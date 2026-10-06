@@ -1,0 +1,371 @@
+From b2ef406d0a800d8d54ef7849adf2e8f01a18c0ab Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 13:29:30 +0530
+Subject: [PATCH 11/17] Add GPU-owner tests for the 32-row GEMV and bs1 greedy
+ equality
+
+test_gemv32.py (adapted from wt-tree's test_gemv16.py) checks rows 1-32 against
+reconstruct + hgemm with fp16 and fp32 output at U = 1/2/4. It checks the
+upper row tiles separately, checks that a row's value is bit-identical at
+every row tile (8/16/32), times WMMA against the cooperative fallback, and
+checks the fused gate+up mgemm at 9-32 rows. It also checks that the graphed
+BC GatedMLP's replays at 1-32 rows equal its eager first call.
+
+test_greedy_equal.py writes the greedy DFlash2 token ids of one checkout
+(TabbyAPI-like setup: Q4 caches, max_history = draft tokens), and --compare
+checks two runs token for token. Prompts stay above 32 tokens, since a
+9-32-token prefill now runs the WMMA GEMV and rounds differently by design.
+
+Both load the model and run kernels; the GPU owner runs them.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ test_gemv32.py       | 213 +++++++++++++++++++++++++++++++++++++++++++
+ test_greedy_equal.py | 118 ++++++++++++++++++++++++
+ 2 files changed, 331 insertions(+)
+ create mode 100644 test_gemv32.py
+ create mode 100644 test_greedy_equal.py
+
+diff --git a/test_gemv32.py b/test_gemv32.py
+new file mode 100644
+index 0000000..59431bd
+--- /dev/null
++++ b/test_gemv32.py
+@@ -0,0 +1,213 @@
++"""GPU-owner-only test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
++
++Loads the model and runs GPU kernels; do not run it in a code-only session. Run it with this checkout's
++extension on PYTHONPATH and env.sh sourced (the script forces EXL3_GEMV_WMMA / _U / _MAX_M per check).
++
++Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 fc and an MLP):
++  1. accuracy: rows 2..32 (or --rows), fp16 and fp32 output, U = 1/2/4, against reconstruct_hgemm; the
++     upper row tiles (rows 8-15 and 16-31) separately, so a lane-half or M-tile mixup cannot hide
++  2. row-tile invariance: row r of an n-row call is bit-identical to row r of the 32-row call, for every
++     n in 2..32 (one K order at every row tile M = 8/16/32; this is what keeps a job's logits independent of
++     how many other jobs share the verify)
++  3. timing: WMMA vs the cooperative GEMM fallback (EXL3_GEMV_WMMA=0) at 8 / 16 / 24 / 32 rows
++  4. multi-matrix GEMV (fused gate+up mgemm, the GatedMLP path) at rows 9..32 against reconstruct_hgemm
++  5. graphed BC GatedMLP at rows 1..32: graph replays (3rd call on) equal the eager first call bit for bit,
++     with fresh input/output tensors each call, and the output matches a reconstruct + hgemm MLP
++"""
++import argparse
++import os
++from pathlib import Path
++
++os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
++os.environ["EXL3_GEMV_MAX_M"] = "32"
++
++import torch
++from exllamav3 import Config, Model
++from exllamav3.ext import exllamav3_ext as ext
++from exllamav3.modules import mlp as mlp_mod
++
++ROOT = Path(__file__).resolve().parent.parent
++SHAPES = [
++    "layers.0.linear_attn.in_proj_qkv", "layers.0.linear_attn.in_proj_z",
++    "layers.0.linear_attn.out_proj", "layers.0.mlp.gate_proj",
++    "layers.0.mlp.down_proj", "layers.3.self_attn.k_proj",
++    "layers.3.self_attn.q_proj", "lm_head",
++]
++DRAFT_SHAPES = ["fc", "layers.0.mlp.down_proj", "layers.0.self_attn.q_proj"]
++
++
++def walk(module):
++    yield module
++    for child in getattr(module, "modules", []) or []:
++        yield from walk(child)
++
++
++def find_linears(model, suffixes):
++    found = {}
++    for module in walk(model):
++        inner = getattr(module, "inner", None)
++        if inner is not None and type(inner).__name__ == "LinearEXL3":
++            for suffix in suffixes:
++                if module.key == suffix or module.key.endswith("." + suffix):
++                    found.setdefault(suffix, inner)
++    missing = set(suffixes) - found.keys()
++    if missing:
++        raise RuntimeError(f"Missing requested projections: {sorted(missing)}")
++    return found
++
++
++def time_call(fn, iterations):
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    start = torch.cuda.Event(enable_timing = True)
++    end = torch.cuda.Event(enable_timing = True)
++    start.record()
++    for _ in range(iterations):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) * 1000 / iterations
++
++
++def rel_err(out, ref):
++    return ((out - ref).abs().max() / ref.abs().max().clamp_min(1e-6)).item()
++
++
++def set_wmma(on, unroll = 4):
++    os.environ["EXL3_GEMV_WMMA"] = "1" if on else "0"
++    os.environ["EXL3_GEMV_WMMA_U"] = str(unroll)
++
++
++def check_linears(tag, layers, rows_list, args):
++    tested = 0
++    print(f"\n[{tag}] 1-3. single-matrix GEMV")
++    print("projection rows dtype U rel_err rel_err_rows8-15 rel_err_rows16-31")
++    for name, layer in layers.items():
++        if not float(layer.K).is_integer():
++            print(f"{name}: half-integer bitrate {layer.K}, WMMA not eligible; skipped")
++            continue
++        tested += 1
++        dev = layer.trellis.device
++        x32 = torch.randn(1, 32, layer.in_features, dtype = torch.half, device = dev)
++        for fp32 in (False, True):
++            dtype = torch.float if fp32 else torch.half
++            ref32 = layer.reconstruct_hgemm(x32, dtype).float()
++            for unroll in (1, 2, 4):
++                set_wmma(True, unroll)
++                full = layer.bc.run_alloc(x32, layer.out_features, fp32)
++                for rows in rows_list:
++                    x = x32[:, :rows].contiguous()
++                    out = layer.bc.run_alloc(x, layer.out_features, fp32)
++                    o, ref = out.float(), ref32[:, :rows]
++                    assert torch.isfinite(o).all(), (name, rows, dtype, unroll)
++                    err = rel_err(o, ref)
++                    assert err <= args.relative_error, (name, rows, dtype, unroll, err)
++                    e8 = rel_err(o[:, 8:16], ref[:, 8:16]) if rows > 8 else float("nan")
++                    e16 = rel_err(o[:, 16:], ref[:, 16:]) if rows > 16 else float("nan")
++                    for e in (e8, e16):
++                        assert not (e == e) or e <= args.relative_error, (name, rows, dtype, unroll, e8, e16)
++                    # 2. row-tile invariance (2+ rows: m == 1 takes the fdot2 GEMV, a different K order)
++                    if rows >= 2:
++                        same = torch.equal(out, full[:, :rows])
++                        assert same, (f"{name}: rows {rows} differ from the same rows of the 32-row call "
++                                      f"(U={unroll}, {dtype}): max abs diff "
++                                      f"{(out.float() - full[:, :rows].float()).abs().max().item():.3g}")
++                    if rows in (2, 8, 9, 16, 17, 24, 32) or args.verbose:
++                        print(f"{name} {rows} {dtype} {unroll} {err:.3g} {e8:.3g} {e16:.3g}", flush = True)
++        # 3. timing
++        for rows in (8, 16, 24, 32):
++            x = x32[:, :rows].contiguous()
++            set_wmma(False)
++            coop = time_call(lambda: layer.bc.run_alloc(x, layer.out_features, False), args.iterations)
++            set_wmma(True, 4)
++            wmma = time_call(lambda: layer.bc.run_alloc(x, layer.out_features, False), args.iterations)
++            print(f"  timing {name} rows {rows}: WMMA {wmma:8.1f} us, fallback (EXL3_GEMV_WMMA=0) {coop:8.1f} us, "
++                  f"{coop / wmma:5.2f}x", flush = True)
++    assert tested, "no integer-bitrate projections to exercise WMMA"
++    return tested
++
++
++def check_mgemm(model, rows_list, args):
++    mlp = next((m for m in walk(model) if type(m).__name__ == "GatedMLP" and m.multi_gu and m.multi_gu[0] is not None),
++               None)
++    if mlp is None:
++        print("\n4. no fused gate+up MultiLinear in this model; multi-matrix check skipped")
++        return
++    mg, gate, up = mlp.multi_gu[0], mlp.gates[0].inner, mlp.ups[0].inner
++    dev = gate.trellis.device
++    print(f"\n4. multi-matrix GEMV (fused gate+up, {mlp.key}), rows {rows_list[0]}..{rows_list[-1]}")
++    set_wmma(True, 4)
++    for rows in rows_list:
++        x = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
++        guh = torch.empty((2, rows, mlp.hidden_size), dtype = mlp.interm_dtype, device = dev)
++        gu = torch.empty((2, rows, mg.out_features), dtype = mlp.interm_dtype, device = dev)
++        ext.exl3_mgemm(x, mg.ptrs_trellis, gu, mg.ptrs_suh, guh, mg.ptrs_svh, None, None, mg.K, -1,
++                       mg.mcg, mg.mul1, -1, -1, 0, 1, None, None)
++        rg = gate.reconstruct_hgemm(x, mlp.interm_dtype).float()[0]
++        ru = up.reconstruct_hgemm(x, mlp.interm_dtype).float()[0]
++        eg, eu = rel_err(gu[0].float(), rg), rel_err(gu[1].float(), ru)
++        assert eg <= args.relative_error and eu <= args.relative_error, (rows, eg, eu)
++        print(f"  rows {rows}: gate {eg:.3g} up {eu:.3g}", flush = True)
++
++
++def check_bc_mlp(model, args):
++    mlps = [m for m in walk(model) if type(m).__name__ == "GatedMLP" and m.bc is not None]
++    assert mlps, "no GatedMLP with a BC graph"
++    mlp = mlps[0]
++    limit = getattr(mlp_mod, "_bc_mlp_max_rows", mlp_mod.MAX_BSZN)
++    print(f"\n5. graphed BC GatedMLP ({mlp.key}), Python row limit {limit}")
++    assert limit >= 32, "this checkout's GatedMLP BC limit is below 32 rows (EXL3_BC_MLP_MAX_ROWS set?)"
++    set_wmma(True, 4)
++    dev = mlp.device
++    g, u, d = mlp.gates[0].inner, mlp.ups[0].inner, mlp.downs[0].inner
++    for rows in list(range(1, 33)):
++        x0 = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
++        outs = []
++        for call in range(5):
++            x = x0.clone()   # fresh pointers every call: the graph has to patch input and output
++            outs.append(mlp.forward(x, {}).float().clone())
++        for call in range(1, 5):
++            assert torch.equal(outs[call], outs[0]), f"rows {rows}: call {call} (graph) != eager first call"
++        # reference: reconstruct + hgemm with the module's activation
++        gg = g.reconstruct_hgemm(x0, torch.half).float()
++        uu = u.reconstruct_hgemm(x0, torch.half).float()
++        a = (torch.nn.functional.silu(gg) * uu).half()
++        ref = d.reconstruct_hgemm(a, torch.float).float()
++        err = rel_err(outs[0], ref)
++        assert err <= args.mlp_relative_error, (rows, err)
++        if rows in (1, 8, 9, 16, 17, 32) or args.verbose:
++            print(f"  rows {rows}: graph replays identical, rel_err vs reconstruct {err:.3g}", flush = True)
++
++
++@torch.inference_mode()
++def main():
++    parser = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--model", default = str(ROOT / "models/Qwen3.8-27B-EXL3-3.0bpw"))
++    parser.add_argument("--draft", nargs = "?", const = str(ROOT / "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw"),
++                        default = None, help = "also check the DFlash2 draft's fc / MLP / q_proj")
++    parser.add_argument("--rows", type = int, nargs = "+", default = list(range(1, 33)))
++    parser.add_argument("--iterations", type = int, default = 100)
++    parser.add_argument("--relative-error", type = float, default = 0.005,
++                        help = "max abs error / max reference magnitude")
++    parser.add_argument("--mlp-relative-error", type = float, default = 0.02)
++    parser.add_argument("--verbose", action = "store_true")
++    args = parser.parse_args()
++    torch.manual_seed(0)
++
++    model = Model.from_config(Config.from_directory(args.model))
++    model.load()
++    n = check_linears("target", find_linears(model, SHAPES), args.rows, args)
++    check_mgemm(model, [r for r in args.rows if r >= 9] or [9, 16, 32], args)
++    check_bc_mlp(model, args)
++    if args.draft:
++        # The draft's lm_head is the target's (attached at generation time), so only its own linears here
++        draft = Model.from_config(Config.from_directory(args.draft))
++        draft.load()
++        n += check_linears("draft", find_linears(draft, DRAFT_SHAPES), args.rows, args)
++    print(f"\nPASS: {n} projections, rows {args.rows[0]}..{args.rows[-1]}, fp16/fp32, U=1/2/4; row-tile "
++          f"invariance; fused gate+up mgemm; graphed BC GatedMLP rows 1..32")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test_greedy_equal.py b/test_greedy_equal.py
+new file mode 100644
+index 0000000..55e902b
+--- /dev/null
++++ b/test_greedy_equal.py
+@@ -0,0 +1,118 @@
++"""GPU-owner-only: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
++
++Loads the target + DFlash2 draft like TabbyAPI (Q4 caches, max_history = draft tokens), runs each prompt
++greedily, and writes the generated token ids to --out. Run it once per checkout (PYTHONPATH selects the tree),
++then --compare the two files: every prompt must match token for token.
++
++  source env.sh; export EXL3_GDN_REPLAY=1
++  PYTHONPATH=$W/wt-dev   python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_dev.json
++  PYTHONPATH=$W/wt-batch python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_batch.json
++  python $W/wt-batch/test_greedy_equal.py --compare /tmp/greedy_dev.json /tmp/greedy_batch.json
++
++--bsz N runs the prompts as N concurrent jobs instead of one at a time. A batched verify is not expected to
++be bit-identical to bs1 (the split-decode attention splits differently at another batch size, so its combine
++rounds differently), so compare a batched file against a bs1 file for the common-prefix lengths only.
++"""
++import argparse, json, os, sys, time
++
++
++def compare(a_path, b_path):
++    a, b = json.load(open(a_path)), json.load(open(b_path))
++    print(f"A: {a_path} ({a['meta']})\nB: {b_path} ({b['meta']})")
++    ok = True
++    for i, (x, y) in enumerate(zip(a["ids"], b["ids"])):
++        n = next((k for k, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
++        same = x == y
++        ok &= same
++        print(f"  prompt {i}: {'IDENTICAL' if same else 'DIFFER'}  ({len(x)} vs {len(y)} tokens, "
++              f"common prefix {n})")
++    print("PASS: identical" if ok else "FAIL: outputs differ")
++    return ok
++
++
++def main():
++    ap = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
++    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    ap.add_argument("--model", default = os.path.join(root, "models/Qwen3.8-27B-EXL3-3.0bpw"))
++    ap.add_argument("--draft", default = os.path.join(root, "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw"))
++    ap.add_argument("--tokens", type = int, default = 400)
++    ap.add_argument("--draft-tokens", type = int, default = 7)
++    ap.add_argument("--bsz", type = int, default = 1)
++    ap.add_argument("--cache-tokens", type = int, default = 16384)
++    ap.add_argument("--out")
++    ap.add_argument("--compare", nargs = 2)
++    args = ap.parse_args()
++    if args.compare:
++        sys.exit(0 if compare(*args.compare) else 1)
++    assert args.out, "--out or --compare"
++
++    os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
++    import torch
++    import exllamav3
++    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
++    from exllamav3.cache import CacheLayer_quant
++
++    dcfg = Config.from_directory(args.draft)
++    draft = Model.from_config(dcfg)
++    kw = dict(layer_type = CacheLayer_quant, k_bits = 4, v_bits = 4, max_batch_size = max(args.bsz, 1),
++              max_history = args.draft_tokens)
++    dcache = Cache(draft, max_num_tokens = args.cache_tokens, **kw)
++    draft.load()
++    config = Config.from_directory(args.model)
++    model = Model.from_config(config)
++    cache = Cache(model, max_num_tokens = args.cache_tokens, **kw)
++    model.load()
++    tok = Tokenizer.from_config(config)
++    gen = Generator(model = model, cache = cache, draft_model = draft, draft_cache = dcache, tokenizer = tok,
++                    max_batch_size = max(args.bsz, 1), num_draft_tokens = args.draft_tokens,
++                    recurrent_cache_size = 512 * 1024**2)
++
++    prompts = ["Write a Python LRU cache class with get/put and unit tests. Code only.",
++               "Write a Python function to parse ISO-8601 durations, with tests. Code only.",
++               "Write a Python trie with insert, search and prefix listing, with tests. Code only.",
++               "Write a Python token-bucket rate limiter class with tests. Code only."]
++    # The system prompt keeps every prompt above 32 tokens: a 9..32-token prefill now takes the WMMA GEMV
++    # (rdna4-dev: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
++    # the same kernels in both trees, so with longer prompts the outputs must match exactly
++    system = ("Think efficiently. Work through the problem once, carefully. If you notice yourself re-deriving "
++              "the same result, second-guessing a conclusion you already checked, or cycling between options, "
++              "stop and commit to the best-supported answer. A confident best answer beats an unfinished analysis.")
++    def ids(p):
++        t = tok.encode(f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{p}<|im_end|>\n"
++                       f"<|im_start|>assistant\n<think>\n\n</think>\n\n", encode_special_tokens = True)
++        assert t.shape[-1] > 32, t.shape
++        return t
++
++    def run(batch):
++        jobs = [Job(input_ids = ids(p), max_new_tokens = args.tokens, sampler = ArgmaxSampler(), identifier = i)
++                for i, p in batch]
++        out = {i: [] for i, _ in batch}
++        for j in jobs:
++            gen.enqueue(j)
++        while gen.num_remaining_jobs():
++            for r in gen.iterate():
++                if r.get("stage") == "streaming" and r.get("token_ids") is not None:
++                    out[r["identifier"]] += r["token_ids"].view(-1).tolist()
++        return out
++
++    # Warm up graphs and autotune at this shape first, so the measured runs see the steady-state kernels
++    run([(0, prompts[0])])
++    results, t0 = {}, time.time()
++    indexed = list(enumerate(prompts))
++    with torch.inference_mode():
++        for k in range(0, len(indexed), max(args.bsz, 1)):
++            results.update(run(indexed[k:k + max(args.bsz, 1)]))
++    wall = time.time() - t0
++    n = sum(len(v) for v in results.values())
++    meta = (f"{os.path.dirname(exllamav3.__file__)}, bsz {args.bsz}, draft {args.draft_tokens}, "
++            f"budget {os.environ.get('EXL3_DRAFT_ROW_BUDGET', 'unset')}, {n} tokens in {wall:.1f}s")
++    json.dump({"meta": meta, "ids": [results[i] for i in range(len(prompts))]}, open(args.out, "w"))
++    print(f"wrote {args.out}: {meta}")
++    for i in range(len(prompts)):
++        print(f"--- prompt {i}: {len(results[i])} tokens\n{tok.decode(torch.tensor(results[i]))[:300]}")
++    sys.stdout.flush()
++    os._exit(0)
++
++
++if __name__ == "__main__":
++    main()

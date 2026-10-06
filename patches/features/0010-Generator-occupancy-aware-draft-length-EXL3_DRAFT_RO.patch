@@ -1,0 +1,163 @@
+From 89580dec2e9dc4928cab9cee066f43b4e6071945 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 13:25:05 +0530
+Subject: [PATCH 10/17] Generator: occupancy-aware draft length
+ (EXL3_DRAFT_ROW_BUDGET)
+
+A batched verify forward is (active sequences) x (draft + 1) rows. Past the
+multi-row GEMV's row limit every linear drops to a much slower GEMM, so a
+fixed draft length that is right for one job is wrong for four. With
+EXL3_DRAFT_ROW_BUDGET=N, each round's draft length becomes
+min(num_draft_tokens, N // rows - 1), at least 1, in every draft mode
+(DFlash2, AR draft model, MTP, n-gram). For example, N = 16 with 7 draft
+tokens gives 7 at 1-2 jobs and 3 at 4 jobs; N = 32 keeps 7 up to 4 jobs. The
+floor of one draft token keeps the AR and MTP draft caches advancing, since
+only drafting advances them. Unset or 0 leaves the draft length unchanged.
+
+When the budget shortens a DFlash2 round, the drafter computes only what
+the round uses: the target head and the selector walk run over block rows
+1..window instead of all 8 rows. The anchor row's logits were always
+discarded, and later rows only cost lm_head rows. The walk is sequential
+and the head row-wise, so the first window proposals are unchanged. They
+are bit-identical whenever the head still runs the WMMA GEMV (2+ rows):
+it gives a row the same value at any row tile. A single-row head call
+takes the fdot2 GEMV instead and may differ by rounding. The
+block forward itself stays at the native 8 rows, since block attention is
+bidirectional.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ exllamav3/architecture/dflash2.py | 17 ++++++++++++---
+ exllamav3/generator/generator.py  | 36 +++++++++++++++++++++++++++----
+ 2 files changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
+index ff85e97..b01d777 100644
+--- a/exllamav3/architecture/dflash2.py
++++ b/exllamav3/architecture/dflash2.py
+@@ -273,8 +273,19 @@ class DFlash2Model(Model):
+         target verifier still samples normally and accepts only exact matches."""
+         target = self.attached_model()
+         lm = target.modules[target.logit_layer_idx]
+-        logits = lm.prepare_for_device(state.half(), params)
+-        logits = lm.forward(logits, params)
++        # The generator's row budget may use only the first `rows` path positions. The walk is
++        # sequential (row i depends on rows < i only) and the head is row-wise, so the head and the
++        # walk run over block rows 1..rows alone: the anchor row's logits are never used, and rows
++        # past the window would only cost head rows (the target's head, the widest linear)
++        rows = params.get("dflash2_rows")
++        if rows is not None and 0 < rows < state.shape[1] - 1:
++            path_state = state[:, 1:1 + rows]
++            logits = lm.prepare_for_device(path_state.half().contiguous(), params)
++            logits = lm.forward(logits, params)
++        else:
++            path_state = state[:, 1:]
++            logits = lm.prepare_for_device(state.half(), params)
++            logits = lm.forward(logits, params)[:, 1:]
+ 
+         dev = self.selector.device
+         # The generator stages the block ids in pinned memory: upload without a host sync
+@@ -286,7 +297,7 @@ class DFlash2Model(Model):
+         # (draft's last block) and the logits (target's head) may sit on other devices than
+         # the selector: to_device bounces pairs with a broken peer path through the host
+         out, confidence = self.selector.walk_block(
+-            to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
++            to_device(path_state, dev), to_device(logits, dev), anchor,
+             return_confidence = export_conf,
+             vocab_size = target.config.vocab_size,
+             scale = self.config.output_multiplier,
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index aec4981..b4107ce 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ import logging
++import os
+ import torch
+ from ..model.model import Model
+ from ..cache.cache import Cache
+@@ -188,6 +189,13 @@ class Generator:
+             self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
+         self.ngram_match_min = ngram_match_min
+         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
++
++        # Occupancy-aware draft length (EXL3_DRAFT_ROW_BUDGET, 0/unset = off): a batched verify
++        # forward is (active sequences) x (draft + 1) rows, and past the multi-row GEMV's row limit
++        # every linear falls to a much slower GEMM. With a budget set, each round's draft length is
++        # capped so the verify stays within it: draft = min(num_draft_tokens, budget // rows - 1),
++        # at least 1. E.g. budget 16 with 7 draft tokens: 1 job 7, 2 jobs 7, 4 jobs 3
++        self.draft_row_budget = max(0, int(os.environ.get("EXL3_DRAFT_ROW_BUDGET", "0") or 0))
+         self.record_draft_stats = record_draft_stats
+         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+ 
+@@ -696,7 +704,7 @@ class Generator:
+         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+ 
+         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         cal = self.draft_calibrator
+         conf_cols = []
+         reach = None
+@@ -800,7 +808,7 @@ class Generator:
+         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
+         # every row's running product of estimated conditional acceptance probabilities falls
+         # below the confidence target, keeping the first low-confidence token as the label probe
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         cal = self.draft_calibrator
+         conf_cols = []
+         reach = None
+@@ -863,7 +871,8 @@ class Generator:
+             return None
+ 
+         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
+-        window = self.num_draft_tokens
++        # (as does the row budget, which also tells the drafter how many block rows need logits)
++        window = self._budget_draft_window(self.num_draft_tokens)
+ 
+         # Create block index table for batch
+         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+@@ -903,6 +912,10 @@ class Generator:
+         }
+         if self.draft_calibrator is not None:
+             params["export_draft_conf"] = True
++        if window < self.num_draft_tokens:
++            # Only the first `window` path positions are used; the selector walk is sequential, so
++            # they come out the same with the later block rows' head and walk skipped
++            params["dflash2_rows"] = window
+         out_state = self.draft_model.forward(
+             input_ids = batch_ids,
+             params = params,
+@@ -956,7 +969,7 @@ class Generator:
+             return None
+ 
+         # Generate draft
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         draft_ids = []
+         min_len = window
+         for job in self.active_jobs:
+@@ -973,6 +986,21 @@ class Generator:
+         return draft_ids
+ 
+ 
++    def _budget_draft_window(self, window: int) -> int:
++        """
++        Draft length for this round under EXL3_DRAFT_ROW_BUDGET (see __init__): the verify forward
++        takes (window + 1) rows per active sequence. Never below 1, so draft-model caches that are
++        only advanced by drafting (AR draft models, MTP) keep advancing; unchanged when the budget
++        is off.
++        """
++        if self.draft_row_budget <= 0 or window <= 1:
++            return window
++        rows = sum(len(job.sequences) for job in self.active_jobs if job.is_prefill_done())
++        if rows == 0:
++            return window
++        return max(1, min(window, self.draft_row_budget // rows - 1))
++
++
+     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
+         """
+         Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.

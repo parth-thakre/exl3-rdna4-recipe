@@ -1,0 +1,177 @@
+From 6115431e3f7900df05c52da0b222eca443300936 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 13:25:05 +0530
+Subject: [PATCH 09/17] GatedMLP: graphed BC path up to 32 rows
+
+BC_GatedMLP::run_bszN took bsz * q_len <= MAX_BSZN (8) rows, so a batched
+verify (2 x 8, 4 x 8) and the DFlash2 draft block at bsz > 1 ran the dense
+MLP eagerly: one Python forward, five launches and three transient
+allocations per layer, with no graph. Attention and GDN were already graphed
+up to 8 x 16 rows.
+
+- MLP_MAX_ROWS = 32 (mlp.h and mlp.py), separate from MAX_BSZN, which the
+  MoE kernels keep at 8. The static scratch (gate/up input and output, act,
+  down input) is sized (.., 32, width); it is shared between layers through
+  g_tensor_cache, so it costs about 5 MB per shape.
+- The per-layer, per-row-count gate/up buffers (allocated to avoid the slot
+  stride problem of slicing dim 1) are now exactly shaped views of the
+  shared statics' leading 2 * n * width elements. Same strides, slot 1
+  where the fused mgemm expects it, and no per-layer allocation. At 32 rows
+  the old scheme would have cost about 2.8 MB per layer per row count.
+- EXL3_BC_MLP_MAX_ROWS lowers the Python-side limit (8 is the previous
+  behaviour), for A/B runs.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ exllamav3/exllamav3_ext/libtorch/mlp.cpp | 22 +++++++++++-------
+ exllamav3/exllamav3_ext/libtorch/mlp.h   | 29 ++++++++++++++++--------
+ exllamav3/modules/mlp.py                 | 18 +++++++++++----
+ 3 files changed, 47 insertions(+), 22 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+index ac8c6c4..868ede4 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+@@ -19,17 +19,23 @@ void BC_GatedMLP::run_bszN_gr
+     Graph* graph
+ )
+ {
+-    // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
+-    // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
+-    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
+-    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
+-    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
++    // guh/gu hold 2 slots (gate, up); slicing the static (2, MLP_MAX_ROWS, width) buffers along dim 1
++    // would leave dim 0's stride at MLP_MAX_ROWS*width instead of num_tokens*width, corrupting the
++    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MLP_MAX_ROWS --
++    // view the statics' leading 2*num_tokens*width elements as (2, num_tokens, width) instead
++    // (a/down_xh have no such issue: their slot dim is size 1, so slicing the token dim -- the true
++    // leading dim there -- stays contiguous)
++    auto flat_prefix = [num_tokens](const at::Tensor& t)
++    {
++        const int64_t w = t.size(2);
++        return t.view({-1}).narrow(0, 0, 2 * (int64_t) num_tokens * w).view({2, (int64_t) num_tokens, w});
++    };
+     at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
+     if (!guh_n_ref.defined())
+-        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
++        guh_n_ref = flat_prefix(guh);
+     at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
+     if (!gu_n_ref.defined())
+-        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
++        gu_n_ref = flat_prefix(gu);
+     at::Tensor guh_n     = guh_n_ref;
+     at::Tensor gu_n      = gu_n_ref;
+     at::Tensor a_n       = a.slice(1, 0, num_tokens);
+@@ -97,7 +103,7 @@ void BC_GatedMLP::run_bszN
+ )
+ {
+     int num_tokens = (int) x.numel() / (int) x.size(-1);
+-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
++    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MLP_MAX_ROWS, "run_bszN: bsz out of supported range");
+     int graphidx = num_tokens - 1;
+ 
+     c10::cuda::CUDAGuard device_guard(x.device());
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
+index c0a31e1..b733544 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
+@@ -10,6 +10,11 @@ namespace py = pybind11;
+ 
+ #define MAX_BSZN 8   // must match MAX_BSZN in blocksparse_mlp.h / BlockSparseMLP.py
+ 
++// Rows (bsz * q_len) the graphed dense BC_GatedMLP takes, separate from the MoE kernels' MAX_BSZN:
++// a batched speculative verify is bsz x (draft + 1) rows, e.g. 4 x 8. Must match MLP_MAX_ROWS in
++// modules/mlp.py, which sizes the static scratch
++#define MLP_MAX_ROWS 32
++
+ // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
+ // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
+ // using this class's OWN scratch (down_xh) rather than gate/up/down's BC_LinearEXL3::run_gr,
+@@ -37,16 +42,17 @@ struct BC_GatedMLP
+     std::shared_ptr<BC_LinearEXL3> down;
+     float act_limit;
+ 
+-    // graph_bszN[num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves exactly as
+-    // the original dedicated bsz-1 path)
+-    Graph graph_bszN[MAX_BSZN];
++    // graph_bszN[num_tokens - 1] covers num_tokens 1..MLP_MAX_ROWS (num_tokens==1 behaves exactly
++    // as the original dedicated bsz-1 path)
++    Graph graph_bszN[MLP_MAX_ROWS];
+ 
+     // guh/gu hold TWO slots (gate, up) side by side; the fused mgemm kernel addresses slot j at
+     // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
+-    // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
+-    // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
+-    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
+-    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
++    // (2, MLP_MAX_ROWS, width) static buffer when num_tokens == MLP_MAX_ROWS (slicing dim 1 leaves
++    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for
++    // any other num_tokens). Each entry is instead an exactly (2, num_tokens, width)-shaped view of
++    // the static's first 2*num_tokens*width elements: contiguous, slot 1 where the kernel expects
++    // it, and no per-layer allocation (the statics are shared between layers, like a/down_xh)
+     std::vector<at::Tensor> guh_cache;
+     std::vector<at::Tensor> gu_cache;
+ 
+@@ -89,8 +95,13 @@ struct BC_GatedMLP
+         act_limit           (_act_limit)
+     {
+         TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
+-        guh_cache.resize(MAX_BSZN);
+-        gu_cache.resize(MAX_BSZN);
++        TORCH_CHECK(guh.dim() == 3 && gu.dim() == 3 && guh.size(0) == 2 && gu.size(0) == 2 &&
++                    guh.size(1) >= MLP_MAX_ROWS && gu.size(1) >= MLP_MAX_ROWS &&
++                    a.size(1) >= MLP_MAX_ROWS && down_xh.size(1) >= MLP_MAX_ROWS &&
++                    guh.is_contiguous() && gu.is_contiguous(),
++                    "BC_GatedMLP: scratch must be contiguous (2, MLP_MAX_ROWS, width) / (1, MLP_MAX_ROWS, width)");
++        guh_cache.resize(MLP_MAX_ROWS);
++        gu_cache.resize(MLP_MAX_ROWS);
+     }
+ 
+     void run_bszN_gr
+diff --git a/exllamav3/modules/mlp.py b/exllamav3/modules/mlp.py
+index 867f3a5..331c572 100644
+--- a/exllamav3/modules/mlp.py
++++ b/exllamav3/modules/mlp.py
+@@ -11,9 +11,17 @@ from ..constants import MAX_MLP_INTERMEDIATE
+ from ..model.model_tp_alloc import TPAllocation
+ from .multilinear import MultiLinear
+ from ..util.tensor import g_tensor_cache
++import os
+ 
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+ 
++# Rows (bsz * q_len) the graphed GatedMLP path (BC_GatedMLP.run_bszN) takes; sizes its static scratch.
++# Must match MLP_MAX_ROWS in exllamav3_ext/libtorch/mlp.h. A batched speculative verify is
++# bsz x (draft + 1) rows (4 x 8 = 32); above the limit the eager path runs.
++# EXL3_BC_MLP_MAX_ROWS lowers the limit (8 is the previous behaviour)
++MLP_MAX_ROWS = 32
++_bc_mlp_max_rows = max(1, min(int(os.environ.get("EXL3_BC_MLP_MAX_ROWS", MLP_MAX_ROWS)), MLP_MAX_ROWS))
++
+ 
+ def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
+     """
+@@ -791,10 +799,10 @@ class GatedMLP(Module):
+             if mgu is not None or can_separate:
+                 out_f = mgu.out_features if mgu is not None else g0.out_features
+                 self.bsz1_pa_args = [
+-                    (device, (2, MAX_BSZN, self.hidden_size), self.interm_dtype, "gu"),
+-                    (device, (2, MAX_BSZN, out_f), self.interm_dtype, "a1"),
+-                    (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
+-                    (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
++                    (device, (2, MLP_MAX_ROWS, self.hidden_size), self.interm_dtype, "gu"),
++                    (device, (2, MLP_MAX_ROWS, out_f), self.interm_dtype, "a1"),
++                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "a2"),
++                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "down_xh"),
+                 ]
+                 self.bc = ext.BC_GatedMLP(
+                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+@@ -865,7 +873,7 @@ class GatedMLP(Module):
+ 
+             for s in r:
+ 
+-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
++                if self.bc is not None and bsz * q_len <= _bc_mlp_max_rows:
+                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
+                     self.bc.run_bszN(xv, d.view(xv.shape))

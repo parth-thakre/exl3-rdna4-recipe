@@ -1,0 +1,326 @@
+From 367232705c052ad09c94086fafbffcf5ceee8db1 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 13:16:27 +0530
+Subject: [PATCH 07/17] ROCm: gfx12 WMMA multi-row GEMV up to 16 rows
+
+A batched speculative verify (bsz 2 x 8 rows) is 16 rows per linear, past the
+multi-row GEMV's 8-row limit, so every linear in the verify and in the
+DFlash2 draft forward fell to the cooperative tile GEMM. The WMMA kernel
+already computes 16 rows: lane L loads A row L & 15, and the accumulator
+holds rows 8 (L >> 4) + i, so lanes 16-31 carry rows 8-15. This reduces both
+lane halves into the row-wise fused epilogue.
+
+Ported from wt-tree e604fcc (GPU-validated there: rows 9-16 match
+reconstruct + hgemm; lm_head at 16 rows 1.85 ms vs 7.5 ms). The gating part
+of 409ee42 is already in rdna4-dev as exl3_gemv_wmma_enabled(device) with a
+per-call env read and a per-device arch check, so the row guards just pass
+the device.
+
+- EXL3_GEMV_MAX_M defaults to 16 (clamp 1..16); 8 restores the old limit.
+- Rows 9-16 need the WMMA path (integer bitrate, gfx12, EXL3_GEMV_WMMA=1);
+  otherwise both entry points decline and the cooperative GEMM runs as
+  before. The fdot2 kernels never see more than 8 rows.
+- The multi-matrix form takes rows 9-16 only unweighted and single-token.
+- The 8-row specialization keeps its scratch size and accumulator count.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                               | 15 +++--
+ exllamav3/exllamav3_ext/quant/exl3_gemm.cu    |  8 +--
+ .../rocm/quant/exl3_gemv_multirow_rdna.cu     | 57 +++++++++++--------
+ .../rocm/quant/exl3_gemv_multirow_rdna.cuh    |  4 +-
+ 4 files changed, 51 insertions(+), 33 deletions(-)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index 974885c..25af189 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -291,14 +291,21 @@ forces shuffle extraction, `1` forces shared-memory staging. Testing only.
+ 
+ ### `EXL3_GEMV_WMMA` (ROCm gfx1200 / gfx1201; default: `0`)
+ 
+-Multi-row EXL3 GEMV (2-8 rows, e.g. a speculative verify) on the gfx12 WMMA units: each 16x16
+-trellis tile is decoded once and one `v_wmma_f32_16x16x16_f16` takes all rows, instead of one
+-fdot2 chain per row. Covers integer bitrates in the single-matrix GEMV and the unweighted
+-single-token multi-matrix GEMV; everything else keeps the fdot2 kernels. Devices other than
++Multi-row EXL3 GEMV (2-16 rows, e.g. a speculative verify, or a batched one at bsz 2 x 8 rows) on
++the gfx12 WMMA units: each 16x16 trellis tile is decoded once and one `v_wmma_f32_16x16x16_f16`
++takes all rows, instead of one fdot2 chain per row. Covers integer bitrates in the single-matrix
++GEMV and the unweighted single-token multi-matrix GEMV; everything else keeps the fdot2 kernels
++(2-8 rows) or the cooperative GEMM (9 rows and up). Devices other than
+ gfx1200 / gfx1201 (gfx11 included) also keep them whatever the setting: eligibility is checked per
+ device at runtime. Results match the fdot2 path to fp32 rounding, not bit for bit. Read on every
+ call, unlike most C++-side variables, so tests can toggle it.
+ 
++### `EXL3_GEMV_MAX_M` (ROCm; default: `16`)
++
++Largest row count the RDNA multi-row GEMV takes (clamped to 1-16). Rows 9 and up need
++`EXL3_GEMV_WMMA` on a gfx12 device and fall back to the cooperative GEMM otherwise. `8` restores
++the previous limit, `1` switches the multi-row path off. Read on every call.
++
+ ### `EXL3_GEMV_WMMA_U` (default: `4`)
+ 
+ k-tiles decoded per WMMA batch in the `EXL3_GEMV_WMMA` kernel: `1`, `2` or `4`.
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index 517ddb7..bdeff7a 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -190,9 +190,9 @@ int exl3_gemm_gr
+     if (mul1) cb = 2;
+ 
+ #if defined(USE_ROCM)
+-    // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
++    // RDNA: m = 1..8 take fdot2, gfx12 WMMA can take m = 2..16 (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
+     // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
+-    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8
++    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= exl3_gemv_max_m()
+         && (!half_k || exl3_rocm_half_gemv_enabled()))
+     {
+         if (exl3_gemv_multirow_try_launch
+@@ -609,9 +609,9 @@ int exl3_mgemm_gr
+ 
+ #if defined(USE_ROCM)
+     // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
+-    // take m = 1..8 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
++    // take m = 1..8 (gfx12 WMMA up to 16) ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
+     // handle, so it stays on the cooperative kernel
+-    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
++    if (size_m >= 1 && size_m <= exl3_gemv_max_m() && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
+         && (!half_k || exl3_rocm_half_gemv_enabled()))
+     {
+         if (exl3_mgemv_multirow_try_launch
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+index 009b253..73f0b36 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+@@ -1,5 +1,5 @@
+ // =============================================================================
+-// Multi-row GEMV for RDNA, m = 2..8
++// Multi-row GEMV for RDNA, fdot2 m = 2..8, gfx12 WMMA m = 2..16
+ // =============================================================================
+ //
+ // The GEMV fast paths take m == 1 only; at m = 2..8 -- speculative-decoding
+@@ -35,7 +35,7 @@
+ // helpers are shared), gated on a runtime LDS budget; not done here.
+ //
+ // Routing: exl3_gemm_gr and exl3_mgemm_gr call the two try_launch entry
+-// points for 2 <= m <= EXL3_GEMV_MAX_M (default 8; 1 switches the path off)
++// points for 2 <= m <= EXL3_GEMV_MAX_M (default 16; 1 switches the path off)
+ // before the cooperative kernels, in and out of graph capture. The
+ // multi-matrix form declines sliced mode.
+ //
+@@ -71,9 +71,9 @@
+ int exl3_gemv_max_m()
+ {
+     const char* env = std::getenv("EXL3_GEMV_MAX_M");
+-    if (!env) return 8;
++    if (!env) return 16;
+     int v = atoi(env);
+-    return v < 1 ? 1 : (v > 8 ? 8 : v);
++    return v < 1 ? 1 : (v > 16 ? 16 : v);
+ }
+ 
+ // m == 1 goes through this structure too, with a row tile of 1 -- rows read
+@@ -608,7 +608,7 @@ void exl3_gemv_mr_dot_single
+ }
+ 
+ // =============================================================================
+-// Kernel 2w: the m <= 8 GEMV on gfx12 WMMA (EXL3_GEMV_WMMA=1)
++// Kernel 2w: the m <= 16 GEMV on gfx12 WMMA (EXL3_GEMV_WMMA=1)
+ // =============================================================================
+ // The fdot2 cores above spend one dot2 per row per weight pair, so an 8-row call
+ // (a DFlash2 verify) costs ~1.4-1.9x a 1-row call although it reads the same
+@@ -625,7 +625,9 @@ void exl3_gemv_mr_dot_single
+ // 32(n & 7) + 4(n >> 3) + 16h + {0, 8}, i.e. k = 4h + {0,1,8,9,2,3,10,11} for
+ // every column. A is loaded in that same k order. The accumulator then holds
+ // D[row 8(L >> 4) + i][col L & 15] (probed on gfx1201): lanes 0-15 carry rows
+-// 0-7 of their column, exactly what exl3_gemv_fused_epilogue_mr consumes.
++// 0-7 of their column, lanes 16-31 rows 8-15. Reduce both halves into
++// lanes 0-15 before the row-wise fused epilogue. The <=8 specialization
++// retains the original scratch size and accumulator count.
+ //
+ // fp32 accumulation inside the WMMA differs in order from the fdot2 chain, so
+ // results match the m == 1 path to rounding, not bit for bit.
+@@ -633,9 +635,9 @@ void exl3_gemv_mr_dot_single
+ typedef _Float16 exl3_h8 __attribute__((ext_vector_type(8)));
+ typedef float exl3_f8 __attribute__((ext_vector_type(8)));
+ 
+-static inline size_t exl3_gemv_wmma_smem_bytes(int warps, int u)
++static inline size_t exl3_gemv_wmma_smem_bytes(int warps, int u, int rows)
+ {
+-    return (size_t) warps * u * 256 * sizeof(half) + (size_t) warps * 8 * 16 * sizeof(float);
++    return (size_t) warps * u * 256 * sizeof(half) + (size_t) warps * (rows <= 8 ? 8 : 16) * 16 * sizeof(float);
+ }
+ 
+ // One k-tile's B round trip through this wave's LDS slot and its WMMA (see the layout note above)
+@@ -664,7 +666,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_tile
+     c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a.v, b.v, c);
+ }
+ 
+-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
+ __device__ __forceinline__ void exl3_gemv_wmma_body
+ (
+     const half* __restrict__ A,     // this slab's rotated rows, size_k apart
+@@ -784,27 +786,28 @@ __device__ __forceinline__ void exl3_gemv_wmma_body
+     #pragma unroll
+     for (int u = 1; u < U; ++u) c += cu[u];
+ 
+-    if (lane < 16)
++    if (M == 16 || lane < 16)
+     {
+         #pragma unroll
+-        for (int i = 0; i < 8; ++i) sh_red[(warp_id * 8 + i) * 16 + lane] = c[i];
++        for (int i = 0; i < 8; ++i)
++            sh_red[(warp_id * M + 8 * (lane >> 4) + i) * 16 + (lane & 15)] = c[i];
+     }
+     __syncthreads();
+     if (warp_id != 0) return;
+ 
+-    float acc[8];
++    float acc[M];
+     #pragma unroll
+-    for (int i = 0; i < 8; ++i)
++    for (int i = 0; i < M; ++i)
+     {
+         float t = 0.0f;
+         if (lane < 16)
+         {
+             #pragma unroll
+-            for (int w = 0; w < WARPS_PER_BLOCK; ++w) t += sh_red[(w * 8 + i) * 16 + lane];
++            for (int w = 0; w < WARPS_PER_BLOCK; ++w) t += sh_red[(w * M + i) * 16 + lane];
+         }
+         acc[i] = t;
+     }
+-    exl3_gemv_fused_epilogue_mr<c_fp32, 8>
++    exl3_gemv_fused_epilogue_mr<c_fp32, M>
+     (
+         acc, Cb, row_off, ldc, size_m, tile_n, lane, svh, seg_counters + tile_n / 8
+     );
+@@ -813,7 +816,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_body
+ #endif
+ }
+ 
+-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
+ static __global__
+ __launch_bounds__(WARPS_PER_BLOCK * 32)
+ __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+@@ -825,7 +828,7 @@ void exl3_gemv_wmma_dot_single
+     const int size_m
+ )
+ {
+-    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U, M>
+     (
+         pb->A_had, pb->B, size_n / 16, blockIdx.x, size_k,
+         pb->C, 0, size_n, size_m, pb->svh, pb->seg_counters
+@@ -833,7 +836,7 @@ void exl3_gemv_wmma_dot_single
+ }
+ 
+ // Multi-matrix form (exl3_gemv_mr_dot_multi's unweighted path): blockIdx.y is the slot
+-template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
+ static __global__
+ __launch_bounds__(WARPS_PER_BLOCK * 32)
+ __attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
+@@ -860,7 +863,7 @@ void exl3_gemv_wmma_dot_multi
+     if (mat_index < 0) return;   // block-uniform
+     const int n_j = size_n_list ? size_n_list[mat_index] : size_n;
+     if (tile_n >= n_j / 16) return;   // block-uniform
+-    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U, M>
+     (
+         A_had + (int64_t) j * size_m * size_k, (const uint16_t*) B_list[mat_index], n_j / 16, tile_n, size_k,
+         c_list ? c_list[mat_index] : pb->Cm,
+@@ -986,6 +989,7 @@ void exl3_gemv_mr_dot_multi
+ // Host dispatch
+ // =============================================================================
+ 
++// fdot2 row tile; m > 8 never reaches the fdot2 kernels (the entry points route it to WMMA or decline)
+ static inline int exl3_gemv_mr_row_tile(int size_m)
+ {
+     return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8));
+@@ -1045,9 +1049,12 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
+     }
+ 
+ // K x codebook x warps x U dispatch for the WMMA entry points (integer bitrates)
++#define LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, m_val, ...) \
++    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, u_val, m_val>), grid, block, smem, stream, __VA_ARGS__); \
++    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, u_val, m_val>), grid, block, smem, stream, __VA_ARGS__);
+ #define LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, u_val, ...) \
+-    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__); \
+-    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__);
++    if (size_m <= 8) { LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, 8, __VA_ARGS__) } \
++    else { LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, 16, __VA_ARGS__) }
+ #define LAUNCH_WMMA_W(kernel, bits_val, codebook, warps_val, ...) \
+     switch (u) { \
+         case 1: LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, 1, __VA_ARGS__) break; \
+@@ -1099,6 +1106,7 @@ bool exl3_gemv_multirow_try_launch
+ {
+     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
+     if (!exl3_gemv_mr_k_ok(K, cb)) return false;
++    if (size_m > 8 && (!exl3_gemv_wmma_enabled(device) || K < 1 || K > 8)) return false;
+     if (size_k % 128 || size_n % 128) return false;
+     if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;
+     if (size_n / 128 > EXL3_MGEMV_SEG_COUNTERS) return false;
+@@ -1135,7 +1143,7 @@ bool exl3_gemv_multirow_try_launch
+         dim3 grid(n_tiles, 1);
+         dim3 block(warps * 32);
+         const int u = exl3_gemv_wmma_unroll();
+-        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u, size_m);
+         LAUNCH_WMMA(exl3_gemv_wmma_dot_single, pb, size_k, size_n, size_m)
+         return true;
+     }
+@@ -1185,9 +1193,11 @@ bool exl3_mgemv_multirow_try_launch
+ {
+     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
+     if (!exl3_gemv_mr_k_ok(K, cb)) return false;
++    if (size_m > 8 && (!exl3_gemv_wmma_enabled(device) || K < 1 || K > 8)) return false;
+     if (size_k % 128 || size_n % 128) return false;
+     // Weighted calls (MoE down) at m == 1 with the mgemv epilogue; see the header
+     const bool weighted = weights_ptr != nullptr;
++    if (size_m > 8 && (weighted || num_tokens != 1)) return false;
+     if (weighted && (size_m != 1 || !exl3_gemv_mr_weighted_enabled())) return false;
+     if (weighted)
+     {
+@@ -1237,7 +1247,7 @@ bool exl3_mgemv_multirow_try_launch
+         const int u = exl3_gemv_wmma_unroll();
+         dim3 grid(n_tiles, bszm);
+         dim3 block(warps * 32);
+-        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u, size_m);
+         LAUNCH_WMMA(exl3_gemv_wmma_dot_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
+                     size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list)
+         return true;
+@@ -1269,6 +1279,7 @@ bool exl3_mgemv_multirow_try_launch
+ #undef LAUNCH_WMMA_CB
+ #undef LAUNCH_WMMA_W
+ #undef LAUNCH_WMMA_U
++#undef LAUNCH_WMMA_M
+ #undef LAUNCH_MR
+ #undef LAUNCH_MR_K
+ #undef LAUNCH_MR_CB
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+index f4b3b61..57d5c86 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ // =============================================================================
+-// Multi-row GEMV for RDNA, m = 2..8 -- host interface
++// Multi-row GEMV for RDNA, m = 2..16 -- host interface
+ // =============================================================================
+ //
+ // See exl3_gemv_multirow_rdna.cu for the design. Both entry points return
+@@ -13,7 +13,7 @@
+ 
+ class Graph;
+ 
+-// EXL3_GEMV_MAX_M (default 8, clamp 1..8): the largest m the multi-row GEMV
++// EXL3_GEMV_MAX_M (default 16, clamp 1..16): the largest m the multi-row GEMV
+ // takes; 1 switches the path off. Re-read per call.
+ int exl3_gemv_max_m();
+ 

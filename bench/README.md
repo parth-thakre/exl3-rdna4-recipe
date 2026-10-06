@@ -41,6 +41,7 @@ two copies in 16 GB.
 | `test_wmma_gemv.py` | WMMA vs fdot2 multi-row GEMV per layer shape: relative error and µs per call. |
 | `bench_gemv.py [--rows 1 8]` | Achieved weight bandwidth of each EXL3 linear (µs and GB/s, % of 640 GB/s). |
 | `bench_decode_attn.py [depth_k] [q_len]` | Split-decode attention on a synthetic Q4 cache, over the `EXL3_DEC_*` launch configs; checks every output against the default. |
+| `bench_batch_sanity.py [--bsz 2 4]` | Runs N different prompts at once and checks each output against the same prompt run alone: no garbage, no cross-talk between batch rows. Prefix and "follows" columns are informational. |
 | `vram_breakdown.py` | Allocated VRAM per component (draft, main weights, KV) and the biggest tensors. |
 
 The DeltaNet replay A/B test (`test_gdn_replay.py`) ships inside the exllamav3 patch. It loads the main model and the

@@ -1,7 +1,7 @@
 """Smoke test: load an EXL3 model on the RX 9070 XT, generate, report prefill/decode speed.
 Run with setup/env.sh sourced and no server holding the GPU. usage: smoke_test.py [--draft DIR | --mtp] [--long]"""
 import argparse, gc, os, sys, time
-os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")   # 9070 XT only; hide the gfx1036 iGPU
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")   # one GPU only: hide an integrated GPU if there is one
 import torch
 from common import MODEL_DIR
 from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler

@@ -1,0 +1,82 @@
+From 56b5c17edd9a79a6c7283b8be96756facc1393a2 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 14:25:08 +0530
+Subject: [PATCH 16/17] Generator: soft row budget documented; DFlash2 prunes
+ rows for any short draft
+
+- EXL3_DRAFT_ROW_BUDGET is soft. The one-token floor keeps AR draft-model
+  and MTP caches advancing, so more than budget / 2 sequences exceed the
+  budget (32 at 17 sequences: 34 rows). Documented in the generator and
+  env_vars.md rather than partitioning the batch.
+- dflash2_rows is now passed whenever the round's window is shorter than
+  block_size - 1, not only when the budget cut it. A configured
+  num_draft_tokens below the block (e.g. 5) now also skips the head and
+  selector rows it never uses. The default 7-token DFlash2 draft equals
+  block_size - 1, so it is unaffected.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                  |  9 ++++++---
+ exllamav3/generator/generator.py | 15 +++++++++------
+ 2 files changed, 15 insertions(+), 9 deletions(-)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index 6950a9c..d3f3a29 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -376,9 +376,12 @@ Occupancy-aware draft length. A batched verify forward is (active sequences) x (
+ With a budget N, each round drafts `min(num_draft_tokens, N // sequences - 1)` tokens, at least 1,
+ so the verify stays within N rows (the multi-row GEMV's fast range: 32 on gfx12 with
+ `EXL3_GEMV_WMMA=1`). For example, `16` with 7 draft tokens drafts 7 at one or two jobs and 3 at four.
+-DFlash2 then also runs the head and selector over only the rows it uses. Applies to every draft
+-mode (DFlash2, draft model, MTP, n-gram). `0` or unset leaves the draft length alone. Read when the
+-Generator is created.
++The budget is soft: the draft never drops below one token (drafting is what advances AR draft-model
++and MTP caches), so more than N / 2 active sequences verify 2 rows each and exceed N (N = 32 at 17
++sequences: 34 rows). Applies to every draft mode (DFlash2, draft model, MTP, n-gram). `0` or unset
++leaves the draft length alone. Read when the Generator is created. Independently of the budget,
++DFlash2 runs the head and selector over only the block rows a round uses whenever the draft is
++shorter than the block (a short `num_draft_tokens` included).
+ 
+ ## Sampling
+ 
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index b4107ce..69aedac 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -194,7 +194,9 @@ class Generator:
+         # forward is (active sequences) x (draft + 1) rows, and past the multi-row GEMV's row limit
+         # every linear falls to a much slower GEMM. With a budget set, each round's draft length is
+         # capped so the verify stays within it: draft = min(num_draft_tokens, budget // rows - 1),
+-        # at least 1. E.g. budget 16 with 7 draft tokens: 1 job 7, 2 jobs 7, 4 jobs 3
++        # at least 1. E.g. budget 16 with 7 draft tokens: 1 job 7, 2 jobs 7, 4 jobs 3.
++        # The budget is soft: the floor of one draft token means more than budget / 2 sequences still
++        # verify 2 rows each (budget 32 at 17 sequences: 34 rows)
+         self.draft_row_budget = max(0, int(os.environ.get("EXL3_DRAFT_ROW_BUDGET", "0") or 0))
+         self.record_draft_stats = record_draft_stats
+         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+@@ -912,9 +914,10 @@ class Generator:
+         }
+         if self.draft_calibrator is not None:
+             params["export_draft_conf"] = True
+-        if window < self.num_draft_tokens:
+-            # Only the first `window` path positions are used; the selector walk is sequential, so
+-            # they come out the same with the later block rows' head and walk skipped
++        if window < self.draft_model.config.block_size - 1:
++            # Only the first `window` path positions are used (a short configured draft, or the row
++            # budget); the selector walk is sequential, so they come out the same with the later
++            # block rows' head and walk skipped
+             params["dflash2_rows"] = window
+         out_state = self.draft_model.forward(
+             input_ids = batch_ids,
+@@ -990,8 +993,8 @@ class Generator:
+         """
+         Draft length for this round under EXL3_DRAFT_ROW_BUDGET (see __init__): the verify forward
+         takes (window + 1) rows per active sequence. Never below 1, so draft-model caches that are
+-        only advanced by drafting (AR draft models, MTP) keep advancing; unchanged when the budget
+-        is off.
++        only advanced by drafting (AR draft models, MTP) keep advancing; that floor makes the budget
++        soft (more than budget / 2 sequences exceed it). Unchanged when the budget is off.
+         """
+         if self.draft_row_budget <= 0 or window <= 1:
+             return window

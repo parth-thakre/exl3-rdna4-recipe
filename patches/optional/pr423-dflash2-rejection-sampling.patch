@@ -1,11 +1,15 @@
-From 8f1e309c583c21e9d8873a44f4331d0fe6c8a786 Mon Sep 17 00:00:00 2001
+From 8892d36ad1f088319fd2377aba3d389fdbcf7bd4 Mon Sep 17 00:00:00 2001
 From: Rafa <2588276+rafatxf@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 11:57:30 +0530
 Subject: [PATCH] DFlash2: speculative (rejection) sampling for stochastic
  samplers
 
 Upstream PR turboderp-org/exllamav3#423 by Rafa (@rafatxf), commit eef016b,
-applied unchanged on top of the RDNA4 series (applies cleanly; base 656b3f7).
+applied on top of the RDNA4 series (base 656b3f7). Rebased onto the batching series (rdna4-dev-batch) with one
+adaptation: walk_sample now takes the path-aligned state and logits (path_state, logits). The batch series'
+DFlash2 row pruning already slices them to block rows 1.. (and to the first dflash2_rows rows when the draft is
+short), so the original state[:, 1:] / logits[:, 1:] would have sliced a second time. The doc section heading
+and `import os` were already present on the new base.
 
 With temperature > 0 the generator verified DFlash2's greedy selector path by sampling the target and accepting
 matches, so a draft token was accepted with probability p(x). When the single active job's sampler is a stateless
@@ -31,30 +35,28 @@ reject_remainder -> rewind(num_rejected), or rewind(0) on full acceptance.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
- doc/env_vars.md                            |  24 +++++
+ doc/env_vars.md                            |  22 +++++
  exllamav3/architecture/dflash2.py          |  14 +++
  exllamav3/exllamav3_ext/bindings.cpp       |   1 +
  exllamav3/exllamav3_ext/dflash2.cu         |  80 ++++++++++++++-
  exllamav3/exllamav3_ext/dflash2.cuh        |  14 +++
- exllamav3/generator/generator.py           | 110 ++++++++++++++++++++-
+ exllamav3/generator/generator.py           | 109 ++++++++++++++++++++-
  exllamav3/generator/sampler/custom.py      |  80 +++++++++++++--
  exllamav3/modules/arch_specific/dflash2.py |  54 ++++++++++
  tests/test_dflash2_walk_sample.py          |  53 ++++++++++
  tests/test_dflash_spec_sampling.py         |  69 +++++++++++++
- 10 files changed, 482 insertions(+), 17 deletions(-)
+ 10 files changed, 479 insertions(+), 17 deletions(-)
  create mode 100644 tests/test_dflash2_walk_sample.py
  create mode 100644 tests/test_dflash_spec_sampling.py
 
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 974885c..b227618 100644
+index d3f3a29..2dfdf1f 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
-@@ -353,6 +353,30 @@ pipeline everywhere, for A/B testing.
- Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
- selection results, persisted across runs).
+@@ -383,6 +383,28 @@ leaves the draft length alone. Read when the Generator is created. Independently
+ DFlash2 runs the head and selector over only the block rows a round uses whenever the draft is
+ shorter than the block (a short `num_draft_tokens` included).
  
-+## Speculative decoding
-+
 +### `EXL3_DFLASH_SPEC` (default: `1`)
 +
 +Speculative (rejection) sampling for DFlash2 drafts, as in the DFlash reference and the Leviathan / Chen et al.
@@ -81,10 +83,10 @@ index 974885c..b227618 100644
  
  ### `EXL3_FUSED_SAMPLER` (default: `1`)
 diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
-index ff85e97..d417020 100644
+index b01d777..c6d5207 100644
 --- a/exllamav3/architecture/dflash2.py
 +++ b/exllamav3/architecture/dflash2.py
-@@ -280,6 +280,20 @@ class DFlash2Model(Model):
+@@ -291,6 +291,20 @@ class DFlash2Model(Model):
          # The generator stages the block ids in pinned memory: upload without a host sync
          anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
          export_conf = params.get("export_draft_conf", False)
@@ -93,7 +95,7 @@ index ff85e97..d417020 100644
 +        spec_t = params.get("dflash2_temperature", 0.0)
 +        if spec_t > 0.0:
 +            out, q, cands = self.selector.walk_sample(
-+                to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor, spec_t,
++                to_device(path_state, dev), to_device(logits, dev), anchor, spec_t,
 +                vocab_size = target.config.vocab_size,
 +                scale = self.config.output_multiplier,
 +                softcap = self.config.final_logit_softcapping,
@@ -269,16 +271,10 @@ index 2263eec..b3e379f 100644
  (
      const at::Tensor& logits,
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index aec4981..1105ae8 100644
+index 69aedac..560b583 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
-@@ -1,4 +1,5 @@
- from __future__ import annotations
-+import os
- import logging
- import torch
- from ..model.model import Model
-@@ -23,6 +24,36 @@ import threading
+@@ -24,6 +24,36 @@ import threading
  from ..tokenizer import MMEmbedding
  from ..util import profile_opt
  
@@ -315,10 +311,10 @@ index aec4981..1105ae8 100644
  class Generator:
  
      def __init__(
-@@ -903,6 +934,20 @@ class Generator:
-         }
-         if self.draft_calibrator is not None:
-             params["export_draft_conf"] = True
+@@ -919,6 +949,20 @@ class Generator:
+             # budget); the selector walk is sequential, so they come out the same with the later
+             # block rows' head and walk skipped
+             params["dflash2_rows"] = window
 +        # Speculative sampling (DFlash2): a single job whose sampler draws from a stateless distribution
 +        # (temperature / top-k / top-p / min-p) gets a sampled draft path, verified in iterate_gen by rejection
 +        # sampling instead of match-the-sample. Same output distribution, higher acceptance at temperature > 0
@@ -336,7 +332,7 @@ index aec4981..1105ae8 100644
          out_state = self.draft_model.forward(
              input_ids = batch_ids,
              params = params,
-@@ -940,9 +985,48 @@ class Generator:
+@@ -956,9 +1000,48 @@ class Generator:
              window = w_used
  
          self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
@@ -385,7 +381,7 @@ index aec4981..1105ae8 100644
      def iterate_ngram_gen(self, results: list):
  
          # Get shape of active batch
-@@ -1209,11 +1293,25 @@ class Generator:
+@@ -1240,11 +1323,25 @@ class Generator:
                  accepted_length = 1
                  rejected = 0
  
@@ -414,7 +410,7 @@ index aec4981..1105ae8 100644
                      eos, sampled_token, rq = job.receive_sample(
                          token_logits,
                          next_token,
-@@ -1268,7 +1366,11 @@ class Generator:
+@@ -1299,7 +1396,11 @@ class Generator:
                      # draft acceptance so state can be stashed at an exact page boundary.
                      if draft_tokens is not None and i < batch_logits.shape[1] - 1:
                          cp_boundary = batch_states is not None and job.is_checkpoint_boundary()

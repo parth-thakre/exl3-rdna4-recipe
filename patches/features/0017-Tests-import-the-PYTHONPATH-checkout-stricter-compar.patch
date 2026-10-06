@@ -1,0 +1,242 @@
+From 11bce813bac191bc33dcdc23ace9c7b55b45d390 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 14:26:49 +0530
+Subject: [PATCH 17/17] Tests: import the PYTHONPATH checkout; stricter compare
+ and MLP replay checks
+
+- test_greedy_equal.py: Python put the script's own checkout (wt-batch)
+  first on sys.path, so the documented wt-dev run imported wt-batch too.
+  The script drops that entry before importing (a PYTHONPATH entry for the
+  same checkout stays) and exits unless exllamav3 comes from the first
+  PYTHONPATH entry. test_gemv32.py gets the same guard.
+- test_greedy_equal.py --compare: both files must carry this script's
+  prompt set and one non-empty output per prompt, so a truncated or
+  mismatched run fails instead of comparing a subset.
+- test_gemv32.py BC GatedMLP check: 8 calls per row count, each with its
+  own random input, all kept alive, alternating fp32 / fp16 output (eager,
+  capture and replay per dtype, interleaved). After the last call, each
+  output is checked against the module's eager path on its own input. A
+  replay that reads a stale input or writes a stale or wrongly sized output
+  now fails; the old identical-input test could not see it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ test_gemv32.py       | 75 +++++++++++++++++++++++++++++++++++---------
+ test_greedy_equal.py | 51 ++++++++++++++++++++++++++----
+ 2 files changed, 105 insertions(+), 21 deletions(-)
+
+diff --git a/test_gemv32.py b/test_gemv32.py
+index 59431bd..9966452 100644
+--- a/test_gemv32.py
++++ b/test_gemv32.py
+@@ -11,13 +11,20 @@ Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 f
+      how many other jobs share the verify)
+   3. timing: WMMA vs the cooperative GEMM fallback (EXL3_GEMV_WMMA=0) at 8 / 16 / 24 / 32 rows
+   4. multi-matrix GEMV (fused gate+up mgemm, the GatedMLP path) at rows 9..32 against reconstruct_hgemm
+-  5. graphed BC GatedMLP at rows 1..32: graph replays (3rd call on) equal the eager first call bit for bit,
+-     with fresh input/output tensors each call, and the output matches a reconstruct + hgemm MLP
++  5. graphed BC GatedMLP at rows 1..32: per row count 8 calls with distinct inputs (all kept alive), fp32 and
++     fp16 output interleaved (one graph per row count and output dtype); every call, eager, capture and
++     replay, matches the module's eager path on its own input, and the first matches reconstruct + hgemm
+ """
+ import argparse
+ import os
++import sys
+ from pathlib import Path
+ 
++# Python puts this script's directory first on sys.path, ahead of PYTHONPATH; drop it so the checkout
++# under test is the one PYTHONPATH names (checked in main)
++if sys.path and os.path.abspath(sys.path[0] or os.curdir) == os.path.dirname(os.path.abspath(__file__)):
++    sys.path.pop(0)
++
+ os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
+ os.environ["EXL3_GEMV_MAX_M"] = "32"
+ 
+@@ -151,33 +158,63 @@ def check_mgemm(model, rows_list, args):
+         print(f"  rows {rows}: gate {eg:.3g} up {eu:.3g}", flush = True)
+ 
+ 
++def mlp_eager(mlp, x, out_dtype):
++    """The module's own eager path (BC graph detached): the same projection kernels, launched one by one
++    through Python, so a graph replay must reproduce it"""
++    bc = mlp.bc
++    mlp.bc = None
++    try:
++        return mlp.forward(x, {}, out_dtype = out_dtype)
++    finally:
++        mlp.bc = bc
++
++
+ def check_bc_mlp(model, args):
+     mlps = [m for m in walk(model) if type(m).__name__ == "GatedMLP" and m.bc is not None]
+     assert mlps, "no GatedMLP with a BC graph"
+     mlp = mlps[0]
+     limit = getattr(mlp_mod, "_bc_mlp_max_rows", mlp_mod.MAX_BSZN)
+-    print(f"\n5. graphed BC GatedMLP ({mlp.key}), Python row limit {limit}")
++    print(f"\n5. graphed BC GatedMLP ({mlp.key}), Python row limit {limit}, module out_dtype {mlp.out_dtype}")
+     assert limit >= 32, "this checkout's GatedMLP BC limit is below 32 rows (EXL3_BC_MLP_MAX_ROWS set?)"
+     set_wmma(True, 4)
+     dev = mlp.device
+     g, u, d = mlp.gates[0].inner, mlp.ups[0].inner, mlp.downs[0].inner
++    # Per row count: 8 calls alternating fp32 / fp16 output, so each output dtype goes eager, capture,
++    # replay, replay, interleaved with the other dtype's graph (a graph keyed by row count alone would
++    # replay the other dtype's epilogue into this output). Every call gets its own random input, kept
++    # alive, and its own output; all are checked after the last call, each against the eager path on its
++    # own input. A replay reading a stale input pointer, or writing a stale / wrongly sized output,
++    # lands on another call's data and misses by O(1)
++    dtypes = (torch.float, torch.half)
+     for rows in list(range(1, 33)):
+-        x0 = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
+-        outs = []
+-        for call in range(5):
+-            x = x0.clone()   # fresh pointers every call: the graph has to patch input and output
+-            outs.append(mlp.forward(x, {}).float().clone())
+-        for call in range(1, 5):
+-            assert torch.equal(outs[call], outs[0]), f"rows {rows}: call {call} (graph) != eager first call"
+-        # reference: reconstruct + hgemm with the module's activation
++        xs, outs = [], []
++        for call in range(8):
++            dt = dtypes[call % 2]
++            x = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
++            y = mlp.forward(x, {}, out_dtype = dt)
++            assert y.dtype == dt, (rows, call, y.dtype, dt)
++            xs.append(x)
++            outs.append(y)
++        exact = 0
++        worst = 0.0
++        for call, (x, y) in enumerate(zip(xs, outs)):
++            ref = mlp_eager(mlp, x, dtypes[call % 2])
++            err = rel_err(y.float(), ref.float())
++            worst = max(worst, err)
++            exact += int(torch.equal(y, ref))
++            assert err <= args.replay_relative_error, \
++                f"rows {rows} call {call} ({dtypes[call % 2]}): BC output vs eager on its own input {err:.3g}"
++        # Absolute accuracy of the first call: reconstruct + hgemm with the module's activation
++        x0 = xs[0]
+         gg = g.reconstruct_hgemm(x0, torch.half).float()
+         uu = u.reconstruct_hgemm(x0, torch.half).float()
+         a = (torch.nn.functional.silu(gg) * uu).half()
+-        ref = d.reconstruct_hgemm(a, torch.float).float()
+-        err = rel_err(outs[0], ref)
+-        assert err <= args.mlp_relative_error, (rows, err)
++        ref0 = d.reconstruct_hgemm(a, torch.float).float()
++        err0 = rel_err(outs[0].float(), ref0)
++        assert err0 <= args.mlp_relative_error, (rows, err0)
+         if rows in (1, 8, 9, 16, 17, 32) or args.verbose:
+-            print(f"  rows {rows}: graph replays identical, rel_err vs reconstruct {err:.3g}", flush = True)
++            print(f"  rows {rows}: 8 calls fp32/fp16 interleaved, max rel_err vs eager {worst:.3g} "
++                  f"({exact}/8 bit-identical), rel_err vs reconstruct {err0:.3g}", flush = True)
+ 
+ 
+ @torch.inference_mode()
+@@ -191,8 +228,16 @@ def main():
+     parser.add_argument("--relative-error", type = float, default = 0.005,
+                         help = "max abs error / max reference magnitude")
+     parser.add_argument("--mlp-relative-error", type = float, default = 0.02)
++    parser.add_argument("--replay-relative-error", type = float, default = 1e-3,
++                        help = "BC GatedMLP output vs the module's eager path on the same input")
+     parser.add_argument("--verbose", action = "store_true")
+     args = parser.parse_args()
++    import exllamav3
++    pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
++    loaded = os.path.realpath(exllamav3.__file__)
++    assert pp and loaded.startswith(os.path.realpath(pp[0]) + os.sep), \
++        f"exllamav3 imported from {loaded}, not from the first PYTHONPATH entry {pp[:1]}"
++    print(f"exllamav3 from {os.path.dirname(loaded)}")
+     torch.manual_seed(0)
+ 
+     model = Model.from_config(Config.from_directory(args.model))
+diff --git a/test_greedy_equal.py b/test_greedy_equal.py
+index 55e902b..22d33a6 100644
+--- a/test_greedy_equal.py
++++ b/test_greedy_equal.py
+@@ -2,7 +2,9 @@
+ 
+ Loads the target + DFlash2 draft like TabbyAPI (Q4 caches, max_history = draft tokens), runs each prompt
+ greedily, and writes the generated token ids to --out. Run it once per checkout (PYTHONPATH selects the tree),
+-then --compare the two files: every prompt must match token for token.
++then --compare the two files: every prompt must match token for token. exllamav3 must import from the first
++PYTHONPATH entry (checked; this script's own directory is dropped from sys.path), and --compare requires
++both files to hold this script's full prompt set.
+ 
+   source env.sh; export EXL3_GDN_REPLAY=1
+   PYTHONPATH=$W/wt-dev   python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_dev.json
+@@ -15,10 +17,47 @@ rounds differently), so compare a batched file against a bs1 file for the common
+ """
+ import argparse, json, os, sys, time
+ 
++# Python puts this script's directory (the wt-batch checkout) first on sys.path, ahead of PYTHONPATH, so
++# without this every run would import wt-batch whatever PYTHONPATH says. Drop that entry only: when
++# PYTHONPATH names this same checkout, its own (later) entry stays
++_HERE = os.path.dirname(os.path.abspath(__file__))
++if sys.path and os.path.abspath(sys.path[0] or os.curdir) == _HERE:
++    sys.path.pop(0)
++
++PROMPTS = ["Write a Python LRU cache class with get/put and unit tests. Code only.",
++           "Write a Python function to parse ISO-8601 durations, with tests. Code only.",
++           "Write a Python trie with insert, search and prefix listing, with tests. Code only.",
++           "Write a Python token-bucket rate limiter class with tests. Code only."]
++
++
++def check_import_tree(exllamav3):
++    """Fail unless exllamav3 came from the first PYTHONPATH entry (the checkout under test)."""
++    pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
++    if not pp:
++        sys.exit("FAIL: set PYTHONPATH to the checkout under test (e.g. $W/wt-dev or $W/wt-batch)")
++    tree = os.path.realpath(pp[0])
++    loaded = os.path.realpath(exllamav3.__file__)
++    if not loaded.startswith(tree + os.sep):
++        sys.exit(f"FAIL: exllamav3 imported from {loaded}, not from the PYTHONPATH checkout {tree}")
++    return tree
++
+ 
+ def compare(a_path, b_path):
+     a, b = json.load(open(a_path)), json.load(open(b_path))
+     print(f"A: {a_path} ({a['meta']})\nB: {b_path} ({b['meta']})")
++    # Same prompt set on both sides, every prompt present, every output non-empty
++    n = len(PROMPTS)
++    problems = []
++    for tag, r in (("A", a), ("B", b)):
++        if r.get("prompts") != PROMPTS:
++            problems.append(f"{tag}: prompt set differs from this script's ({len(r.get('prompts') or [])} prompts)")
++        if len(r["ids"]) != n:
++            problems.append(f"{tag}: {len(r['ids'])} outputs, expected {n}")
++        if any(len(x) == 0 for x in r["ids"]):
++            problems.append(f"{tag}: empty output(s)")
++    if problems:
++        print("FAIL: " + "; ".join(problems))
++        return False
+     ok = True
+     for i, (x, y) in enumerate(zip(a["ids"], b["ids"])):
+         n = next((k for k, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
+@@ -49,6 +88,8 @@ def main():
+     os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
+     import torch
+     import exllamav3
++    tree = check_import_tree(exllamav3)
++    print(f"exllamav3 from {os.path.dirname(exllamav3.__file__)} (PYTHONPATH checkout {tree})")
+     from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
+     from exllamav3.cache import CacheLayer_quant
+ 
+@@ -67,10 +108,7 @@ def main():
+                     max_batch_size = max(args.bsz, 1), num_draft_tokens = args.draft_tokens,
+                     recurrent_cache_size = 512 * 1024**2)
+ 
+-    prompts = ["Write a Python LRU cache class with get/put and unit tests. Code only.",
+-               "Write a Python function to parse ISO-8601 durations, with tests. Code only.",
+-               "Write a Python trie with insert, search and prefix listing, with tests. Code only.",
+-               "Write a Python token-bucket rate limiter class with tests. Code only."]
++    prompts = PROMPTS
+     # The system prompt keeps every prompt above 32 tokens: a 9..32-token prefill now takes the WMMA GEMV
+     # (rdna4-dev: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
+     # the same kernels in both trees, so with longer prompts the outputs must match exactly
+@@ -106,7 +144,8 @@ def main():
+     n = sum(len(v) for v in results.values())
+     meta = (f"{os.path.dirname(exllamav3.__file__)}, bsz {args.bsz}, draft {args.draft_tokens}, "
+             f"budget {os.environ.get('EXL3_DRAFT_ROW_BUDGET', 'unset')}, {n} tokens in {wall:.1f}s")
+-    json.dump({"meta": meta, "ids": [results[i] for i in range(len(prompts))]}, open(args.out, "w"))
++    json.dump({"meta": meta, "prompts": prompts, "ids": [results[i] for i in range(len(prompts))]},
++              open(args.out, "w"))
+     print(f"wrote {args.out}: {meta}")
+     for i in range(len(prompts)):
+         print(f"--- prompt {i}: {len(results[i])} tokens\n{tok.decode(torch.tensor(results[i]))[:300]}")

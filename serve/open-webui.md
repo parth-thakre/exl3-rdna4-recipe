@@ -25,6 +25,6 @@ starts on boot in our setup; use a systemd user unit or `podman generate systemd
 
 ## Suggested chat settings
 
-For hard reasoning questions, set `reasoning_effort` to `medium` and use the anti-spiral system prompt from the main
-README (per chat, or in the model's advanced parameters). On GPQA it removed every thinking spiral that hit the token
+For hard reasoning questions, set `reasoning_effort` to `medium` and use the anti-spiral system prompt from
+`notes/measurements.md` (per chat, or in the model's advanced parameters). On GPQA it removed every thinking spiral that hit the token
 cap and was faster at equal or better accuracy. We haven't made it the default in our own Open WebUI yet.

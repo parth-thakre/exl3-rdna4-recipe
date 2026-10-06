@@ -1,0 +1,74 @@
+From a784aacb6bf7c073408a01a67ad6f54f6f174f7c Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 14:25:08 +0530
+Subject: [PATCH 14/17] GatedMLP: key BC graphs by output dtype as well as row
+ count
+
+BC_GatedMLP kept one captured graph per row count. The down projection's
+epilogue (fp16 or fp32 stores) is baked into the captured kernel, so a
+graph captured with an fp32 output and replayed for an fp16 output at the
+same row count (only the output pointer patched) wrote fp32 values past
+the half-size allocation. The reverse left garbage. This predates the
+32-row change: rows 1-8 had the same single key.
+
+- graph_bszN[fp32 output][rows - 1]: each output dtype gets its own graph.
+- run_bszN checks its inputs: x fp16, d fp16 or fp32, contiguous, and
+  exactly rows x out_features. A wrong shape is now an error rather than
+  an out-of-bounds write.
+
+No in-model caller varies the dtype: every GatedMLP.forward call site
+(TransformerBlock, DFlash2Block, BlockSparseMLP shared experts) passes no
+out_dtype, so each instance always gets its own out_dtype, and the target
+and draft MLPs are separate instances with separate graphs. The bug was
+reachable only by direct callers that pass out_dtype.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ exllamav3/exllamav3_ext/libtorch/mlp.cpp | 8 +++++++-
+ exllamav3/exllamav3_ext/libtorch/mlp.h   | 9 ++++++---
+ 2 files changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+index 868ede4..5aaecd4 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+@@ -104,12 +104,18 @@ void BC_GatedMLP::run_bszN
+ {
+     int num_tokens = (int) x.numel() / (int) x.size(-1);
+     TORCH_CHECK(num_tokens >= 1 && num_tokens <= MLP_MAX_ROWS, "run_bszN: bsz out of supported range");
++    TORCH_CHECK(x.scalar_type() == at::kHalf, "BC_GatedMLP::run_bszN: input must be fp16");
++    TORCH_CHECK(d.scalar_type() == at::kHalf || d.scalar_type() == at::kFloat,
++                "BC_GatedMLP::run_bszN: output must be fp16 or fp32");
++    TORCH_CHECK(d.numel() == (int64_t) num_tokens * down->svh.size(0) && d.is_contiguous(),
++                "BC_GatedMLP::run_bszN: output must be contiguous (num_tokens, out_features)");
+     int graphidx = num_tokens - 1;
++    const int dtypeidx = d.scalar_type() == at::kFloat ? 1 : 0;
+ 
+     c10::cuda::CUDAGuard device_guard(x.device());
+     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+-    Graph& g = graph_bszN[graphidx];
++    Graph& g = graph_bszN[dtypeidx][graphidx];
+ 
+     if (g.disabled || (!g.ready && !g.ready_to_record))
+     {
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
+index b733544..9945895 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
+@@ -42,9 +42,12 @@ struct BC_GatedMLP
+     std::shared_ptr<BC_LinearEXL3> down;
+     float act_limit;
+ 
+-    // graph_bszN[num_tokens - 1] covers num_tokens 1..MLP_MAX_ROWS (num_tokens==1 behaves exactly
+-    // as the original dedicated bsz-1 path)
+-    Graph graph_bszN[MLP_MAX_ROWS];
++    // graph_bszN[fp32 output][num_tokens - 1] covers num_tokens 1..MLP_MAX_ROWS (num_tokens==1 behaves
++    // exactly as the original dedicated bsz-1 path). The output dtype is part of the key: the down
++    // projection's epilogue (fp16 or fp32 stores) is baked into the captured kernel, and replaying a
++    // graph captured for the other dtype with only the output pointer patched would write the wrong
++    // element size into d
++    Graph graph_bszN[2][MLP_MAX_ROWS];
+ 
+     // guh/gu hold TWO slots (gate, up) side by side; the fused mgemm kernel addresses slot j at
+     // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the

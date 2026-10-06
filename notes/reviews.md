@@ -1,14 +1,21 @@
 # Code reviews of the patches
 
-Two review rounds by a second model (Sol, GPT-6.1 at high effort) on the exllamav3 changes. d6a4353 and 70ba2c2 are
-local work commits, not upstream ones; file:line references point into those trees.
+Every change in this repo (the exllamav3 patches, the scripts and the docs) was written by Claude Opus 5.5 and
+reviewed by GPT-6.1 Sol (at high effort), round by round, until the reviewer had no open findings on the production
+path. The reviews were static reads plus CPU-side checks; GPU validation was run separately on the test machine and
+is noted where relevant. Commit hashes below (d6a4353, 70ba2c2, and the branch names) are local work commits, not
+upstream ones; file:line references point into those trees.
 
-All six items of the first review were fixed in a review-fixes commit on the old base; in the port to 0662fac those
-fixes are folded into the commits in `patches/features/`. The five items of the second review are fixed in the
-DeltaNet replay commit: abandoned caches hand their pending records back on eviction,
-rewind validates every layer before consuming anything and marks failed commits, recording storage uses bounded
-power-of-two row buckets, the test counts real captured-graph launches, and `batched_gdn_replay` checks head counts
-before using them. Both are in the combined patch.
+Where the findings ended up:
+
+- First review (RDNA4 patches): all six items fixed in a review-fixes commit on the old base; in the port to 0662fac
+  those fixes are folded into the commits in `patches/features/`.
+- Second review (DeltaNet replay): all five items fixed in the replay commit. Abandoned caches hand their pending
+  records back on eviction, rewind validates every layer before consuming anything and marks failed commits,
+  recording storage uses bounded power-of-two row buckets, the test counts real captured-graph launches, and
+  `batched_gdn_replay` checks head counts before using them.
+- Batching series: fixed in the series itself (two rounds); the open items are test-only.
+- PR #423 (upstream, not ours): not clean, so it ships as an optional patch that is off by default.
 
 ## Review of d6a4353 (RDNA4 patches), 2026-10-06
 
@@ -38,4 +45,38 @@ kernel args (2,064 / 1,048 B, under 4 KB). Off the normal path:
 3. P2: per-layer recording buffers accumulate per (bsz, seqlen) shape: up to 4,896 rows/layer vs 128.
 4. P3: the test counts configured buffers, not captured-graph launches.
 5. P3: gdn.cu:2206 can hit `% 0` before validating head counts.
-Sent back to the Opus author for fixes; a Sol re-review comes after.
+Sent back to the author for fixes, then re-reviewed (fixed as listed above).
+
+## Review of the batching series (16/32-row WMMA GEMV, graphed MLP to 32 rows, row budget), 2026-10-06
+
+Round 1: the kernel is clean (layouts, partial tiles, LDS barriers, 40/48/32 KiB of LDS). Fixed in the series: the MLP
+graph cache was keyed by row count only (a dtype mismatch could write out of bounds; never hit by this model), the
+graphed MLP path bypassed LoRA adapters and per-projection controls, the row budget was made soft, DFlash2 row pruning,
+and three weak tests (one of them, through `sys.path`, compared a checkout with itself).
+
+Round 2: no production regression; the Qwen3.8 dense target and the DFlash2 draft stay on the fast path. Open, all
+test-only: the tests don't check which native extension build was loaded (they import whatever is first on
+`PYTHONPATH`); the batch sanity bench could flag shared prompt boilerplate as cross-talk (it didn't fire, and
+`bench/bench_batch_sanity.py` now treats that signal as informational unless the topic check also fails); exact
+replay determinism on the same path is no longer asserted.
+
+GPU validation: bs1 greedy output identical to the series' base; bs2 and bs4 batched outputs identical to bs1 over 400
+tokens; a 120k fill with 4 slots peaks at 16.13 GB; through TabbyAPI 132 tok/s for one request and 303 tok/s combined
+for 4 concurrent requests.
+
+## Review of upstream PR #423 (DFlash2 rejection sampling), 2026-10-06
+
+Reviewed as rebased onto our RDNA4 series (before the batching series). Not clean, so we don't use it and the recipe
+ships it off by default.
+- P1: speculative verify bypasses job-level token masks (`min_new_tokens`, banned-string retries), so a stop token can
+  end generation early (generator.py:1011).
+- P2: `probs()` truncates top-k by exact count at ties; the fused sampler keeps every tied token (custom.py:1203).
+- P2: the sampled DFlash2 path skips the `draft_conf` export, which disables confidence calibration
+  (dflash2.py:286-296).
+- P3: extra device-to-host syncs on the hot path.
+
+Correct: the accept/residual/bonus math, the GDN replay accounting, the RNG handling; greedy decoding unaffected. GPU,
+on that pre-batching rebase: sampled prose 59.3 -> 62.6 tok/s, acceptance 24% -> 26%; greedy output identical.
+
+The patch has since been rebased onto the batching series with one adaptation (see `patches/README.md`). That rebase
+has been compiled but not yet reviewed or run on the GPU.

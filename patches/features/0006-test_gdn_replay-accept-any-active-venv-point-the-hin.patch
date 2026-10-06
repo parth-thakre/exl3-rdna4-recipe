@@ -1,7 +1,7 @@
 From 4cbf7faaff3aeb4cbb6ea8b9965c0b5663ccb45b Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 12:30:05 +0530
-Subject: [PATCH 6/6] test_gdn_replay: accept any active venv, point the hint
+Subject: [PATCH 06/17] test_gdn_replay: accept any active venv, point the hint
  at setup/env.sh
 
 The check required the original workspace venv and its deps path. It now

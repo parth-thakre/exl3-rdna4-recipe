@@ -1,8 +1,8 @@
 From 0603ac1d29ff199fad53d75750556fe374c0016b Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:03 +0530
-Subject: [PATCH 3/6] Split-decode attention: GQA grouping, EXL3_DEC_* tuning,
- Q4W kernel
+Subject: [PATCH 03/17] Split-decode attention: GQA grouping, EXL3_DEC_*
+ tuning, Q4W kernel
 
 A program of the split-decode kernel takes 16 query rows, so a multi-token
 verify (q_len 8) spreads Qwen's 6-head GQA groups over 3 programs, each

@@ -22,6 +22,9 @@ export CC=${CC:-gcc}
 command -v "$CC" >/dev/null || echo "setup/env.sh: warning: C compiler '$CC' not found; Triton kernels won't compile" >&2
 export CPATH="$DEPS_DIR/usr/include:$DEPS_DIR/usr/include/python3.12${CPATH:+:$CPATH}"
 
+# Expandable segments cut allocator fragmentation, which otherwise can OOM a long prefill after concurrent use
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 # HIP graphs stay on. Graph::launch re-instantiates every 100k node updates (EXL3_GRAPH_REINST), which avoids the
 # kernel-argument pool exhaustion in libamdhip64 (segfault after ~1.6M updates, about 1 h of serving).
 

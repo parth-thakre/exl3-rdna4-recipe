@@ -5,13 +5,14 @@ point at this repo's layout. Dates are 2026. Numbers are from one RX 9070 XT (16
 `wt-replay` were local work branches. All of this was on exllamav3 f1cf869 and TabbyAPI f07131c (with a since
 superseded TabbyAPI patch); the work has since been ported to exllamav3 0662fac as the commits in `patches/features/`.
 The WMMA GEMV, graph re-instantiation, GQA decode attention with Q4W, the review fixes and the DeltaNet replay are in
-`patches/exllamav3-rdna4.patch`. The 16-row GEMV, adaptive draft length, tree fallback and Q4P experiments below are
-not in this repo.
+`patches/exllamav3-rdna4.patch`. The 16-row GEMV below later grew into the batching series (16- and 32-row GEMV),
+which is in the patch too; see `notes/measurements.md`. The adaptive draft length, tree fallback and Q4P experiments
+are not in this repo. These notes stop before the batching work.
 
 Some configuration labels in these notes are loose (for example, the "before/after attention patch" rows mix 64k and
-80k servers, and the MTP row mixes 128k, 144k and 160k servers). The tables in the main README were rechecked against
+80k servers, and the MTP row mixes 128k, 144k and 160k servers). The tables in `notes/measurements.md` were rechecked against
 the raw benchmark logs and give the exact configuration and prompt length of every number; where the two disagree,
-the README is right.
+`notes/measurements.md` is right.
 
 ## Recommended request settings
 

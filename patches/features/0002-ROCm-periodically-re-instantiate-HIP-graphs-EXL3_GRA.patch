@@ -1,7 +1,7 @@
 From 9f91c4ccd153dcb5abe497f79d9293245c903b9d Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:03 +0530
-Subject: [PATCH 2/6] ROCm: periodically re-instantiate HIP graphs
+Subject: [PATCH 02/17] ROCm: periodically re-instantiate HIP graphs
  (EXL3_GRAPH_REINST)
 
 hipGraphExecKernelNodeSetParams draws on a fixed per-exec kernel-argument

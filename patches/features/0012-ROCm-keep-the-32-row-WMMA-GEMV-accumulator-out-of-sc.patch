@@ -1,0 +1,40 @@
+From 170aff708b7f5c501c5a387fa07184167c640d52 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 13:42:26 +0530
+Subject: [PATCH 12/17] ROCm: keep the 32-row WMMA GEMV accumulator out of
+ scratch
+
+The fused epilogue's store loop stopped at rows_valid with a break. At
+M = 32 that blocked the full unroll, so acc[32] was dynamically indexed and
+every M = 32 WMMA instantiation got 144 B of scratch (code-object metadata;
+M = 8 and M = 16 had none). The loop now skips rows past rows_valid
+instead: same stores, fully unrolled, and the M = 32 kernels have no
+scratch (VGPRs 50-172, no spills).
+
+The fdot2 multi-row kernels share the epilogue. Their resource use is
+unchanged: their scratch, 48-144 B at M = 2..8, is the same as in
+rdna4-dev and comes from the per-tile accumulator array, not this loop.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+index 40998e1..7ff849c 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+@@ -319,10 +319,12 @@ __device__ __forceinline__ void exl3_gemv_fused_epilogue_mr
+ {
+     if (lane < 16)
+     {
++        // Predicated rather than an early break: the break form stops the full unroll at M = 32, which
++        // leaves acc dynamically indexed (in scratch)
+         #pragma unroll
+         for (int r = 0; r < M; ++r)
+         {
+-            if (r >= rows_valid) break;
++            if (r >= rows_valid) continue;
+             const int64_t out_idx = row_off + (int64_t) r * ldc + tile_n * 16 + lane;
+             if constexpr (c_fp32)
+                 ((float*) Cb)[out_idx] = acc[r];

@@ -1,5 +1,5 @@
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index e02c346..974885c 100644
+index e02c346..d3f3a29 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
 @@ -37,12 +37,51 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)
@@ -54,7 +54,7 @@ index e02c346..974885c 100644
  ### `EXL3_BC_DSA` (default: `1`)
  
  DeepSeek-V4 counterpart of `EXL3_BC_ATTN`: for decode steps (bsz 1, q_len ≤ 16) the whole DSA
-@@ -106,6 +145,22 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
+@@ -106,6 +145,29 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
  the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
  force the torch path, for A/B testing.
  
@@ -65,6 +65,13 @@ index e02c346..974885c 100644
 +48-layer model): the verify pass reads the committed state without writing it, and the rewind
 +replays only the accepted prefix of the recorded verify inputs. The resulting state is bit-identical
 +to the history path. Mamba2 layers keep their history.
++
++### `EXL3_BC_MLP_MAX_ROWS` (default: `32`)
++
++Most rows (bsz x q_len) the graphed dense GatedMLP path (`BC_GatedMLP`) takes; larger inputs run
++the eager path. The limit is 32 (`MLP_MAX_ROWS`, which also sizes the shared static scratch), so a
++batched speculative verify up to 4 x 8 rows stays graphed; `8` restores the previous limit.
++Read at import.
 +
 +### `EXL3_BC_GDN_REPLAY` (default: `1`)
 +
@@ -77,19 +84,27 @@ index e02c346..974885c 100644
  ### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
  
  Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
-@@ -234,6 +289,20 @@ the path wherever its hard constraints allow (testing).
+@@ -234,6 +296,28 @@ the path wherever its hard constraints allow (testing).
  Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
  forces shuffle extraction, `1` forces shared-memory staging. Testing only.
  
 +### `EXL3_GEMV_WMMA` (ROCm gfx1200 / gfx1201; default: `0`)
 +
-+Multi-row EXL3 GEMV (2-8 rows, e.g. a speculative verify) on the gfx12 WMMA units: each 16x16
-+trellis tile is decoded once and one `v_wmma_f32_16x16x16_f16` takes all rows, instead of one
-+fdot2 chain per row. Covers integer bitrates in the single-matrix GEMV and the unweighted
-+single-token multi-matrix GEMV; everything else keeps the fdot2 kernels. Devices other than
++Multi-row EXL3 GEMV (2-32 rows, e.g. a speculative verify, or a batched one at bsz 4 x 8 rows) on
++the gfx12 WMMA units: each 16x16 trellis tile is decoded once and one `v_wmma_f32_16x16x16_f16`
++per 16 rows takes them all, instead of one fdot2 chain per row. Covers integer bitrates in the single-matrix
++GEMV and the unweighted single-token multi-matrix GEMV; everything else keeps the fdot2 kernels
++(2-8 rows) or the cooperative GEMM (9 rows and up). Devices other than
 +gfx1200 / gfx1201 (gfx11 included) also keep them whatever the setting: eligibility is checked per
 +device at runtime. Results match the fdot2 path to fp32 rounding, not bit for bit. Read on every
 +call, unlike most C++-side variables, so tests can toggle it.
++
++### `EXL3_GEMV_MAX_M` (ROCm; default: `32`)
++
++Largest row count the RDNA multi-row GEMV takes (clamped to 1-32). Rows 9 and up need
++`EXL3_GEMV_WMMA` on a gfx12 device and fall back to the cooperative GEMM otherwise. `8` restores
++the original limit, `16` the single-M-tile one, `1` switches the multi-row path off. Read on every
++call.
 +
 +### `EXL3_GEMV_WMMA_U` (default: `4`)
 +
@@ -98,6 +113,63 @@ index e02c346..974885c 100644
  ### `EXL3_INT8_GEMV` (default: `2`)
  
  Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
+@@ -284,6 +368,21 @@ pipeline everywhere, for A/B testing.
+ Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
+ selection results, persisted across runs).
+ 
++## Speculative decoding
++
++### `EXL3_DRAFT_ROW_BUDGET` (default: `0`, off)
++
++Occupancy-aware draft length. A batched verify forward is (active sequences) x (draft + 1) rows.
++With a budget N, each round drafts `min(num_draft_tokens, N // sequences - 1)` tokens, at least 1,
++so the verify stays within N rows (the multi-row GEMV's fast range: 32 on gfx12 with
++`EXL3_GEMV_WMMA=1`). For example, `16` with 7 draft tokens drafts 7 at one or two jobs and 3 at four.
++The budget is soft: the draft never drops below one token (drafting is what advances AR draft-model
++and MTP caches), so more than N / 2 active sequences verify 2 rows each and exceed N (N = 32 at 17
++sequences: 34 rows). Applies to every draft mode (DFlash2, draft model, MTP, n-gram). `0` or unset
++leaves the draft length alone. Read when the Generator is created. Independently of the budget,
++DFlash2 runs the head and selector over only the block rows a round uses whenever the draft is
++shorter than the block (a short `num_draft_tokens` included).
++
+ ## Sampling
+ 
+ ### `EXL3_FUSED_SAMPLER` (default: `1`)
+diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
+index ff85e97..b01d777 100644
+--- a/exllamav3/architecture/dflash2.py
++++ b/exllamav3/architecture/dflash2.py
+@@ -273,8 +273,19 @@ class DFlash2Model(Model):
+         target verifier still samples normally and accepts only exact matches."""
+         target = self.attached_model()
+         lm = target.modules[target.logit_layer_idx]
+-        logits = lm.prepare_for_device(state.half(), params)
+-        logits = lm.forward(logits, params)
++        # The generator's row budget may use only the first `rows` path positions. The walk is
++        # sequential (row i depends on rows < i only) and the head is row-wise, so the head and the
++        # walk run over block rows 1..rows alone: the anchor row's logits are never used, and rows
++        # past the window would only cost head rows (the target's head, the widest linear)
++        rows = params.get("dflash2_rows")
++        if rows is not None and 0 < rows < state.shape[1] - 1:
++            path_state = state[:, 1:1 + rows]
++            logits = lm.prepare_for_device(path_state.half().contiguous(), params)
++            logits = lm.forward(logits, params)
++        else:
++            path_state = state[:, 1:]
++            logits = lm.prepare_for_device(state.half(), params)
++            logits = lm.forward(logits, params)[:, 1:]
+ 
+         dev = self.selector.device
+         # The generator stages the block ids in pinned memory: upload without a host sync
+@@ -286,7 +297,7 @@ class DFlash2Model(Model):
+         # (draft's last block) and the logits (target's head) may sit on other devices than
+         # the selector: to_device bounces pairs with a broken peer path through the host
+         out, confidence = self.selector.walk_block(
+-            to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor,
++            to_device(path_state, dev), to_device(logits, dev), anchor,
+             return_confidence = export_conf,
+             vocab_size = target.config.vocab_size,
+             scale = self.config.output_multiplier,
 diff --git a/exllamav3/cache/cache.py b/exllamav3/cache/cache.py
 index 3589188..2c82243 100644
 --- a/exllamav3/cache/cache.py
@@ -1210,11 +1282,173 @@ index 2041610..2e7fdf6 100644
  .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
      py::arg("ptrs_trellis"),
      py::arg("ptrs_suh"),
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+index ac8c6c4..5aaecd4 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
+@@ -19,17 +19,23 @@ void BC_GatedMLP::run_bszN_gr
+     Graph* graph
+ )
+ {
+-    // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
+-    // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
+-    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
+-    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
+-    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
++    // guh/gu hold 2 slots (gate, up); slicing the static (2, MLP_MAX_ROWS, width) buffers along dim 1
++    // would leave dim 0's stride at MLP_MAX_ROWS*width instead of num_tokens*width, corrupting the
++    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MLP_MAX_ROWS --
++    // view the statics' leading 2*num_tokens*width elements as (2, num_tokens, width) instead
++    // (a/down_xh have no such issue: their slot dim is size 1, so slicing the token dim -- the true
++    // leading dim there -- stays contiguous)
++    auto flat_prefix = [num_tokens](const at::Tensor& t)
++    {
++        const int64_t w = t.size(2);
++        return t.view({-1}).narrow(0, 0, 2 * (int64_t) num_tokens * w).view({2, (int64_t) num_tokens, w});
++    };
+     at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
+     if (!guh_n_ref.defined())
+-        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
++        guh_n_ref = flat_prefix(guh);
+     at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
+     if (!gu_n_ref.defined())
+-        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
++        gu_n_ref = flat_prefix(gu);
+     at::Tensor guh_n     = guh_n_ref;
+     at::Tensor gu_n      = gu_n_ref;
+     at::Tensor a_n       = a.slice(1, 0, num_tokens);
+@@ -97,13 +103,19 @@ void BC_GatedMLP::run_bszN
+ )
+ {
+     int num_tokens = (int) x.numel() / (int) x.size(-1);
+-    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN: bsz out of supported range");
++    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MLP_MAX_ROWS, "run_bszN: bsz out of supported range");
++    TORCH_CHECK(x.scalar_type() == at::kHalf, "BC_GatedMLP::run_bszN: input must be fp16");
++    TORCH_CHECK(d.scalar_type() == at::kHalf || d.scalar_type() == at::kFloat,
++                "BC_GatedMLP::run_bszN: output must be fp16 or fp32");
++    TORCH_CHECK(d.numel() == (int64_t) num_tokens * down->svh.size(0) && d.is_contiguous(),
++                "BC_GatedMLP::run_bszN: output must be contiguous (num_tokens, out_features)");
+     int graphidx = num_tokens - 1;
++    const int dtypeidx = d.scalar_type() == at::kFloat ? 1 : 0;
+ 
+     c10::cuda::CUDAGuard device_guard(x.device());
+     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+ 
+-    Graph& g = graph_bszN[graphidx];
++    Graph& g = graph_bszN[dtypeidx][graphidx];
+ 
+     if (g.disabled || (!g.ready && !g.ready_to_record))
+     {
+diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
+index c0a31e1..9945895 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mlp.h
++++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
+@@ -10,6 +10,11 @@ namespace py = pybind11;
+ 
+ #define MAX_BSZN 8   // must match MAX_BSZN in blocksparse_mlp.h / BlockSparseMLP.py
+ 
++// Rows (bsz * q_len) the graphed dense BC_GatedMLP takes, separate from the MoE kernels' MAX_BSZN:
++// a batched speculative verify is bsz x (draft + 1) rows, e.g. 4 x 8. Must match MLP_MAX_ROWS in
++// modules/mlp.py, which sizes the static scratch
++#define MLP_MAX_ROWS 32
++
+ // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
+ // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
+ // using this class's OWN scratch (down_xh) rather than gate/up/down's BC_LinearEXL3::run_gr,
+@@ -37,16 +42,20 @@ struct BC_GatedMLP
+     std::shared_ptr<BC_LinearEXL3> down;
+     float act_limit;
+ 
+-    // graph_bszN[num_tokens - 1] covers num_tokens 1..MAX_BSZN (num_tokens==1 behaves exactly as
+-    // the original dedicated bsz-1 path)
+-    Graph graph_bszN[MAX_BSZN];
++    // graph_bszN[fp32 output][num_tokens - 1] covers num_tokens 1..MLP_MAX_ROWS (num_tokens==1 behaves
++    // exactly as the original dedicated bsz-1 path). The output dtype is part of the key: the down
++    // projection's epilogue (fp16 or fp32 stores) is baked into the captured kernel, and replaying a
++    // graph captured for the other dtype with only the output pointer patched would write the wrong
++    // element size into d
++    Graph graph_bszN[2][MLP_MAX_ROWS];
+ 
+     // guh/gu hold TWO slots (gate, up) side by side; the fused mgemm kernel addresses slot j at
+     // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
+-    // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
+-    // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
+-    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
+-    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
++    // (2, MLP_MAX_ROWS, width) static buffer when num_tokens == MLP_MAX_ROWS (slicing dim 1 leaves
++    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for
++    // any other num_tokens). Each entry is instead an exactly (2, num_tokens, width)-shaped view of
++    // the static's first 2*num_tokens*width elements: contiguous, slot 1 where the kernel expects
++    // it, and no per-layer allocation (the statics are shared between layers, like a/down_xh)
+     std::vector<at::Tensor> guh_cache;
+     std::vector<at::Tensor> gu_cache;
+ 
+@@ -89,8 +98,13 @@ struct BC_GatedMLP
+         act_limit           (_act_limit)
+     {
+         TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
+-        guh_cache.resize(MAX_BSZN);
+-        gu_cache.resize(MAX_BSZN);
++        TORCH_CHECK(guh.dim() == 3 && gu.dim() == 3 && guh.size(0) == 2 && gu.size(0) == 2 &&
++                    guh.size(1) >= MLP_MAX_ROWS && gu.size(1) >= MLP_MAX_ROWS &&
++                    a.size(1) >= MLP_MAX_ROWS && down_xh.size(1) >= MLP_MAX_ROWS &&
++                    guh.is_contiguous() && gu.is_contiguous(),
++                    "BC_GatedMLP: scratch must be contiguous (2, MLP_MAX_ROWS, width) / (1, MLP_MAX_ROWS, width)");
++        guh_cache.resize(MLP_MAX_ROWS);
++        gu_cache.resize(MLP_MAX_ROWS);
+     }
+ 
+     void run_bszN_gr
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index 517ddb7..4ab6471 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -190,9 +190,9 @@ int exl3_gemm_gr
+     if (mul1) cb = 2;
+ 
+ #if defined(USE_ROCM)
+-    // RDNA: m = 1..8 take the multi-row fdot2 GEMV (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
++    // RDNA: m = 1..8 take fdot2, gfx12 WMMA can take m = 2..32 (rocm/quant/exl3_gemv_multirow_rdna.cu), in and out of graph
+     // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
+-    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= 8
++    if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= exl3_gemv_max_m()
+         && (!half_k || exl3_rocm_half_gemv_enabled()))
+     {
+         if (exl3_gemv_multirow_try_launch
+@@ -609,9 +609,9 @@ int exl3_mgemm_gr
+ 
+ #if defined(USE_ROCM)
+     // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
+-    // take m = 1..8 ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
++    // take m = 1..8 (gfx12 WMMA up to 32) ahead of the cooperative kernel. Sliced mode is per-source strided, which they do not
+     // handle, so it stays on the cooperative kernel
+-    if (size_m >= 1 && size_m <= 8 && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
++    if (size_m >= 1 && size_m <= exl3_gemv_max_m() && force_shape_idx <= 0 && force_num_sms <= 0 && !had_src_list
+         && (!half_k || exl3_rocm_half_gemv_enabled()))
+     {
+         if (exl3_mgemv_multirow_try_launch
 diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
-index 38bbe48..009b253 100644
+index 38bbe48..7ff849c 100644
 --- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
 +++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
-@@ -65,6 +65,8 @@
+@@ -1,5 +1,5 @@
+ // =============================================================================
+-// Multi-row GEMV for RDNA, m = 2..8
++// Multi-row GEMV for RDNA, fdot2 m = 2..8, gfx12 WMMA m = 2..32
+ // =============================================================================
+ //
+ // The GEMV fast paths take m == 1 only; at m = 2..8 -- speculative-decoding
+@@ -35,7 +35,8 @@
+ // helpers are shared), gated on a runtime LDS budget; not done here.
+ //
+ // Routing: exl3_gemm_gr and exl3_mgemm_gr call the two try_launch entry
+-// points for 2 <= m <= EXL3_GEMV_MAX_M (default 8; 1 switches the path off)
++// points for 2 <= m <= EXL3_GEMV_MAX_M (default 32; 1 switches the path off;
++// m > 8 only on the gfx12 WMMA kernel)
+ // before the cooperative kernels, in and out of graph capture. The
+ // multi-matrix form declines sliced mode.
+ //
+@@ -65,13 +66,15 @@
  
  #include <cstdlib>
  #include <mutex>
@@ -1223,12 +1457,35 @@ index 38bbe48..009b253 100644
  
  int exl3_gemv_max_m()
  {
-@@ -605,6 +607,298 @@ void exl3_gemv_mr_dot_single
+     const char* env = std::getenv("EXL3_GEMV_MAX_M");
+-    if (!env) return 8;
++    if (!env) return 32;
+     int v = atoi(env);
+-    return v < 1 ? 1 : (v > 8 ? 8 : v);
++    return v < 1 ? 1 : (v > 32 ? 32 : v);
+ }
+ 
+ // m == 1 goes through this structure too, with a row tile of 1 -- rows read
+@@ -316,10 +319,12 @@ __device__ __forceinline__ void exl3_gemv_fused_epilogue_mr
+ {
+     if (lane < 16)
+     {
++        // Predicated rather than an early break: the break form stops the full unroll at M = 32, which
++        // leaves acc dynamically indexed (in scratch)
+         #pragma unroll
+         for (int r = 0; r < M; ++r)
+         {
+-            if (r >= rows_valid) break;
++            if (r >= rows_valid) continue;
+             const int64_t out_idx = row_off + (int64_t) r * ldc + tile_n * 16 + lane;
+             if constexpr (c_fp32)
+                 ((float*) Cb)[out_idx] = acc[r];
+@@ -605,6 +610,388 @@ void exl3_gemv_mr_dot_single
      );
  }
  
 +// =============================================================================
-+// Kernel 2w: the m <= 8 GEMV on gfx12 WMMA (EXL3_GEMV_WMMA=1)
++// Kernel 2w: the m <= 32 GEMV on gfx12 WMMA (EXL3_GEMV_WMMA=1)
 +// =============================================================================
 +// The fdot2 cores above spend one dot2 per row per weight pair, so an 8-row call
 +// (a DFlash2 verify) costs ~1.4-1.9x a 1-row call although it reads the same
@@ -1245,7 +1502,18 @@ index 38bbe48..009b253 100644
 +// 32(n & 7) + 4(n >> 3) + 16h + {0, 8}, i.e. k = 4h + {0,1,8,9,2,3,10,11} for
 +// every column. A is loaded in that same k order. The accumulator then holds
 +// D[row 8(L >> 4) + i][col L & 15] (probed on gfx1201): lanes 0-15 carry rows
-+// 0-7 of their column, exactly what exl3_gemv_fused_epilogue_mr consumes.
++// 0-7 of their column, lanes 16-31 rows 8-15. Reduce both halves into
++// lanes 0-15 before the row-wise fused epilogue. The <=8 specialization
++// retains the original scratch size and accumulator count.
++//
++// M = 32 (a batched verify at bsz 4 x 8 rows) runs two 16-row M tiles: each
++// decoded B tile is read from LDS once and feeds two WMMAs, one per tile of A
++// (rows 0-15, rows 16-31), so the trellis is still decoded once per tile. Each
++// output element's K order (warp chunk, U batch, WMMA) is the same for every
++// M, so a row's result does not depend on the row tile it ran in. The
++// cross-wave reduction scratch (WARPS x 32 x 16 floats) reuses the B staging
++// slots after a block barrier; stacked, the two would fill the 64 KB
++// workgroup limit at 16 waves.
 +//
 +// fp32 accumulation inside the WMMA differs in order from the fdot2 chain, so
 +// results match the m == 1 path to rounding, not bit for bit.
@@ -1253,9 +1521,17 @@ index 38bbe48..009b253 100644
 +typedef _Float16 exl3_h8 __attribute__((ext_vector_type(8)));
 +typedef float exl3_f8 __attribute__((ext_vector_type(8)));
 +
-+static inline size_t exl3_gemv_wmma_smem_bytes(int warps, int u)
++static inline int exl3_gemv_wmma_m(int rows)
 +{
-+    return (size_t) warps * u * 256 * sizeof(half) + (size_t) warps * 8 * 16 * sizeof(float);
++    return rows <= 8 ? 8 : (rows <= 16 ? 16 : 32);
++}
++
++static inline size_t exl3_gemv_wmma_smem_bytes(int warps, int u, int rows)
++{
++    const int M = exl3_gemv_wmma_m(rows);
++    const size_t sb = (size_t) warps * u * 256 * sizeof(half);
++    const size_t red = (size_t) warps * M * 16 * sizeof(float);
++    return M == 32 ? (sb > red ? sb : red) : sb + red;   // M == 32 aliases the two (see the body)
 +}
 +
 +// One k-tile's B round trip through this wave's LDS slot and its WMMA (see the layout note above)
@@ -1284,7 +1560,43 @@ index 38bbe48..009b253 100644
 +    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a.v, b.v, c);
 +}
 +
-+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++// exl3_gemv_wmma_tile with two 16-row M tiles of A (rows 0-15 into c0, rows 16-31 into c1) on one B tile
++__device__ __forceinline__ void exl3_gemv_wmma_tile2
++(
++    half* sb, FragB f0, FragB f1, const half* a_ptr0, const half* a_ptr1, bool row_ok0, bool row_ok1,
++    int lane, int b_off, exl3_f8& c0, exl3_f8& c1
++)
++{
++    union { uint4 u; half2 h2[4]; } w;
++    w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
++    *((uint4*) (sb + lane * 8)) = w.u;
++
++    union AV { uint2 u[2]; exl3_h8 v; };
++    AV a0 = {}, a1 = {};
++    if (row_ok0)
++    {
++        const uint2 lo = *((const uint2*) a_ptr0);
++        const uint2 hi = *((const uint2*) (a_ptr0 + 8));
++        a0.u[0] = make_uint2(lo.x, hi.x);
++        a0.u[1] = make_uint2(lo.y, hi.y);
++    }
++    if (row_ok1)
++    {
++        const uint2 lo = *((const uint2*) a_ptr1);
++        const uint2 hi = *((const uint2*) (a_ptr1 + 8));
++        a1.u[0] = make_uint2(lo.x, hi.x);
++        a1.u[1] = make_uint2(lo.y, hi.y);
++    }
++
++    __syncwarp();
++    union { uint2 u[2]; exl3_h8 v; } b;
++    b.u[0] = *((const uint2*) (sb + b_off));
++    b.u[1] = *((const uint2*) (sb + b_off + 8));
++    c0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0.v, b.v, c0);
++    c1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1.v, b.v, c1);
++}
++
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
 +__device__ __forceinline__ void exl3_gemv_wmma_body
 +(
 +    const half* __restrict__ A,     // this slab's rotated rows, size_k apart
@@ -1301,12 +1613,16 @@ index 38bbe48..009b253 100644
 +)
 +{
 +#if defined(__gfx1200__) || defined(__gfx1201__)
++    static_assert(M == 8 || M == 16 || M == 32, "WMMA GEMV row tile");
++    constexpr int MT = M == 32 ? 2 : 1;   // 16-row WMMA M tiles
 +    const int warp_id = threadIdx.x / 32;
 +    const int lane = threadIdx.x % 32;
 +
 +    extern __shared__ char shared_mem[];
 +    half* sb = ((half*) shared_mem) + warp_id * U * 256;
-+    float* sh_red = (float*) (shared_mem + WARPS_PER_BLOCK * U * 256 * sizeof(half));
++    // M == 32: the reduction scratch overlays the B slots, written only after a block barrier
++    float* sh_red = M == 32 ? (float*) shared_mem
++                            : (float*) (shared_mem + WARPS_PER_BLOCK * U * 256 * sizeof(half));
 +
 +    constexpr int tile_elements = Exl3Width<bits>::tile_u16;
 +
@@ -1317,13 +1633,22 @@ index 38bbe48..009b253 100644
 +
 +    const int h = lane >> 4;
 +    const int r = lane & 15;
-+    const bool row_ok = r < size_m;
-+    const half* a_row = A + (int64_t) (row_ok ? r : 0) * size_k + 4 * h;
++    // Lane row per M tile: 16 mt + r
++    bool row_ok[MT];
++    const half* a_row[MT];
++    uint32_t a_off[MT];
 +    // A for the unrolled loop: wave-uniform base + constant 32-bit lane offset (global_load saddr form). Rows
 +    // past size_m read row 0: they only land in output rows the epilogue never stores, so no branch is needed.
 +    typedef __attribute__((address_space(1))) const uint2 exl3_g_u2;
 +    exl3_g_char* a_g = (exl3_g_char*) (const char*) exl3_uni_ptr(A);
-+    uint32_t a_off = (uint32_t) (((row_ok ? r : 0) * size_k + 4 * h) * sizeof(half));
++    #pragma unroll
++    for (int mt = 0; mt < MT; ++mt)
++    {
++        const int row = 16 * mt + r;
++        row_ok[mt] = row < size_m;
++        a_row[mt] = A + (int64_t) (row_ok[mt] ? row : 0) * size_k + 4 * h;
++        a_off[mt] = (uint32_t) (((row_ok[mt] ? row : 0) * size_k + 4 * h) * sizeof(half));
++    }
 +    const int b_off = 32 * (r & 7) + 4 * (r >> 3) + 16 * h;   // r doubles as the column for B
 +
 +    // Trellis through the RDNA tiles core's decoder (exl3_gemv_tiles_rdna.cuh): per-lane raw-word plan computed
@@ -1341,9 +1666,11 @@ index 38bbe48..009b253 100644
 +
 +    // One accumulator per unrolled tile so the U WMMAs of a batch do not wait on each other; the A loads and
 +    // trellis loads of the batch are all issued before the first decode
-+    exl3_f8 cu[U];
++    exl3_f8 cu[MT][U];
 +    #pragma unroll
-+    for (int u = 0; u < U; ++u) cu[u] = exl3_f8{};
++    for (int mt = 0; mt < MT; ++mt)
++        #pragma unroll
++        for (int u = 0; u < U; ++u) cu[mt][u] = exl3_f8{};
 +    int kt = exl3_uni(kb0);
 +    const int kend = exl3_uni(kb1);
 +    for (; kt + U <= kend; kt += U)
@@ -1357,16 +1684,20 @@ index 38bbe48..009b253 100644
 +            for (int i = 0; i < R; ++i)
 +                raw[u][i] = exl3_ld_g(b_c + (size_t) u * b_stride, off[i]);
 +        union AV { uint2 u2[2]; exl3_h8 v; };
-+        AV av[U];
-+        exl3_opaque(a_off);
++        AV av[MT][U];
 +        #pragma unroll
-+        for (int u = 0; u < U; ++u)
++        for (int mt = 0; mt < MT; ++mt)
 +        {
-+            exl3_g_char* ap = a_g + (size_t) (kt + u) * 32;
-+            const uint2 lo = *(exl3_g_u2*) (ap + a_off);          // k = 4h + 0..3
-+            const uint2 hi = *(exl3_g_u2*) (ap + a_off + 16);     // k = 4h + 8..11
-+            av[u].u2[0] = make_uint2(lo.x, hi.x);                 // -> k = 4h + {0,1,8,9,2,3,10,11}
-+            av[u].u2[1] = make_uint2(lo.y, hi.y);
++            exl3_opaque(a_off[mt]);
++            #pragma unroll
++            for (int u = 0; u < U; ++u)
++            {
++                exl3_g_char* ap = a_g + (size_t) (kt + u) * 32;
++                const uint2 lo = *(exl3_g_u2*) (ap + a_off[mt]);          // k = 4h + 0..3
++                const uint2 hi = *(exl3_g_u2*) (ap + a_off[mt] + 16);     // k = 4h + 8..11
++                av[mt][u].u2[0] = make_uint2(lo.x, hi.x);                 // -> k = 4h + {0,1,8,9,2,3,10,11}
++                av[mt][u].u2[1] = make_uint2(lo.y, hi.y);
++            }
 +        }
 +        #pragma unroll
 +        for (int u = 0; u < U; ++u)
@@ -1384,7 +1715,9 @@ index 38bbe48..009b253 100644
 +            union { uint2 u2[2]; exl3_h8 v; } b;
 +            b.u2[0] = *((const uint2*) (sb + u * 256 + b_off));
 +            b.u2[1] = *((const uint2*) (sb + u * 256 + b_off + 8));
-+            cu[u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[u].v, b.v, cu[u]);
++            #pragma unroll
++            for (int mt = 0; mt < MT; ++mt)
++                cu[mt][u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[mt][u].v, b.v, cu[mt][u]);
 +        }
 +        __syncwarp();
 +        b_c += (size_t) U * b_stride;
@@ -1396,35 +1729,49 @@ index 38bbe48..009b253 100644
 +        for (int i = 0; i < R; ++i) raw[i] = exl3_ld_g(b_c, off[i]);
 +        FragB f0, f1;
 +        exl3_dq_tile_decode<bits, cb>(raw, lp, f0, f1);
-+        exl3_gemv_wmma_tile(sb, f0, f1, a_row + kt * 16, row_ok, lane, b_off, cu[0]);
++        if constexpr (MT == 1)
++            exl3_gemv_wmma_tile(sb, f0, f1, a_row[0] + kt * 16, row_ok[0], lane, b_off, cu[0][0]);
++        else
++            exl3_gemv_wmma_tile2(sb, f0, f1, a_row[0] + kt * 16, a_row[1] + kt * 16, row_ok[0], row_ok[1],
++                                 lane, b_off, cu[0][0], cu[1][0]);
 +        __syncwarp();
 +        b_c += b_stride;
 +    }
-+    exl3_f8 c = cu[0];
++    exl3_f8 c[MT];
 +    #pragma unroll
-+    for (int u = 1; u < U; ++u) c += cu[u];
++    for (int mt = 0; mt < MT; ++mt)
++    {
++        c[mt] = cu[mt][0];
++        #pragma unroll
++        for (int u = 1; u < U; ++u) c[mt] += cu[mt][u];
++    }
 +
-+    if (lane < 16)
++    // Lane (r, h) of M tile mt holds rows 16 mt + 8 h + i of column r; at M == 8 only h == 0 is real
++    if constexpr (M == 32) __syncthreads();   // every wave is done with its B slot before sh_red overlays it
++    if (M > 8 || lane < 16)
 +    {
 +        #pragma unroll
-+        for (int i = 0; i < 8; ++i) sh_red[(warp_id * 8 + i) * 16 + lane] = c[i];
++        for (int mt = 0; mt < MT; ++mt)
++            #pragma unroll
++            for (int i = 0; i < 8; ++i)
++                sh_red[(warp_id * M + 16 * mt + 8 * h + i) * 16 + r] = c[mt][i];
 +    }
 +    __syncthreads();
 +    if (warp_id != 0) return;
 +
-+    float acc[8];
++    float acc[M];
 +    #pragma unroll
-+    for (int i = 0; i < 8; ++i)
++    for (int i = 0; i < M; ++i)
 +    {
 +        float t = 0.0f;
 +        if (lane < 16)
 +        {
 +            #pragma unroll
-+            for (int w = 0; w < WARPS_PER_BLOCK; ++w) t += sh_red[(w * 8 + i) * 16 + lane];
++            for (int w = 0; w < WARPS_PER_BLOCK; ++w) t += sh_red[(w * M + i) * 16 + lane];
 +        }
 +        acc[i] = t;
 +    }
-+    exl3_gemv_fused_epilogue_mr<c_fp32, 8>
++    exl3_gemv_fused_epilogue_mr<c_fp32, M>
 +    (
 +        acc, Cb, row_off, ldc, size_m, tile_n, lane, svh, seg_counters + tile_n / 8
 +    );
@@ -1433,7 +1780,7 @@ index 38bbe48..009b253 100644
 +#endif
 +}
 +
-+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
 +static __global__
 +__launch_bounds__(WARPS_PER_BLOCK * 32)
 +__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
@@ -1445,7 +1792,7 @@ index 38bbe48..009b253 100644
 +    const int size_m
 +)
 +{
-+    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U, M>
 +    (
 +        pb->A_had, pb->B, size_n / 16, blockIdx.x, size_k,
 +        pb->C, 0, size_n, size_m, pb->svh, pb->seg_counters
@@ -1453,7 +1800,7 @@ index 38bbe48..009b253 100644
 +}
 +
 +// Multi-matrix form (exl3_gemv_mr_dot_multi's unweighted path): blockIdx.y is the slot
-+template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U, int M>
 +static __global__
 +__launch_bounds__(WARPS_PER_BLOCK * 32)
 +__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
@@ -1480,7 +1827,7 @@ index 38bbe48..009b253 100644
 +    if (mat_index < 0) return;   // block-uniform
 +    const int n_j = size_n_list ? size_n_list[mat_index] : size_n;
 +    if (tile_n >= n_j / 16) return;   // block-uniform
-+    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U, M>
 +    (
 +        A_had + (int64_t) j * size_m * size_k, (const uint16_t*) B_list[mat_index], n_j / 16, tile_n, size_k,
 +        c_list ? c_list[mat_index] : pb->Cm,
@@ -1522,14 +1869,26 @@ index 38bbe48..009b253 100644
  template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
  static __global__
  __launch_bounds__(WARPS_PER_BLOCK * 32)
-@@ -750,6 +1044,40 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
+@@ -692,6 +1079,7 @@ void exl3_gemv_mr_dot_multi
+ // Host dispatch
+ // =============================================================================
+ 
++// fdot2 row tile; m > 8 never reaches the fdot2 kernels (the entry points route it to WMMA or decline)
+ static inline int exl3_gemv_mr_row_tile(int size_m)
+ {
+     return size_m <= 1 ? 1 : (size_m <= 2 ? 2 : (size_m <= 4 ? 4 : 8));
+@@ -750,6 +1138,44 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
          case EXL3_HALF_BITS(3): LAUNCH_MR_CB(EXL3_HALF_BITS(3), 2, kernel_name, __VA_ARGS__); break; \
      }
  
 +// K x codebook x warps x U dispatch for the WMMA entry points (integer bitrates)
++#define LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, m_val, ...) \
++    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, u_val, m_val>), grid, block, smem, stream, __VA_ARGS__); \
++    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, u_val, m_val>), grid, block, smem, stream, __VA_ARGS__);
 +#define LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, u_val, ...) \
-+    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__); \
-+    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__);
++    if (size_m <= 8) { LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, 8, __VA_ARGS__) } \
++    else if (size_m <= 16) { LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, 16, __VA_ARGS__) } \
++    else { LAUNCH_WMMA_M(kernel, bits_val, codebook, warps_val, u_val, 32, __VA_ARGS__) }
 +#define LAUNCH_WMMA_W(kernel, bits_val, codebook, warps_val, ...) \
 +    switch (u) { \
 +        case 1: LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, 1, __VA_ARGS__) break; \
@@ -1563,7 +1922,15 @@ index 38bbe48..009b253 100644
  bool exl3_gemv_multirow_try_launch
  (
      const half* A_ptr,
-@@ -799,6 +1127,19 @@ bool exl3_gemv_multirow_try_launch
+@@ -771,6 +1197,7 @@ bool exl3_gemv_multirow_try_launch
+ {
+     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
+     if (!exl3_gemv_mr_k_ok(K, cb)) return false;
++    if (size_m > 8 && (!exl3_gemv_wmma_enabled(device) || K < 1 || K > 8)) return false;
+     if (size_k % 128 || size_n % 128) return false;
+     if (!suh_ptr || !A_had_ptr || !svh_ptr) return false;
+     if (size_n / 128 > EXL3_MGEMV_SEG_COUNTERS) return false;
+@@ -799,6 +1226,19 @@ bool exl3_gemv_multirow_try_launch
          }
      }
  
@@ -1575,7 +1942,7 @@ index 38bbe48..009b253 100644
 +        dim3 grid(n_tiles, 1);
 +        dim3 block(warps * 32);
 +        const int u = exl3_gemv_wmma_unroll();
-+        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u, size_m);
 +        LAUNCH_WMMA(exl3_gemv_wmma_dot_single, pb, size_k, size_n, size_m)
 +        return true;
 +    }
@@ -1583,7 +1950,19 @@ index 38bbe48..009b253 100644
      // 2. GEMV, M rows per warp, fused output epilogue
      {
          const int n_tiles = size_n / 16;
-@@ -888,6 +1229,20 @@ bool exl3_mgemv_multirow_try_launch
+@@ -844,9 +1284,11 @@ bool exl3_mgemv_multirow_try_launch
+ {
+     if (size_m < exl3_gemv_mr_min_m(size_n / 16) || size_m > exl3_gemv_max_m()) return false;
+     if (!exl3_gemv_mr_k_ok(K, cb)) return false;
++    if (size_m > 8 && (!exl3_gemv_wmma_enabled(device) || K < 1 || K > 8)) return false;
+     if (size_k % 128 || size_n % 128) return false;
+     // Weighted calls (MoE down) at m == 1 with the mgemv epilogue; see the header
+     const bool weighted = weights_ptr != nullptr;
++    if (size_m > 8 && (weighted || num_tokens != 1)) return false;
+     if (weighted && (size_m != 1 || !exl3_gemv_mr_weighted_enabled())) return false;
+     if (weighted)
+     {
+@@ -888,6 +1330,20 @@ bool exl3_mgemv_multirow_try_launch
          }
      }
  
@@ -1595,7 +1974,7 @@ index 38bbe48..009b253 100644
 +        const int u = exl3_gemv_wmma_unroll();
 +        dim3 grid(n_tiles, bszm);
 +        dim3 block(warps * 32);
-+        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u, size_m);
 +        LAUNCH_WMMA(exl3_gemv_wmma_dot_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
 +                    size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list)
 +        return true;
@@ -1604,7 +1983,7 @@ index 38bbe48..009b253 100644
      // 2. GEMV
      {
          const int n_tiles = size_n / 16;
-@@ -909,6 +1264,11 @@ bool exl3_mgemv_multirow_try_launch
+@@ -909,6 +1365,12 @@ bool exl3_mgemv_multirow_try_launch
      return true;
  }
  
@@ -1613,14 +1992,131 @@ index 38bbe48..009b253 100644
 +#undef LAUNCH_WMMA_CB
 +#undef LAUNCH_WMMA_W
 +#undef LAUNCH_WMMA_U
++#undef LAUNCH_WMMA_M
  #undef LAUNCH_MR
  #undef LAUNCH_MR_K
  #undef LAUNCH_MR_CB
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+index f4b3b61..e92133d 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cuh
+@@ -1,7 +1,7 @@
+ #pragma once
+ 
+ // =============================================================================
+-// Multi-row GEMV for RDNA, m = 2..8 -- host interface
++// Multi-row GEMV for RDNA, m = 2..32 (m > 8: gfx12 WMMA only) -- host interface
+ // =============================================================================
+ //
+ // See exl3_gemv_multirow_rdna.cu for the design. Both entry points return
+@@ -13,7 +13,7 @@
+ 
+ class Graph;
+ 
+-// EXL3_GEMV_MAX_M (default 8, clamp 1..8): the largest m the multi-row GEMV
++// EXL3_GEMV_MAX_M (default 32, clamp 1..32): the largest m the multi-row GEMV
+ // takes; 1 switches the path off. Re-read per call.
+ int exl3_gemv_max_m();
+ 
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index 9fb4b52..aec4981 100644
+index 9fb4b52..69aedac 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
-@@ -1293,9 +1293,12 @@ class Generator:
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ import logging
++import os
+ import torch
+ from ..model.model import Model
+ from ..cache.cache import Cache
+@@ -188,6 +189,15 @@ class Generator:
+             self.ngram_corpus = NgramCorpus(ngram_corpus, tokenizer)
+         self.ngram_match_min = ngram_match_min
+         self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
++
++        # Occupancy-aware draft length (EXL3_DRAFT_ROW_BUDGET, 0/unset = off): a batched verify
++        # forward is (active sequences) x (draft + 1) rows, and past the multi-row GEMV's row limit
++        # every linear falls to a much slower GEMM. With a budget set, each round's draft length is
++        # capped so the verify stays within it: draft = min(num_draft_tokens, budget // rows - 1),
++        # at least 1. E.g. budget 16 with 7 draft tokens: 1 job 7, 2 jobs 7, 4 jobs 3.
++        # The budget is soft: the floor of one draft token means more than budget / 2 sequences still
++        # verify 2 rows each (budget 32 at 17 sequences: 34 rows)
++        self.draft_row_budget = max(0, int(os.environ.get("EXL3_DRAFT_ROW_BUDGET", "0") or 0))
+         self.record_draft_stats = record_draft_stats
+         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
+ 
+@@ -696,7 +706,7 @@ class Generator:
+         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+ 
+         # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         cal = self.draft_calibrator
+         conf_cols = []
+         reach = None
+@@ -800,7 +810,7 @@ class Generator:
+         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
+         # every row's running product of estimated conditional acceptance probabilities falls
+         # below the confidence target, keeping the first low-confidence token as the label probe
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         cal = self.draft_calibrator
+         conf_cols = []
+         reach = None
+@@ -863,7 +873,8 @@ class Generator:
+             return None
+ 
+         # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
+-        window = self.num_draft_tokens
++        # (as does the row budget, which also tells the drafter how many block rows need logits)
++        window = self._budget_draft_window(self.num_draft_tokens)
+ 
+         # Create block index table for batch
+         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+@@ -903,6 +914,11 @@ class Generator:
+         }
+         if self.draft_calibrator is not None:
+             params["export_draft_conf"] = True
++        if window < self.draft_model.config.block_size - 1:
++            # Only the first `window` path positions are used (a short configured draft, or the row
++            # budget); the selector walk is sequential, so they come out the same with the later
++            # block rows' head and walk skipped
++            params["dflash2_rows"] = window
+         out_state = self.draft_model.forward(
+             input_ids = batch_ids,
+             params = params,
+@@ -956,7 +972,7 @@ class Generator:
+             return None
+ 
+         # Generate draft
+-        window = self.num_draft_tokens
++        window = self._budget_draft_window(self.num_draft_tokens)
+         draft_ids = []
+         min_len = window
+         for job in self.active_jobs:
+@@ -973,6 +989,21 @@ class Generator:
+         return draft_ids
+ 
+ 
++    def _budget_draft_window(self, window: int) -> int:
++        """
++        Draft length for this round under EXL3_DRAFT_ROW_BUDGET (see __init__): the verify forward
++        takes (window + 1) rows per active sequence. Never below 1, so draft-model caches that are
++        only advanced by drafting (AR draft models, MTP) keep advancing; that floor makes the budget
++        soft (more than budget / 2 sequences exceed it). Unchanged when the budget is off.
++        """
++        if self.draft_row_budget <= 0 or window <= 1:
++            return window
++        rows = sum(len(job.sequences) for job in self.active_jobs if job.is_prefill_done())
++        if rows == 0:
++            return window
++        return max(1, min(window, self.draft_row_budget // rows - 1))
++
++
+     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
+         """
+         Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.
+@@ -1293,9 +1324,12 @@ class Generator:
                              job.prepare_logit_mask()
                              job.prepare_sampling_past_ids()
  
@@ -2687,6 +3183,110 @@ index 2dd4345..9b440a1 100644
          )
  
      return core_attn_out
+diff --git a/exllamav3/modules/mlp.py b/exllamav3/modules/mlp.py
+index 867f3a5..de6fff5 100644
+--- a/exllamav3/modules/mlp.py
++++ b/exllamav3/modules/mlp.py
+@@ -11,9 +11,46 @@ from ..constants import MAX_MLP_INTERMEDIATE
+ from ..model.model_tp_alloc import TPAllocation
+ from .multilinear import MultiLinear
+ from ..util.tensor import g_tensor_cache
++import os
+ 
+ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+ 
++# Rows (bsz * q_len) the graphed GatedMLP path (BC_GatedMLP.run_bszN) takes; sizes its static scratch.
++# Must match MLP_MAX_ROWS in exllamav3_ext/libtorch/mlp.h. A batched speculative verify is
++# bsz x (draft + 1) rows (4 x 8 = 32); above the limit the eager path runs.
++# EXL3_BC_MLP_MAX_ROWS lowers the limit (8 is the previous behaviour)
++MLP_MAX_ROWS = 32
++_bc_mlp_max_rows = max(1, min(int(os.environ.get("EXL3_BC_MLP_MAX_ROWS", MLP_MAX_ROWS)), MLP_MAX_ROWS))
++
++# Forward controls that Linear.forward / LinearEXL3.forward act on per projection (H capture, output
++# sensitivity capture, projection overrides, forced reconstruction); the fused paths (BC graphs, fused
++# gate+up mgemm) call the kernels directly and would silently skip them
++_PER_PROJECTION_PARAMS = ("capture", "capture_sens", "quant_preserve", "ovr", "reconstruct")
++
++
++def _plain_linear(linear, trim_ok: bool = False) -> bool:
++    """True when Linear.forward adds nothing around the quantized matmul: no LoRA adapter, no
++    output scales or softcap, and (unless the fused path does its own exact-width copy, trim_ok) no
++    padded-output trim. LoRA can be attached after load, so this is checked per forward."""
++    return (
++        not linear.lora_a_tensors and
++        linear.pre_scale == 1.0 and linear.post_scale == 1.0 and linear.softcap == 0.0 and
++        (trim_ok or not (linear.trim_padded_out and linear.out_features != linear.out_features_unpadded))
++    )
++
++
++def _fusable(params: dict, linears, trim_ok: bool = False) -> bool:
++    """May the projections run through a fused path (BC graph or fused gate+up mgemm)? Runs on every
++    MLP forward, so plain loops rather than any()/all() over generators"""
++    if params:
++        for k in _PER_PROJECTION_PARAMS:
++            if k in params:
++                return False
++    for l in linears:
++        if not _plain_linear(l, trim_ok):
++            return False
++    return True
++
+ 
+ def gated_act_slopes(activation_fn: str, g: torch.Tensor, u: torch.Tensor, act_limit: float):
+     """
+@@ -394,9 +431,12 @@ class MLP(Module):
+         # Fused C++ path for single-token decode, replayed through an internal CUDA graph from
+         # the third invocation on
+         bsz, q_len, _ = x.shape
++        # The single captured graph bakes in the output dtype, so only the module's own dtype takes it
+         if (
+             self.bc is not None and bsz == 1 and q_len == 1 and
+-            x.dtype == torch.float16 and x.is_contiguous()
++            x.dtype == torch.float16 and x.is_contiguous() and
++            (out_dtype is None or out_dtype == self.out_dtype) and
++            _fusable(params, (self.ups[0], self.downs[0]), trim_ok = True)   # BC_MLP stages padded dims itself
+         ):
+             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
+             self.bc.run_bsz1(x, d)
+@@ -791,10 +831,10 @@ class GatedMLP(Module):
+             if mgu is not None or can_separate:
+                 out_f = mgu.out_features if mgu is not None else g0.out_features
+                 self.bsz1_pa_args = [
+-                    (device, (2, MAX_BSZN, self.hidden_size), self.interm_dtype, "gu"),
+-                    (device, (2, MAX_BSZN, out_f), self.interm_dtype, "a1"),
+-                    (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
+-                    (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
++                    (device, (2, MLP_MAX_ROWS, self.hidden_size), self.interm_dtype, "gu"),
++                    (device, (2, MLP_MAX_ROWS, out_f), self.interm_dtype, "a1"),
++                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "a2"),
++                    (device, (1, MLP_MAX_ROWS, out_f), torch.half, "down_xh"),
+                 ]
+                 self.bc = ext.BC_GatedMLP(
+                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
+@@ -865,12 +905,21 @@ class GatedMLP(Module):
+ 
+             for s in r:
+ 
+-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
++                # LoRA, per-projection forward controls and output post-processing need each
++                # projection's own Linear.forward: neither fused path (BC graph, fused gate+up
++                # mgemm) runs them, so such forwards take the unfused path below
++                fusable = _fusable(params, (self.gates[s], self.ups[s], self.downs[s]))
++
++                if (
++                    self.bc is not None and fusable and bsz * q_len <= _bc_mlp_max_rows and
++                    x.dtype == torch.float16 and x.is_contiguous() and
++                    self.downs[s].out_features == dim
++                ):
+                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
+                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
+                     self.bc.run_bszN(xv, d.view(xv.shape))
+ 
+-                elif self.multi_gu[s] is None or bsz * q_len > 32:
++                elif self.multi_gu[s] is None or bsz * q_len > 32 or not fusable:
+                     g = self.gates[s].forward(x, params)
+                     u = self.ups[s].forward(x, params)
+                     if "capture_sens" in params:
 diff --git a/test_gdn_replay.py b/test_gdn_replay.py
 new file mode 100644
 index 0000000..638e50c
@@ -3338,3 +3938,430 @@ index 0000000..638e50c
 +
 +if __name__ == "__main__":
 +    raise SystemExit(main())
+diff --git a/test_gemv32.py b/test_gemv32.py
+new file mode 100644
+index 0000000..9966452
+--- /dev/null
++++ b/test_gemv32.py
+@@ -0,0 +1,258 @@
++"""GPU-owner-only test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
++
++Loads the model and runs GPU kernels; do not run it in a code-only session. Run it with this checkout's
++extension on PYTHONPATH and env.sh sourced (the script forces EXL3_GEMV_WMMA / _U / _MAX_M per check).
++
++Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 fc and an MLP):
++  1. accuracy: rows 2..32 (or --rows), fp16 and fp32 output, U = 1/2/4, against reconstruct_hgemm; the
++     upper row tiles (rows 8-15 and 16-31) separately, so a lane-half or M-tile mixup cannot hide
++  2. row-tile invariance: row r of an n-row call is bit-identical to row r of the 32-row call, for every
++     n in 2..32 (one K order at every row tile M = 8/16/32; this is what keeps a job's logits independent of
++     how many other jobs share the verify)
++  3. timing: WMMA vs the cooperative GEMM fallback (EXL3_GEMV_WMMA=0) at 8 / 16 / 24 / 32 rows
++  4. multi-matrix GEMV (fused gate+up mgemm, the GatedMLP path) at rows 9..32 against reconstruct_hgemm
++  5. graphed BC GatedMLP at rows 1..32: per row count 8 calls with distinct inputs (all kept alive), fp32 and
++     fp16 output interleaved (one graph per row count and output dtype); every call, eager, capture and
++     replay, matches the module's eager path on its own input, and the first matches reconstruct + hgemm
++"""
++import argparse
++import os
++import sys
++from pathlib import Path
++
++# Python puts this script's directory first on sys.path, ahead of PYTHONPATH; drop it so the checkout
++# under test is the one PYTHONPATH names (checked in main)
++if sys.path and os.path.abspath(sys.path[0] or os.curdir) == os.path.dirname(os.path.abspath(__file__)):
++    sys.path.pop(0)
++
++os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
++os.environ["EXL3_GEMV_MAX_M"] = "32"
++
++import torch
++from exllamav3 import Config, Model
++from exllamav3.ext import exllamav3_ext as ext
++from exllamav3.modules import mlp as mlp_mod
++
++ROOT = Path(__file__).resolve().parent.parent
++SHAPES = [
++    "layers.0.linear_attn.in_proj_qkv", "layers.0.linear_attn.in_proj_z",
++    "layers.0.linear_attn.out_proj", "layers.0.mlp.gate_proj",
++    "layers.0.mlp.down_proj", "layers.3.self_attn.k_proj",
++    "layers.3.self_attn.q_proj", "lm_head",
++]
++DRAFT_SHAPES = ["fc", "layers.0.mlp.down_proj", "layers.0.self_attn.q_proj"]
++
++
++def walk(module):
++    yield module
++    for child in getattr(module, "modules", []) or []:
++        yield from walk(child)
++
++
++def find_linears(model, suffixes):
++    found = {}
++    for module in walk(model):
++        inner = getattr(module, "inner", None)
++        if inner is not None and type(inner).__name__ == "LinearEXL3":
++            for suffix in suffixes:
++                if module.key == suffix or module.key.endswith("." + suffix):
++                    found.setdefault(suffix, inner)
++    missing = set(suffixes) - found.keys()
++    if missing:
++        raise RuntimeError(f"Missing requested projections: {sorted(missing)}")
++    return found
++
++
++def time_call(fn, iterations):
++    for _ in range(10):
++        fn()
++    torch.cuda.synchronize()
++    start = torch.cuda.Event(enable_timing = True)
++    end = torch.cuda.Event(enable_timing = True)
++    start.record()
++    for _ in range(iterations):
++        fn()
++    end.record()
++    torch.cuda.synchronize()
++    return start.elapsed_time(end) * 1000 / iterations
++
++
++def rel_err(out, ref):
++    return ((out - ref).abs().max() / ref.abs().max().clamp_min(1e-6)).item()
++
++
++def set_wmma(on, unroll = 4):
++    os.environ["EXL3_GEMV_WMMA"] = "1" if on else "0"
++    os.environ["EXL3_GEMV_WMMA_U"] = str(unroll)
++
++
++def check_linears(tag, layers, rows_list, args):
++    tested = 0
++    print(f"\n[{tag}] 1-3. single-matrix GEMV")
++    print("projection rows dtype U rel_err rel_err_rows8-15 rel_err_rows16-31")
++    for name, layer in layers.items():
++        if not float(layer.K).is_integer():
++            print(f"{name}: half-integer bitrate {layer.K}, WMMA not eligible; skipped")
++            continue
++        tested += 1
++        dev = layer.trellis.device
++        x32 = torch.randn(1, 32, layer.in_features, dtype = torch.half, device = dev)
++        for fp32 in (False, True):
++            dtype = torch.float if fp32 else torch.half
++            ref32 = layer.reconstruct_hgemm(x32, dtype).float()
++            for unroll in (1, 2, 4):
++                set_wmma(True, unroll)
++                full = layer.bc.run_alloc(x32, layer.out_features, fp32)
++                for rows in rows_list:
++                    x = x32[:, :rows].contiguous()
++                    out = layer.bc.run_alloc(x, layer.out_features, fp32)
++                    o, ref = out.float(), ref32[:, :rows]
++                    assert torch.isfinite(o).all(), (name, rows, dtype, unroll)
++                    err = rel_err(o, ref)
++                    assert err <= args.relative_error, (name, rows, dtype, unroll, err)
++                    e8 = rel_err(o[:, 8:16], ref[:, 8:16]) if rows > 8 else float("nan")
++                    e16 = rel_err(o[:, 16:], ref[:, 16:]) if rows > 16 else float("nan")
++                    for e in (e8, e16):
++                        assert not (e == e) or e <= args.relative_error, (name, rows, dtype, unroll, e8, e16)
++                    # 2. row-tile invariance (2+ rows: m == 1 takes the fdot2 GEMV, a different K order)
++                    if rows >= 2:
++                        same = torch.equal(out, full[:, :rows])
++                        assert same, (f"{name}: rows {rows} differ from the same rows of the 32-row call "
++                                      f"(U={unroll}, {dtype}): max abs diff "
++                                      f"{(out.float() - full[:, :rows].float()).abs().max().item():.3g}")
++                    if rows in (2, 8, 9, 16, 17, 24, 32) or args.verbose:
++                        print(f"{name} {rows} {dtype} {unroll} {err:.3g} {e8:.3g} {e16:.3g}", flush = True)
++        # 3. timing
++        for rows in (8, 16, 24, 32):
++            x = x32[:, :rows].contiguous()
++            set_wmma(False)
++            coop = time_call(lambda: layer.bc.run_alloc(x, layer.out_features, False), args.iterations)
++            set_wmma(True, 4)
++            wmma = time_call(lambda: layer.bc.run_alloc(x, layer.out_features, False), args.iterations)
++            print(f"  timing {name} rows {rows}: WMMA {wmma:8.1f} us, fallback (EXL3_GEMV_WMMA=0) {coop:8.1f} us, "
++                  f"{coop / wmma:5.2f}x", flush = True)
++    assert tested, "no integer-bitrate projections to exercise WMMA"
++    return tested
++
++
++def check_mgemm(model, rows_list, args):
++    mlp = next((m for m in walk(model) if type(m).__name__ == "GatedMLP" and m.multi_gu and m.multi_gu[0] is not None),
++               None)
++    if mlp is None:
++        print("\n4. no fused gate+up MultiLinear in this model; multi-matrix check skipped")
++        return
++    mg, gate, up = mlp.multi_gu[0], mlp.gates[0].inner, mlp.ups[0].inner
++    dev = gate.trellis.device
++    print(f"\n4. multi-matrix GEMV (fused gate+up, {mlp.key}), rows {rows_list[0]}..{rows_list[-1]}")
++    set_wmma(True, 4)
++    for rows in rows_list:
++        x = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
++        guh = torch.empty((2, rows, mlp.hidden_size), dtype = mlp.interm_dtype, device = dev)
++        gu = torch.empty((2, rows, mg.out_features), dtype = mlp.interm_dtype, device = dev)
++        ext.exl3_mgemm(x, mg.ptrs_trellis, gu, mg.ptrs_suh, guh, mg.ptrs_svh, None, None, mg.K, -1,
++                       mg.mcg, mg.mul1, -1, -1, 0, 1, None, None)
++        rg = gate.reconstruct_hgemm(x, mlp.interm_dtype).float()[0]
++        ru = up.reconstruct_hgemm(x, mlp.interm_dtype).float()[0]
++        eg, eu = rel_err(gu[0].float(), rg), rel_err(gu[1].float(), ru)
++        assert eg <= args.relative_error and eu <= args.relative_error, (rows, eg, eu)
++        print(f"  rows {rows}: gate {eg:.3g} up {eu:.3g}", flush = True)
++
++
++def mlp_eager(mlp, x, out_dtype):
++    """The module's own eager path (BC graph detached): the same projection kernels, launched one by one
++    through Python, so a graph replay must reproduce it"""
++    bc = mlp.bc
++    mlp.bc = None
++    try:
++        return mlp.forward(x, {}, out_dtype = out_dtype)
++    finally:
++        mlp.bc = bc
++
++
++def check_bc_mlp(model, args):
++    mlps = [m for m in walk(model) if type(m).__name__ == "GatedMLP" and m.bc is not None]
++    assert mlps, "no GatedMLP with a BC graph"
++    mlp = mlps[0]
++    limit = getattr(mlp_mod, "_bc_mlp_max_rows", mlp_mod.MAX_BSZN)
++    print(f"\n5. graphed BC GatedMLP ({mlp.key}), Python row limit {limit}, module out_dtype {mlp.out_dtype}")
++    assert limit >= 32, "this checkout's GatedMLP BC limit is below 32 rows (EXL3_BC_MLP_MAX_ROWS set?)"
++    set_wmma(True, 4)
++    dev = mlp.device
++    g, u, d = mlp.gates[0].inner, mlp.ups[0].inner, mlp.downs[0].inner
++    # Per row count: 8 calls alternating fp32 / fp16 output, so each output dtype goes eager, capture,
++    # replay, replay, interleaved with the other dtype's graph (a graph keyed by row count alone would
++    # replay the other dtype's epilogue into this output). Every call gets its own random input, kept
++    # alive, and its own output; all are checked after the last call, each against the eager path on its
++    # own input. A replay reading a stale input pointer, or writing a stale / wrongly sized output,
++    # lands on another call's data and misses by O(1)
++    dtypes = (torch.float, torch.half)
++    for rows in list(range(1, 33)):
++        xs, outs = [], []
++        for call in range(8):
++            dt = dtypes[call % 2]
++            x = torch.randn(1, rows, mlp.hidden_size, dtype = torch.half, device = dev)
++            y = mlp.forward(x, {}, out_dtype = dt)
++            assert y.dtype == dt, (rows, call, y.dtype, dt)
++            xs.append(x)
++            outs.append(y)
++        exact = 0
++        worst = 0.0
++        for call, (x, y) in enumerate(zip(xs, outs)):
++            ref = mlp_eager(mlp, x, dtypes[call % 2])
++            err = rel_err(y.float(), ref.float())
++            worst = max(worst, err)
++            exact += int(torch.equal(y, ref))
++            assert err <= args.replay_relative_error, \
++                f"rows {rows} call {call} ({dtypes[call % 2]}): BC output vs eager on its own input {err:.3g}"
++        # Absolute accuracy of the first call: reconstruct + hgemm with the module's activation
++        x0 = xs[0]
++        gg = g.reconstruct_hgemm(x0, torch.half).float()
++        uu = u.reconstruct_hgemm(x0, torch.half).float()
++        a = (torch.nn.functional.silu(gg) * uu).half()
++        ref0 = d.reconstruct_hgemm(a, torch.float).float()
++        err0 = rel_err(outs[0].float(), ref0)
++        assert err0 <= args.mlp_relative_error, (rows, err0)
++        if rows in (1, 8, 9, 16, 17, 32) or args.verbose:
++            print(f"  rows {rows}: 8 calls fp32/fp16 interleaved, max rel_err vs eager {worst:.3g} "
++                  f"({exact}/8 bit-identical), rel_err vs reconstruct {err0:.3g}", flush = True)
++
++
++@torch.inference_mode()
++def main():
++    parser = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--model", default = str(ROOT / "models/Qwen3.8-27B-EXL3-3.0bpw"))
++    parser.add_argument("--draft", nargs = "?", const = str(ROOT / "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw"),
++                        default = None, help = "also check the DFlash2 draft's fc / MLP / q_proj")
++    parser.add_argument("--rows", type = int, nargs = "+", default = list(range(1, 33)))
++    parser.add_argument("--iterations", type = int, default = 100)
++    parser.add_argument("--relative-error", type = float, default = 0.005,
++                        help = "max abs error / max reference magnitude")
++    parser.add_argument("--mlp-relative-error", type = float, default = 0.02)
++    parser.add_argument("--replay-relative-error", type = float, default = 1e-3,
++                        help = "BC GatedMLP output vs the module's eager path on the same input")
++    parser.add_argument("--verbose", action = "store_true")
++    args = parser.parse_args()
++    import exllamav3
++    pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
++    loaded = os.path.realpath(exllamav3.__file__)
++    assert pp and loaded.startswith(os.path.realpath(pp[0]) + os.sep), \
++        f"exllamav3 imported from {loaded}, not from the first PYTHONPATH entry {pp[:1]}"
++    print(f"exllamav3 from {os.path.dirname(loaded)}")
++    torch.manual_seed(0)
++
++    model = Model.from_config(Config.from_directory(args.model))
++    model.load()
++    n = check_linears("target", find_linears(model, SHAPES), args.rows, args)
++    check_mgemm(model, [r for r in args.rows if r >= 9] or [9, 16, 32], args)
++    check_bc_mlp(model, args)
++    if args.draft:
++        # The draft's lm_head is the target's (attached at generation time), so only its own linears here
++        draft = Model.from_config(Config.from_directory(args.draft))
++        draft.load()
++        n += check_linears("draft", find_linears(draft, DRAFT_SHAPES), args.rows, args)
++    print(f"\nPASS: {n} projections, rows {args.rows[0]}..{args.rows[-1]}, fp16/fp32, U=1/2/4; row-tile "
++          f"invariance; fused gate+up mgemm; graphed BC GatedMLP rows 1..32")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/test_greedy_equal.py b/test_greedy_equal.py
+new file mode 100644
+index 0000000..22d33a6
+--- /dev/null
++++ b/test_greedy_equal.py
+@@ -0,0 +1,157 @@
++"""GPU-owner-only: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
++
++Loads the target + DFlash2 draft like TabbyAPI (Q4 caches, max_history = draft tokens), runs each prompt
++greedily, and writes the generated token ids to --out. Run it once per checkout (PYTHONPATH selects the tree),
++then --compare the two files: every prompt must match token for token. exllamav3 must import from the first
++PYTHONPATH entry (checked; this script's own directory is dropped from sys.path), and --compare requires
++both files to hold this script's full prompt set.
++
++  source env.sh; export EXL3_GDN_REPLAY=1
++  PYTHONPATH=$W/wt-dev   python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_dev.json
++  PYTHONPATH=$W/wt-batch python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_batch.json
++  python $W/wt-batch/test_greedy_equal.py --compare /tmp/greedy_dev.json /tmp/greedy_batch.json
++
++--bsz N runs the prompts as N concurrent jobs instead of one at a time. A batched verify is not expected to
++be bit-identical to bs1 (the split-decode attention splits differently at another batch size, so its combine
++rounds differently), so compare a batched file against a bs1 file for the common-prefix lengths only.
++"""
++import argparse, json, os, sys, time
++
++# Python puts this script's directory (the wt-batch checkout) first on sys.path, ahead of PYTHONPATH, so
++# without this every run would import wt-batch whatever PYTHONPATH says. Drop that entry only: when
++# PYTHONPATH names this same checkout, its own (later) entry stays
++_HERE = os.path.dirname(os.path.abspath(__file__))
++if sys.path and os.path.abspath(sys.path[0] or os.curdir) == _HERE:
++    sys.path.pop(0)
++
++PROMPTS = ["Write a Python LRU cache class with get/put and unit tests. Code only.",
++           "Write a Python function to parse ISO-8601 durations, with tests. Code only.",
++           "Write a Python trie with insert, search and prefix listing, with tests. Code only.",
++           "Write a Python token-bucket rate limiter class with tests. Code only."]
++
++
++def check_import_tree(exllamav3):
++    """Fail unless exllamav3 came from the first PYTHONPATH entry (the checkout under test)."""
++    pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
++    if not pp:
++        sys.exit("FAIL: set PYTHONPATH to the checkout under test (e.g. $W/wt-dev or $W/wt-batch)")
++    tree = os.path.realpath(pp[0])
++    loaded = os.path.realpath(exllamav3.__file__)
++    if not loaded.startswith(tree + os.sep):
++        sys.exit(f"FAIL: exllamav3 imported from {loaded}, not from the PYTHONPATH checkout {tree}")
++    return tree
++
++
++def compare(a_path, b_path):
++    a, b = json.load(open(a_path)), json.load(open(b_path))
++    print(f"A: {a_path} ({a['meta']})\nB: {b_path} ({b['meta']})")
++    # Same prompt set on both sides, every prompt present, every output non-empty
++    n = len(PROMPTS)
++    problems = []
++    for tag, r in (("A", a), ("B", b)):
++        if r.get("prompts") != PROMPTS:
++            problems.append(f"{tag}: prompt set differs from this script's ({len(r.get('prompts') or [])} prompts)")
++        if len(r["ids"]) != n:
++            problems.append(f"{tag}: {len(r['ids'])} outputs, expected {n}")
++        if any(len(x) == 0 for x in r["ids"]):
++            problems.append(f"{tag}: empty output(s)")
++    if problems:
++        print("FAIL: " + "; ".join(problems))
++        return False
++    ok = True
++    for i, (x, y) in enumerate(zip(a["ids"], b["ids"])):
++        n = next((k for k, (p, q) in enumerate(zip(x, y)) if p != q), min(len(x), len(y)))
++        same = x == y
++        ok &= same
++        print(f"  prompt {i}: {'IDENTICAL' if same else 'DIFFER'}  ({len(x)} vs {len(y)} tokens, "
++              f"common prefix {n})")
++    print("PASS: identical" if ok else "FAIL: outputs differ")
++    return ok
++
++
++def main():
++    ap = argparse.ArgumentParser(description = __doc__, formatter_class = argparse.RawDescriptionHelpFormatter)
++    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    ap.add_argument("--model", default = os.path.join(root, "models/Qwen3.8-27B-EXL3-3.0bpw"))
++    ap.add_argument("--draft", default = os.path.join(root, "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw"))
++    ap.add_argument("--tokens", type = int, default = 400)
++    ap.add_argument("--draft-tokens", type = int, default = 7)
++    ap.add_argument("--bsz", type = int, default = 1)
++    ap.add_argument("--cache-tokens", type = int, default = 16384)
++    ap.add_argument("--out")
++    ap.add_argument("--compare", nargs = 2)
++    args = ap.parse_args()
++    if args.compare:
++        sys.exit(0 if compare(*args.compare) else 1)
++    assert args.out, "--out or --compare"
++
++    os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
++    import torch
++    import exllamav3
++    tree = check_import_tree(exllamav3)
++    print(f"exllamav3 from {os.path.dirname(exllamav3.__file__)} (PYTHONPATH checkout {tree})")
++    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
++    from exllamav3.cache import CacheLayer_quant
++
++    dcfg = Config.from_directory(args.draft)
++    draft = Model.from_config(dcfg)
++    kw = dict(layer_type = CacheLayer_quant, k_bits = 4, v_bits = 4, max_batch_size = max(args.bsz, 1),
++              max_history = args.draft_tokens)
++    dcache = Cache(draft, max_num_tokens = args.cache_tokens, **kw)
++    draft.load()
++    config = Config.from_directory(args.model)
++    model = Model.from_config(config)
++    cache = Cache(model, max_num_tokens = args.cache_tokens, **kw)
++    model.load()
++    tok = Tokenizer.from_config(config)
++    gen = Generator(model = model, cache = cache, draft_model = draft, draft_cache = dcache, tokenizer = tok,
++                    max_batch_size = max(args.bsz, 1), num_draft_tokens = args.draft_tokens,
++                    recurrent_cache_size = 512 * 1024**2)
++
++    prompts = PROMPTS
++    # The system prompt keeps every prompt above 32 tokens: a 9..32-token prefill now takes the WMMA GEMV
++    # (rdna4-dev: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
++    # the same kernels in both trees, so with longer prompts the outputs must match exactly
++    system = ("Think efficiently. Work through the problem once, carefully. If you notice yourself re-deriving "
++              "the same result, second-guessing a conclusion you already checked, or cycling between options, "
++              "stop and commit to the best-supported answer. A confident best answer beats an unfinished analysis.")
++    def ids(p):
++        t = tok.encode(f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{p}<|im_end|>\n"
++                       f"<|im_start|>assistant\n<think>\n\n</think>\n\n", encode_special_tokens = True)
++        assert t.shape[-1] > 32, t.shape
++        return t
++
++    def run(batch):
++        jobs = [Job(input_ids = ids(p), max_new_tokens = args.tokens, sampler = ArgmaxSampler(), identifier = i)
++                for i, p in batch]
++        out = {i: [] for i, _ in batch}
++        for j in jobs:
++            gen.enqueue(j)
++        while gen.num_remaining_jobs():
++            for r in gen.iterate():
++                if r.get("stage") == "streaming" and r.get("token_ids") is not None:
++                    out[r["identifier"]] += r["token_ids"].view(-1).tolist()
++        return out
++
++    # Warm up graphs and autotune at this shape first, so the measured runs see the steady-state kernels
++    run([(0, prompts[0])])
++    results, t0 = {}, time.time()
++    indexed = list(enumerate(prompts))
++    with torch.inference_mode():
++        for k in range(0, len(indexed), max(args.bsz, 1)):
++            results.update(run(indexed[k:k + max(args.bsz, 1)]))
++    wall = time.time() - t0
++    n = sum(len(v) for v in results.values())
++    meta = (f"{os.path.dirname(exllamav3.__file__)}, bsz {args.bsz}, draft {args.draft_tokens}, "
++            f"budget {os.environ.get('EXL3_DRAFT_ROW_BUDGET', 'unset')}, {n} tokens in {wall:.1f}s")
++    json.dump({"meta": meta, "prompts": prompts, "ids": [results[i] for i in range(len(prompts))]},
++              open(args.out, "w"))
++    print(f"wrote {args.out}: {meta}")
++    for i in range(len(prompts)):
++        print(f"--- prompt {i}: {len(results[i])} tokens\n{tok.decode(torch.tensor(results[i]))[:300]}")
++    sys.stdout.flush()
++    os._exit(0)
++
++
++if __name__ == "__main__":
++    main()
