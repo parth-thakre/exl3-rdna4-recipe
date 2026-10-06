@@ -74,29 +74,44 @@ case $mode in
         echo "wrote $out ($(grep -c '^From [0-9a-f]\{40\} ' "$out") commit(s), $(grep -c '^diff --git' "$out") file diffs)"
         ;;
     features)
-        parent=$(dirname "$features_dir")
-        mkdir -p "$parent"
-        tmp=$(mktemp -d "$parent/.features.XXXXXX")
-        git -C "$repo" format-patch -q --no-signature -o "$(cd "$tmp" && pwd)" "$base..$branch" -- . "${excludes[@]}"
-        compgen -G "$tmp/*.patch" >/dev/null || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
-        # Build the complete replacement directory first (other files in DIR are kept, old *.patch files are
-        # replaced), then swap whole directories with renames; the old set is restored if the swap fails
-        if [ -d "$features_dir" ]; then
-            find "$features_dir" -mindepth 1 -maxdepth 1 ! -name '*.patch' -exec cp -a {} "$tmp"/ \;
+        # DIR must be a real directory (or not exist yet). It is never replaced or re-created: only its top-level
+        # regular *.patch files are swapped, so other entries, permissions and ownership are left alone.
+        if [ -L "$features_dir" ] || { [ -e "$features_dir" ] && [ ! -d "$features_dir" ]; }; then
+            echo "$features_dir exists and is not a plain directory; refusing to touch it" >&2; exit 1
         fi
-        backup=
-        if [ -e "$features_dir" ]; then
-            backup=$(mktemp -d "$parent/.features-old.XXXXXX") && rmdir "$backup"
-            mv "$features_dir" "$backup"
-        fi
-        if ! mv "$tmp" "$features_dir"; then
-            [ -n "$backup" ] && mv "$backup" "$features_dir"
-            echo "could not install the new patches; $features_dir left as it was" >&2
-            exit 1
-        fi
-        tmp=
-        [ -n "$backup" ] && rm -rf "$backup"
-        echo "wrote $(ls "$features_dir"/*.patch | wc -l) patches to $features_dir:"
-        ls "$features_dir"/*.patch | sed 's#.*/#  #'
+        mkdir -p "$features_dir"
+        dest=$(cd "$features_dir" && pwd -P)
+        # Staging lives inside DIR (same filesystem, so every move below is a rename); its names aren't *.patch
+        tmp=$(mktemp -d "$dest/.regen-new.XXXXXX")
+        old=$(mktemp -d "$dest/.regen-old.XXXXXX")
+        git -C "$repo" format-patch -q --no-signature -o "$tmp" "$base..$branch" -- . "${excludes[@]}"
+        mapfile -t new_names < <(find "$tmp" -mindepth 1 -maxdepth 1 -type f -name '*.patch' -printf '%f\n' | sort)
+        [ ${#new_names[@]} -gt 0 ] || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
+        mapfile -t old_names < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -name '*.patch' -printf '%f\n' | sort)
+        # Rollback puts the old set back and removes whatever part of the new set got in. It runs on any failure
+        # and on interruption until the swap has finished; afterwards cleanup only removes the empty staging dirs.
+        moved_old=() moved_new=() swapped=
+        rollback() {
+            local n
+            for n in "${moved_new[@]}"; do rm -f "$dest/$n"; done
+            for n in "${moved_old[@]}"; do mv -T "$old/$n" "$dest/$n" || echo "could not restore $n; it is in $old" >&2; done
+        }
+        cleanup() {
+            [ -n "$swapped" ] || rollback
+            rm -rf "$tmp"
+            # After a swap $old holds the replaced patches, which are no longer wanted; after a rollback it is empty
+            # unless a restore failed, and then it is kept so nothing is lost
+            if [ -n "$swapped" ]; then rm -rf "$old"; else rmdir "$old" 2>/dev/null || true; fi
+        }
+        trap cleanup EXIT
+        trap 'exit 130' INT TERM
+        for n in "${old_names[@]}"; do mv -T "$dest/$n" "$old/$n" || exit 1; moved_old+=("$n"); done
+        for n in "${new_names[@]}"; do
+            [ ! -e "$dest/$n" ] && [ ! -L "$dest/$n" ] || { echo "$features_dir/$n is in the way (not a regular patch file)" >&2; exit 1; }
+            mv -T "$tmp/$n" "$dest/$n" || exit 1; moved_new+=("$n")
+        done
+        swapped=1
+        echo "wrote ${#new_names[@]} patches to $features_dir (replaced ${#old_names[@]}):"
+        printf '  %s\n' "${new_names[@]}"
         ;;
 esac
