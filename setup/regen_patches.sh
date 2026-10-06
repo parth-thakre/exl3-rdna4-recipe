@@ -79,11 +79,23 @@ case $mode in
         tmp=$(mktemp -d "$parent/.features.XXXXXX")
         git -C "$repo" format-patch -q --no-signature -o "$(cd "$tmp" && pwd)" "$base..$branch" -- . "${excludes[@]}"
         compgen -G "$tmp/*.patch" >/dev/null || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
-        # Swap in the new set: other files in DIR are kept, old *.patch files are replaced
-        mkdir -p "$features_dir"
-        rm -f "$features_dir"/*.patch
-        mv "$tmp"/*.patch "$features_dir"/
-        rm -rf "$tmp"; tmp=
+        # Build the complete replacement directory first (other files in DIR are kept, old *.patch files are
+        # replaced), then swap whole directories with renames; the old set is restored if the swap fails
+        if [ -d "$features_dir" ]; then
+            find "$features_dir" -mindepth 1 -maxdepth 1 ! -name '*.patch' -exec cp -a {} "$tmp"/ \;
+        fi
+        backup=
+        if [ -e "$features_dir" ]; then
+            backup=$(mktemp -d "$parent/.features-old.XXXXXX") && rmdir "$backup"
+            mv "$features_dir" "$backup"
+        fi
+        if ! mv "$tmp" "$features_dir"; then
+            [ -n "$backup" ] && mv "$backup" "$features_dir"
+            echo "could not install the new patches; $features_dir left as it was" >&2
+            exit 1
+        fi
+        tmp=
+        [ -n "$backup" ] && rm -rf "$backup"
         echo "wrote $(ls "$features_dir"/*.patch | wc -l) patches to $features_dir:"
         ls "$features_dir"/*.patch | sed 's#.*/#  #'
         ;;
