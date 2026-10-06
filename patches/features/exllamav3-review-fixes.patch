@@ -1,0 +1,222 @@
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+index b5ca716..160d540 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+@@ -65,6 +65,8 @@
+ 
+ #include <cstdlib>
+ #include <mutex>
++#include <atomic>
++#include <cstring>
+ 
+ int exl3_gemv_max_m()
+ {
+@@ -651,7 +653,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_tile
+         a.u[1] = make_uint2(lo.y, hi.y);
+     }
+ 
+-    __builtin_amdgcn_wave_barrier();
++    __syncwarp();   // wave-scope LDS fence + barrier (the bare barrier does not order LDS)
+     union { uint2 u[2]; exl3_h8 v; } b;
+     b.u[0] = *((const uint2*) (sb + b_off));
+     b.u[1] = *((const uint2*) (sb + b_off + 8));
+@@ -751,7 +753,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_body
+             w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
+             *((uint4*) (sb + u * 256 + lane * 8)) = w.u4;
+         }
+-        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
+         #pragma unroll
+         for (int u = 0; u < U; ++u)
+         {
+@@ -760,7 +762,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_body
+             b.u2[1] = *((const uint2*) (sb + u * 256 + b_off + 8));
+             cu[u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[u].v, b.v, cu[u]);
+         }
+-        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
+         b_c += (size_t) U * b_stride;
+     }
+     for (; kt < kend; ++kt)
+@@ -771,7 +773,7 @@ __device__ __forceinline__ void exl3_gemv_wmma_body
+         FragB f0, f1;
+         exl3_dq_tile_decode<bits, cb>(raw, lp, f0, f1);
+         exl3_gemv_wmma_tile(sb, f0, f1, a_row + kt * 16, row_ok, lane, b_off, cu[0]);
+-        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
+         b_c += b_stride;
+     }
+     exl3_f8 c = cu[0];
+@@ -864,10 +866,25 @@ void exl3_gemv_wmma_dot_multi
+     );
+ }
+ 
+-static inline bool exl3_gemv_wmma_enabled()
++// EXL3_GEMV_WMMA=1 opts in, but only gfx1200/gfx1201 have the kernel body (other device variants
++// trap), so eligibility is checked per device once and cached; elsewhere the fdot2 path runs
++static inline bool exl3_gemv_wmma_enabled(int device)
+ {
+-    const char* env = std::getenv("EXL3_GEMV_WMMA");
+-    return env && atoi(env) != 0;
++    const char* env = std::getenv("EXL3_GEMV_WMMA");   // read per call: tests toggle it at runtime
++    static std::atomic<int8_t> eligible[64] = {};       // 0 unknown, 1 yes, -1 no
++    if (!env || atoi(env) == 0 || device < 0 || device >= 64) return false;
++    int8_t e = eligible[device].load(std::memory_order_relaxed);
++    if (!e)
++    {
++        hipDeviceProp_t props{};
++        bool ok = hipGetDeviceProperties(&props, device) == hipSuccess && props.warpSize == 32 &&
++                  (std::strncmp(props.gcnArchName, "gfx1200", 7) == 0 ||
++                   std::strncmp(props.gcnArchName, "gfx1201", 7) == 0) &&
++                  (props.gcnArchName[7] == '\0' || props.gcnArchName[7] == ':');
++        e = ok ? 1 : -1;
++        eligible[device].store(e, std::memory_order_relaxed);
++    }
++    return e > 0;
+ }
+ 
+ // k-tiles decoded per WMMA batch: 1, 2 or 4 (default)
+@@ -1107,7 +1124,7 @@ bool exl3_gemv_multirow_try_launch
+     }
+ 
+     // 2w. gfx12 WMMA GEMV (see exl3_gemv_wmma_dot_single), integer bitrates
+-    if (exl3_gemv_wmma_enabled() && K >= 1 && K <= 8 && size_m >= 2)
++    if (exl3_gemv_wmma_enabled(device) && K >= 1 && K <= 8 && size_m >= 2)
+     {
+         const int n_tiles = size_n / 16;
+         const int warps = exl3_gemv_mr_warps(size_k, n_tiles, 1);
+@@ -1209,7 +1226,7 @@ bool exl3_mgemv_multirow_try_launch
+     }
+ 
+     // 2w. gfx12 WMMA GEMV, unweighted single-token calls at integer bitrates
+-    if (exl3_gemv_wmma_enabled() && !weighted && num_tokens == 1 && K >= 1 && K <= 8 && size_m >= 2)
++    if (exl3_gemv_wmma_enabled(device) && !weighted && num_tokens == 1 && K >= 1 && K <= 8 && size_m >= 2)
+     {
+         const int n_tiles = size_n / 16;
+         const int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm);
+diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
+index 7dcb160..0d35337 100644
+--- a/exllamav3/modules/attention_fn/bc_attn.py
++++ b/exllamav3/modules/attention_fn/bc_attn.py
+@@ -75,12 +75,10 @@ _SPLIT_WARPS, _SPLIT_STAGES = (8, 1) if torch.version.hip else (4, 2)
+ def _split_launch(device, hd_pad: int) -> tuple[int, int]:
+     """(num_warps, num_stages) for the split-decode kernel: gfx1100 runs the head_dim <= 128 tile faster
+     at 4 warps (still a single stage)"""
+-    from .triton_paged import gfx_arch
+-    if (w := os.environ.get("EXL3_DEC_WARPS")):
+-        return int(w), int(os.environ.get("EXL3_DEC_STAGES", _SPLIT_STAGES))
+-    if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
+-        return 4, 1
+-    return _SPLIT_WARPS, _SPLIT_STAGES
++    from .triton_paged import gfx_arch, decode_launch_overrides
++    warps, stages = (4, 1) if hd_pad <= 128 and gfx_arch(device) == "gfx1100" else (_SPLIT_WARPS, _SPLIT_STAGES)
++    env_warps, env_stages, _ = decode_launch_overrides()   # each applies on its own
++    return (warps if env_warps is None else env_warps), (stages if env_stages is None else env_stages)
+ 
+ 
+ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
+@@ -309,6 +307,7 @@ class BCAttn:
+         import triton
+         from .triton_paged import (
+             combine_subtiles,
++            decode_launch_overrides,
+             _paged_attn_decode_split_kernel,
+             _paged_attn_decode_combine_kernel,
+             _paged_kv_update_kernel,
+@@ -324,7 +323,7 @@ class BCAttn:
+         qh, kvh = self.num_q_heads, self.num_kv_heads
+         group_size = qh // kvh
+ 
+-        block_n = int(os.environ.get("EXL3_DEC_BLOCK_N", max(16, 8192 // hd_pad)))
++        block_n = decode_launch_overrides()[2] or max(16, 8192 // hd_pad)
+         block_m = triton.next_power_of_2(q_len)
+         block_h = decode_block_h(block_m, group_size)
+         block_rows = block_m * block_h
+diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
+index 4b2b027..e4bc57d 100644
+--- a/exllamav3/modules/attention_fn/triton_paged.py
++++ b/exllamav3/modules/attention_fn/triton_paged.py
+@@ -1090,6 +1090,9 @@ def _paged_attn_decode_split_q4w_kernel(
+ ):
+     pid = tl.program_id(0)
+     split = tl.program_id(1)
++    # BC launches the grid at the split cap; splits past the live count skip the query prep entirely
++    if split >= num_splits:
++        return
+     WPH: tl.constexpr = head_dim // 8           # 4-bit words per head per token
+     G: tl.constexpr = head_dim // 32
+     GPT: tl.constexpr = n_kv_heads * head_dim // 32
+@@ -1353,6 +1356,30 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+ 
+ _decode_sm_count = {}
+ 
++def _env_pow2(name: str) -> int | None:
++    """A power-of-two launch override from the environment, None when unset"""
++    if not (v := os.environ.get(name)):
++        return None
++    n = int(v)
++    if n <= 0 or n & (n - 1):
++        raise ValueError(f"{name}={v}: must be a positive power of two")
++    return n
++
++def decode_launch_overrides(num_warps: int | None = None, num_stages: int | None = None,
++                            block_n: int | None = None) -> tuple[int | None, int | None, int | None]:
++    """Fills each of (num_warps, num_stages, block_n) left as None from EXL3_DEC_WARPS / EXL3_DEC_STAGES /
++    EXL3_DEC_BLOCK_N (still None when unset). Both the eager split-decode launch and the BC graph build resolve
++    through here, so a fallback keeps the tuning. An env value is only read (and validated) when it applies."""
++    if num_warps is None:
++        num_warps = _env_pow2("EXL3_DEC_WARPS")
++    if num_stages is None and (v := os.environ.get("EXL3_DEC_STAGES")):
++        num_stages = int(v)
++        if num_stages < 0:
++            raise ValueError(f"EXL3_DEC_STAGES={v}: must be non-negative")
++    if block_n is None:
++        block_n = _env_pow2("EXL3_DEC_BLOCK_N")
++    return num_warps, num_stages, block_n
++
+ def decode_block_h(block_m: int, group_size: int) -> int:
+     """GQA sibling heads per split-decode program. The default packs 16 rows (block_m * block_h); with a multi-token
+     query (speculative verify) that splits a GQA group across programs, each re-reading and re-dequantizing the same
+@@ -1360,8 +1387,8 @@ def decode_block_h(block_m: int, group_size: int) -> int:
+     if os.environ.get("EXL3_DEC_GROUP", "0") != "0":
+         # at least 16 rows: the WMMA tl.dot needs a 16-row tile
+         return max(triton.next_power_of_2(group_size), 16 // block_m, 1)
+-    if (v := os.environ.get("EXL3_DEC_BLOCK_H")):
+-        return int(v)
++    if (v := _env_pow2("EXL3_DEC_BLOCK_H")):
++        return v
+     return max(16 // block_m, 1)
+ 
+ def decode_split_target(sm_count: int, block_m: int) -> int:
+@@ -1393,8 +1420,8 @@ def paged_attn_triton_decode(
+     qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
+     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
+     n_kv_heads_override: int | None = None,
+-    num_warps: int = 4,
+-    num_stages: int = 2,
++    num_warps: int | None = None,       # None: EXL3_DEC_WARPS, else 4
++    num_stages: int | None = None,      # None: EXL3_DEC_STAGES, else 2
+ ) -> torch.Tensor:
+     """Flash-decoding paged attention for short queries: the kv sequence is split across
+     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
+@@ -1454,6 +1481,11 @@ def paged_attn_triton_decode(
+         k_scales, v_scales, qck, qcv = q, q, 0, 0
+         h32 = q
+ 
++    # Explicit arguments win over the EXL3_DEC_* overrides, which win over the defaults
++    num_warps, num_stages, block_n = decode_launch_overrides(num_warps, num_stages, block_n)
++    num_warps = 4 if num_warps is None else num_warps
++    num_stages = 2 if num_stages is None else num_stages
++
+     # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile
+     candidates = halving_ladder(max(16, 8192 // hd_pad)) if block_n is None else [block_n]
+ 
+@@ -1503,7 +1535,7 @@ def paged_attn_triton_decode(
+     split_kernel = decode_split_kernel_for(qck, qcv, head_dim, hd_pad)
+     with torch.cuda.device(q.device):
+         pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
+-                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0], split_kernel.__name__)
++                    window_right >= 0, has_sinks, num_warps, num_stages, tuple(candidates), split_kernel.__name__)
+         block_n = pick_config(
+             q.device, "paged_attn_decode", pick_key, candidates,
+             lambda bn: shared_bytes(split_kernel, prepare(bn)[0],

@@ -1,0 +1,59 @@
+diff --git a/exllamav3/exllamav3_ext/graph.cu b/exllamav3/exllamav3_ext/graph.cu
+index c16fec7..fb26172 100644
+--- a/exllamav3/exllamav3_ext/graph.cu
++++ b/exllamav3/exllamav3_ext/graph.cu
+@@ -19,6 +19,7 @@ Graph::Graph()
+     graph = NULL;
+     graph_exec = NULL;
+     need_cublas = false;
++    param_updates = 0;
+ }
+ 
+ Graph::~Graph()
+@@ -170,9 +171,33 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
+         if (n == graph_node_sites.size()) TORCH_CHECK(false, "Graph update failed");
+     }
+ 
++    #ifdef USE_ROCM
++        // HIP's graph exec keeps a fixed pool of kernel-argument space and never reclaims it on
++        // hipGraphExecKernelNodeSetParams: after ~1.6M updates the next one segfaults inside libamdhip64
++        // (reproduced standalone on ROCm 7.2 / gfx1201; matches ROCm/rocm-systems#10713). Re-instantiating
++        // frees the pool, after which every node with a patch site is set again from node_params, which
++        // already hold the current values. EXL3_GRAPH_REINST overrides the interval (0 disables).
++        {
++            static const long reinst_every = []() {
++                const char* env = std::getenv("EXL3_GRAPH_REINST");
++                return env ? atol(env) : 100000L;
++            }();
++            if (reinst_every > 0 && param_updates >= reinst_every)
++            {
++                cuda_check(cudaStreamSynchronize(stream));
++                cuda_check(cudaGraphExecDestroy(graph_exec));
++                cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
++                for (auto& site : graph_node_sites)
++                    if (std::get<1>(site) != GP_end) node_needs_update[std::get<0>(site)] = true;
++                param_updates = 0;
++            }
++        }
++    #endif
++
+     for (int n = 0; n < nodes.size(); ++n)
+     {
+         if (!node_needs_update[n]) continue;
++        param_updates++;
+         if (node_is_driver[n])
+         {
+             CUresult r = CudaDrv::instance().graph_exec_kernel_node_set_params((CUgraphExec) graph_exec, (CUgraphNode) nodes[n], &node_params_drv[n]);
+diff --git a/exllamav3/exllamav3_ext/graph.cuh b/exllamav3/exllamav3_ext/graph.cuh
+index 45f33c9..6e3f03d 100644
+--- a/exllamav3/exllamav3_ext/graph.cuh
++++ b/exllamav3/exllamav3_ext/graph.cuh
+@@ -119,6 +119,8 @@ public:
+     std::vector<char> node_is_driver;
+     std::vector<void*> current_values;
+     std::vector<bool> node_needs_update;
++    // ROCm: node parameter updates since graph_exec was (re)instantiated, see Graph::launch
++    long param_updates;
+ 
+     bool need_cublas;
+     bool ready;

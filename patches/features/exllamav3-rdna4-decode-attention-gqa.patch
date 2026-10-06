@@ -1,0 +1,380 @@
+diff --git a/exllamav3/exllamav3_ext/libtorch/attention.cpp b/exllamav3/exllamav3_ext/libtorch/attention.cpp
+index 5932275..79781af 100644
+--- a/exllamav3/exllamav3_ext/libtorch/attention.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/attention.cpp
+@@ -211,6 +211,7 @@ void BC_Attention::configure_slot
+     std::shared_ptr<TritonKernel> k_update,
+     int block_n,
+     int splits_cap,
++    int block_h,
+     c10::optional<at::Tensor> xp,
+     c10::optional<at::Tensor> yp
+ )
+@@ -315,7 +316,8 @@ void BC_Attention::configure_slot
+ 
+     int group_size = num_q_heads / num_kv_heads;
+     int block_m = 1; while (block_m < q_len) block_m <<= 1;
+-    int block_h = MAX(16 / block_m, 1);
++    // Must match the BLOCK_H the split kernel was compiled with (bc_attn.py decode_block_h)
++    if (block_h <= 0) block_h = MAX(16 / block_m, 1);
+     int h_blocks = CEIL_DIVIDE(group_size, block_h);
+     s.programs = bsz * num_kv_heads * h_blocks;
+     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
+diff --git a/exllamav3/exllamav3_ext/libtorch/attention.h b/exllamav3/exllamav3_ext/libtorch/attention.h
+index 839c512..671f6af 100644
+--- a/exllamav3/exllamav3_ext/libtorch/attention.h
++++ b/exllamav3/exllamav3_ext/libtorch/attention.h
+@@ -287,6 +287,7 @@ struct BC_Attention
+         std::shared_ptr<TritonKernel> k_update,
+         int block_n,
+         int splits_cap,
++        int block_h,          // GQA heads per split program, as compiled (0: 16 / block_m)
+         c10::optional<at::Tensor> xp,
+         c10::optional<at::Tensor> yp
+     );
+diff --git a/exllamav3/exllamav3_ext/libtorch/attention_bc.h b/exllamav3/exllamav3_ext/libtorch/attention_bc.h
+index 391745c..5b9f8de 100644
+--- a/exllamav3/exllamav3_ext/libtorch/attention_bc.h
++++ b/exllamav3/exllamav3_ext/libtorch/attention_bc.h
+@@ -157,6 +157,7 @@ py::class_<BC_Attention, std::shared_ptr<BC_Attention>>(m, "BC_Attention").def
+     py::arg("k_update"),
+     py::arg("block_n"),
+     py::arg("splits_cap"),
++    py::arg("block_h"),
+     py::arg("xp"),
+     py::arg("yp")
+ )
+diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
+index 458ccc9..7dcb160 100644
+--- a/exllamav3/modules/attention_fn/bc_attn.py
++++ b/exllamav3/modules/attention_fn/bc_attn.py
+@@ -76,6 +76,8 @@ def _split_launch(device, hd_pad: int) -> tuple[int, int]:
+     """(num_warps, num_stages) for the split-decode kernel: gfx1100 runs the head_dim <= 128 tile faster
+     at 4 warps (still a single stage)"""
+     from .triton_paged import gfx_arch
++    if (w := os.environ.get("EXL3_DEC_WARPS")):
++        return int(w), int(os.environ.get("EXL3_DEC_STAGES", _SPLIT_STAGES))
+     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
+         return 4, 1
+     return _SPLIT_WARPS, _SPLIT_STAGES
+@@ -311,6 +313,9 @@ class BCAttn:
+             _paged_attn_decode_combine_kernel,
+             _paged_kv_update_kernel,
+             _normalize_window,
++            decode_block_h,
++            decode_split_target,
++            decode_split_kernel_for,
+         )
+ 
+         dev = self.device
+@@ -319,16 +324,16 @@ class BCAttn:
+         qh, kvh = self.num_q_heads, self.num_kv_heads
+         group_size = qh // kvh
+ 
+-        block_n = max(16, 8192 // hd_pad)
++        block_n = int(os.environ.get("EXL3_DEC_BLOCK_N", max(16, 8192 // hd_pad)))
+         block_m = triton.next_power_of_2(q_len)
+-        block_h = max(16 // block_m, 1)
++        block_h = decode_block_h(block_m, group_size)
+         block_rows = block_m * block_h
+         h_blocks = triton.cdiv(group_size, block_h)
+         programs = bsz * kvh * h_blocks
+ 
+         # The live split count and split length are runtime kernel arguments derived from the
+         # block-table bound per call (patched into the graph); the grid is sized to the cap
+-        target = 2 * _get_sm_count(dev)
++        target = decode_split_target(_get_sm_count(dev), block_m)
+         splits_cap = max(1, min(target // programs, 128))
+         window_left, window_right = _normalize_window(self.window_size)
+ 
+@@ -355,7 +360,8 @@ class BCAttn:
+             SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
+             BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
+         )
+-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, *_split_launch(dev, hd_pad),
++        split_fn = decode_split_kernel_for(self.k_bits if self.quant else 0, self.v_bits if self.quant else 0, hd, hd_pad)
++        k_split = _compile_kernel(dev, split_fn, sig, consts, *_split_launch(dev, hd_pad),
+                                   pointer_range_32 = self._pointer_range_32())
+ 
+         sig_c = {
+@@ -432,7 +438,7 @@ class BCAttn:
+             q, kv, o, partial_o, partial_ml,
+             gate_a, gate_b,
+             k_split, k_combine, k_update,
+-            block_n, splits_cap,
++            block_n, splits_cap, block_h,
+             xp, yp,
+         )
+ 
+diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
+index 26e24b4..4b2b027 100644
+--- a/exllamav3/modules/attention_fn/triton_paged.py
++++ b/exllamav3/modules/attention_fn/triton_paged.py
+@@ -1056,6 +1056,197 @@ def _paged_attn_decode_split_kernel(
+             tl.store(partial_ml + ml_base + rows * 2 + 1, l)
+ 
+ 
++
++# Q4W split-decode for 4-bit caches (EXL3_DEC_Q4W=1). The packed path unpacks a whole (head_dim, BLOCK_N) tile with a
++# broadcast + reshape that the AMD backend lowers to a 16-bit LDS shuffle per value: on gfx1201 that leaves the kernel
++# at ~1/5 of DRAM bandwidth (an fp16 cache of 3.5x the bytes runs faster). Here each tile's packed words are loaded
++# once, as (head_dim / 8, BLOCK_N); nibble j of word i is value 8 i + j, so for each j the shifted words give a
++# (head_dim / 8)-deep slice and the dot splits into 8 partial dots against q's matching columns (picked out of the
++# rotated q once per program with exact 0/1 selection dots). Only the words change layout, never unpacked values.
++# Same signature as _paged_attn_decode_split_kernel; requires 4-bit K and V and HD_PAD == head_dim.
++
++@triton.jit
++def _q4w_sel(HD: tl.constexpr, WPH: tl.constexpr, j: tl.constexpr):
++    """(HD, WPH) fp16 0/1 matrix picking column 8 i + j into column i."""
++    d = tl.arange(0, HD)
++    i = tl.arange(0, WPH)
++    return tl.where(d[:, None] == i[None, :] * 8 + j, 1.0, 0.0).to(tl.float16)
++
++
++@triton.jit
++def _q4w_slice(words, s8, j: tl.constexpr):
++    return ((((words >> (4 * j)) & 15).to(tl.float32) - 7.5) * s8).to(tl.float16)
++
++
++@triton.jit
++def _paged_attn_decode_split_q4w_kernel(
++    q, k_cache, v_cache, block_table, cache_seqlens, out, partial_o, partial_ml, k_scales, v_scales, h32,
++    split_len, num_pages_per_seq, num_splits, sinks,
++    QCK: tl.constexpr, QCV: tl.constexpr, q_len: tl.constexpr, kv_append_len: tl.constexpr,
++    n_q_heads: tl.constexpr, n_kv_heads: tl.constexpr, page_size: tl.constexpr, head_dim: tl.constexpr,
++    HD_PAD: tl.constexpr, scale: tl.constexpr, CAUSAL: tl.constexpr, WINDOW_LEFT: tl.constexpr,
++    WINDOW_RIGHT: tl.constexpr, SOFTCAP: tl.constexpr, FINAL: tl.constexpr, HAS_SINKS: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_ROWS: tl.constexpr, BLOCK_N: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    split = tl.program_id(1)
++    WPH: tl.constexpr = head_dim // 8           # 4-bit words per head per token
++    G: tl.constexpr = head_dim // 32
++    GPT: tl.constexpr = n_kv_heads * head_dim // 32
++
++    group_size = n_q_heads // n_kv_heads
++    h_blocks = tl.cdiv(group_size, BLOCK_H)
++    h_block = pid % h_blocks
++    bh = pid // h_blocks
++    batch = bh // n_kv_heads
++    kv_head = bh - batch * n_kv_heads
++
++    rows = tl.arange(0, BLOCK_ROWS)
++    row_q = rows % BLOCK_M
++    row_h_local = h_block * BLOCK_H + (rows // BLOCK_M)
++    q_head = kv_head * group_size + row_h_local
++    valid_row = (row_q < q_len) & (row_h_local < group_size)
++
++    offs_d = tl.arange(0, HD_PAD)
++    q_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
++    q_tile = tl.load(q + q_base[:, None] + offs_d[None, :], mask=valid_row[:, None], other=0.0)
++    q_tile = _rot_h32(q_tile, h32, BLOCK_ROWS, HD_PAD)
++    q0 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 0)).to(tl.float16)
++    q1 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 1)).to(tl.float16)
++    q2 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 2)).to(tl.float16)
++    q3 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 3)).to(tl.float16)
++    q4 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 4)).to(tl.float16)
++    q5 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 5)).to(tl.float16)
++    q6 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 6)).to(tl.float16)
++    q7 = tl.dot(q_tile, _q4w_sel(HD_PAD, WPH, 7)).to(tl.float16)
++
++    total_k_len = tl.load(cache_seqlens + batch) + kv_append_len
++    q_abs = total_k_len - q_len + row_q
++    if WINDOW_LEFT >= 0:
++        w_lo = tl.maximum(total_k_len - q_len - WINDOW_LEFT, 0)
++        w_lo = (w_lo // BLOCK_N) * BLOCK_N
++        w_span = tl.cdiv(tl.cdiv(total_k_len - w_lo, num_splits), BLOCK_N) * BLOCK_N
++        n_start = w_lo + split * w_span
++        n_end = tl.minimum(n_start + w_span, total_k_len)
++    else:
++        n_start = split * split_len
++        n_end = tl.minimum(n_start + split_len, total_k_len)
++
++    wi = tl.arange(0, WPH)
++    m = tl.full((BLOCK_ROWS,), -float("inf"), tl.float32)
++    l = tl.full((BLOCK_ROWS,), 0.0, tl.float32)
++    acc0 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc1 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc2 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc3 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc4 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc5 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc6 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++    acc7 = tl.zeros((BLOCK_ROWS, WPH), tl.float32)
++
++    for n0 in range(n_start, n_end, BLOCK_N):
++        offs_n = n0 + tl.arange(0, BLOCK_N)
++        mask_n = offs_n < n_end
++        page = offs_n // page_size
++        page_off = offs_n - page * page_size
++        phys = tl.load(block_table + batch * num_pages_per_seq + page, mask=mask_n, other=0)
++        tok = phys * page_size + page_off
++
++        kw = tl.load(k_cache + kv_head * WPH + tok[None, :] * (GPT * 4) + wi[:, None], mask=mask_n[None, :], other=0)
++        ks8 = tl.load(k_scales + tok[None, :] * GPT + kv_head * G + (wi // 4)[:, None], mask=mask_n[None, :], other=0.0).to(tl.float32) * 0.125
++        scores = tl.dot(q0, _q4w_slice(kw, ks8, 0))
++        scores += tl.dot(q1, _q4w_slice(kw, ks8, 1))
++        scores += tl.dot(q2, _q4w_slice(kw, ks8, 2))
++        scores += tl.dot(q3, _q4w_slice(kw, ks8, 3))
++        scores += tl.dot(q4, _q4w_slice(kw, ks8, 4))
++        scores += tl.dot(q5, _q4w_slice(kw, ks8, 5))
++        scores += tl.dot(q6, _q4w_slice(kw, ks8, 6))
++        scores += tl.dot(q7, _q4w_slice(kw, ks8, 7))
++        scores = scores * scale
++        if SOFTCAP > 0.0:
++            scores_scaled = scores / SOFTCAP
++            scores = (2.0 / (1.0 + tl.exp(-2.0 * scores_scaled)) - 1.0) * SOFTCAP
++
++        valid = valid_row[:, None] & mask_n[None, :]
++        if CAUSAL:
++            valid = valid & (offs_n[None, :] <= q_abs[:, None])
++        if WINDOW_LEFT >= 0:
++            valid = valid & (offs_n[None, :] >= q_abs[:, None] - WINDOW_LEFT)
++        if WINDOW_RIGHT >= 0:
++            valid = valid & (offs_n[None, :] <= q_abs[:, None] + WINDOW_RIGHT)
++        scores = tl.where(valid, scores, -float("inf"))
++
++        m_new = tl.maximum(m, tl.max(scores, axis=1))
++        m_exp = tl.where(m_new == -float("inf"), 0.0, m_new)
++        p = tl.exp(scores - m_exp[:, None])
++        p = tl.where(valid, p, 0.0)
++        alpha = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_exp))
++        l = l * alpha + tl.sum(p, axis=1)
++        p16 = p.to(tl.float16)
++
++        vw = tl.load(v_cache + kv_head * WPH + tok[:, None] * (GPT * 4) + wi[None, :], mask=mask_n[:, None], other=0)
++        vs8 = tl.load(v_scales + tok[:, None] * GPT + kv_head * G + (wi // 4)[None, :], mask=mask_n[:, None], other=0.0).to(tl.float32) * 0.125
++        acc0 = acc0 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 0))
++        acc1 = acc1 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 1))
++        acc2 = acc2 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 2))
++        acc3 = acc3 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 3))
++        acc4 = acc4 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 4))
++        acc5 = acc5 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 5))
++        acc6 = acc6 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 6))
++        acc7 = acc7 * alpha[:, None] + tl.dot(p16, _q4w_slice(vw, vs8, 7))
++        m = m_new
++
++    if FINAL:
++        if HAS_SINKS:
++            sink = tl.load(sinks + q_head, mask=valid_row, other=0.0).to(tl.float32)
++            m_top = tl.maximum(m, sink)
++            alpha_s = tl.where(m == -float("inf"), 0.0, tl.exp(m - m_top))
++            l = l * alpha_s + tl.exp(sink - m_top)
++            acc0 = acc0 * alpha_s[:, None]
++            acc1 = acc1 * alpha_s[:, None]
++            acc2 = acc2 * alpha_s[:, None]
++            acc3 = acc3 * alpha_s[:, None]
++            acc4 = acc4 * alpha_s[:, None]
++            acc5 = acc5 * alpha_s[:, None]
++            acc6 = acc6 * alpha_s[:, None]
++            acc7 = acc7 * alpha_s[:, None]
++        inv_l = 1.0 / tl.where(l == 0.0, 1.0, l)
++        # back to head-dim order with exact selection dots (transposed), then the inverse rotation
++        out_tile = tl.dot((acc0 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 0)))
++        out_tile += tl.dot((acc1 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 1)))
++        out_tile += tl.dot((acc2 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 2)))
++        out_tile += tl.dot((acc3 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 3)))
++        out_tile += tl.dot((acc4 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 4)))
++        out_tile += tl.dot((acc5 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 5)))
++        out_tile += tl.dot((acc6 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 6)))
++        out_tile += tl.dot((acc7 * inv_l[:, None]).to(tl.float16), tl.trans(_q4w_sel(HD_PAD, WPH, 7)))
++        out_tile = _rot_h32(out_tile, h32, BLOCK_ROWS, HD_PAD)
++        out_base = ((batch * q_len + row_q) * n_q_heads + q_head) * head_dim
++        tl.store(out + out_base[:, None] + offs_d[None, :], out_tile, mask=valid_row[:, None])
++    else:
++        if split < num_splits:
++            po_base = (pid * num_splits + split) * BLOCK_ROWS * HD_PAD
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 0)[None, :], acc0)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 1)[None, :], acc1)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 2)[None, :], acc2)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 3)[None, :], acc3)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 4)[None, :], acc4)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 5)[None, :], acc5)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 6)[None, :], acc6)
++            tl.store(partial_o + po_base + rows[:, None] * HD_PAD + (wi * 8 + 7)[None, :], acc7)
++            ml_base = (pid * num_splits + split) * BLOCK_ROWS * 2
++            tl.store(partial_ml + ml_base + rows * 2, m)
++            tl.store(partial_ml + ml_base + rows * 2 + 1, l)
++
++
++def decode_split_kernel_for(qck, qcv, head_dim, hd_pad):
++    """The split-decode kernel to use: Q4W when enabled and applicable, else the generic one."""
++    if (os.environ.get("EXL3_DEC_Q4W", "0") != "0" and qck == 4 and qcv == 4 and hd_pad == head_dim
++            and head_dim >= 128):
++        return _paged_attn_decode_split_q4w_kernel
++    return _paged_attn_decode_split_kernel
++
++
+ @triton.jit
+ def _paged_attn_decode_combine_kernel(
+     partial_o,
+@@ -1162,6 +1353,26 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+ 
+ _decode_sm_count = {}
+ 
++def decode_block_h(block_m: int, group_size: int) -> int:
++    """GQA sibling heads per split-decode program. The default packs 16 rows (block_m * block_h); with a multi-token
++    query (speculative verify) that splits a GQA group across programs, each re-reading and re-dequantizing the same
++    K/V tiles. EXL3_DEC_GROUP=1 takes the whole group in one program (rows = block_m * next_pow2(group))."""
++    if os.environ.get("EXL3_DEC_GROUP", "0") != "0":
++        # at least 16 rows: the WMMA tl.dot needs a 16-row tile
++        return max(triton.next_power_of_2(group_size), 16 // block_m, 1)
++    if (v := os.environ.get("EXL3_DEC_BLOCK_H")):
++        return int(v)
++    return max(16 // block_m, 1)
++
++def decode_split_target(sm_count: int, block_m: int) -> int:
++    """Programs to aim for across (kv-head groups x splits). EXL3_DEC_SPLIT_MULT overrides the per-SM factor;
++    with EXL3_DEC_GROUP=1 it defaults to the gfx1201 sweep's best (8 for single-token decode, 4 for verify)."""
++    if (v := os.environ.get("EXL3_DEC_SPLIT_MULT")):
++        return int(float(v) * sm_count)
++    if os.environ.get("EXL3_DEC_GROUP", "0") != "0":
++        return (8 if block_m == 1 else 4) * sm_count
++    return 2 * sm_count
++
+ def paged_attn_triton_decode(
+     q: torch.Tensor,
+     k: torch.Tensor | None,
+@@ -1248,7 +1459,7 @@ def paged_attn_triton_decode(
+ 
+     group_size = n_q_heads // n_kv_heads
+     block_m = triton.next_power_of_2(q_len)
+-    block_h = max(16 // block_m, 1)
++    block_h = decode_block_h(block_m, group_size)
+     block_rows = block_m * block_h
+     h_blocks = triton.cdiv(group_size, block_h)
+     num_pages_per_seq = block_table.shape[1]
+@@ -1264,7 +1475,7 @@ def paged_attn_triton_decode(
+     dev = q.device.index
+     if dev not in _decode_sm_count:
+         _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
+-    target = 2 * _decode_sm_count[dev]
++    target = decode_split_target(_decode_sm_count[dev], block_m)
+ 
+     def prepare(block_n):
+         """Split count, partial buffers and the split kernel's argument list for one kv tile."""
+@@ -1289,12 +1500,13 @@ def paged_attn_triton_decode(
+         )
+         return args, splits, partial_o, partial_ml
+ 
++    split_kernel = decode_split_kernel_for(qck, qcv, head_dim, hd_pad)
+     with torch.cuda.device(q.device):
+         pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
+-                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
++                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0], split_kernel.__name__)
+         block_n = pick_config(
+             q.device, "paged_attn_decode", pick_key, candidates,
+-            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
++            lambda bn: shared_bytes(split_kernel, prepare(bn)[0],
+                                     num_warps = num_warps, num_stages = num_stages))
+         args, num_splits, partial_o, partial_ml = prepare(block_n)
+ 
+@@ -1302,7 +1514,7 @@ def paged_attn_triton_decode(
+             _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
+                              n_kv_heads, page_size, head_dim)
+ 
+-        _paged_attn_decode_split_kernel[(programs, num_splits)](
++        split_kernel[(programs, num_splits)](
+             *args, num_warps = num_warps, num_stages = num_stages,
+         )
+ 

@@ -1,0 +1,4 @@
+# Install with --index-url https://download.pytorch.org/whl/rocm7.2 (setup/make_venv.sh does this)
+torch==2.13.0+rocm7.2
+torchvision==0.28.0+rocm7.2
+triton-rocm==3.7.1

@@ -1,0 +1,415 @@
+diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+index 719a347..b5ca716 100644
+--- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
++++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
+@@ -186,7 +186,8 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
+     const int lane,
+     const int kb_begin,
+     const int kb_end,
+-    float* out
++    float* out,
++    const int rows_valid = M
+ )
+ {
+     constexpr int tile_elements = Exl3Width<bits>::tile_u16;   // 16 * bits (integer K)
+@@ -207,7 +208,9 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
+         #pragma unroll
+         for (int r = 0; r < M; ++r)
+         {
+-            const half2* a2 = (const half2*) (A + r * lda + k_tile * 16);
++            // Rows >= rows_valid are never stored; load the last valid row rather than read past the end of A
++            const int rr = r < rows_valid ? r : rows_valid - 1;
++            const half2* a2 = (const half2*) (A + rr * lda + k_tile * 16);
+             half2 a01 = a2[r0 >> 1];
+             half2 a89 = a2[(r0 >> 1) + 4];
+             accA[r] = __builtin_amdgcn_fdot2(a01, frag0[0], accA[r], false);
+@@ -544,8 +547,9 @@ __device__ __forceinline__ void exl3_gemv_mr_body
+         core, tpb, A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc,
+         [&](int tn, int k0, int k1, float* o)
+         {
+-            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o);
+-        }
++            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o, rows_valid);
++        },
++        rows_valid
+     );
+     if (warp_id != 0) return;
+     if constexpr (M == 1)
+@@ -597,6 +601,283 @@ void exl3_gemv_mr_dot_single
+     );
+ }
+ 
++// =============================================================================
++// Kernel 2w: the m <= 8 GEMV on gfx12 WMMA (EXL3_GEMV_WMMA=1)
++// =============================================================================
++// The fdot2 cores above spend one dot2 per row per weight pair, so an 8-row call
++// (a DFlash2 verify) costs ~1.4-1.9x a 1-row call although it reads the same
++// trellis. Here each 16x16 tile is still decoded once (dq_dispatch, 8 weights per
++// lane), then one v_wmma_f32_16x16x16_f16 takes all rows.
++//
++// Layout. dq_dispatch leaves lane l = 4g + q holding, for column g, k = 2q + {0,1}
++// and 2q + 8 + {0,1}, and the same for column g + 8 (the mma.m16n8k16 B order).
++// The decoded tile goes to a per-wave LDS slot in that order: half j of lane l at
++// index 8l + j, column n's values at 32(n & 7) + 4(n >> 3) + 8q + {0..3}. gfx12
++// WMMA wants lane L to hold column L & 15 for 8 K values, lanes L and L ^ 16
++// splitting the 16. K order inside a tile is free as long as A and B agree, so
++// lane L takes q = 2h, 2h + 1 (h = L >> 4): two contiguous 4-half runs at
++// 32(n & 7) + 4(n >> 3) + 16h + {0, 8}, i.e. k = 4h + {0,1,8,9,2,3,10,11} for
++// every column. A is loaded in that same k order. The accumulator then holds
++// D[row 8(L >> 4) + i][col L & 15] (probed on gfx1201): lanes 0-15 carry rows
++// 0-7 of their column, exactly what exl3_gemv_fused_epilogue_mr consumes.
++//
++// fp32 accumulation inside the WMMA differs in order from the fdot2 chain, so
++// results match the m == 1 path to rounding, not bit for bit.
++
++typedef _Float16 exl3_h8 __attribute__((ext_vector_type(8)));
++typedef float exl3_f8 __attribute__((ext_vector_type(8)));
++
++static inline size_t exl3_gemv_wmma_smem_bytes(int warps, int u)
++{
++    return (size_t) warps * u * 256 * sizeof(half) + (size_t) warps * 8 * 16 * sizeof(float);
++}
++
++// One k-tile's B round trip through this wave's LDS slot and its WMMA (see the layout note above)
++__device__ __forceinline__ void exl3_gemv_wmma_tile
++(
++    half* sb, FragB f0, FragB f1, const half* a_ptr, bool row_ok, int lane, int b_off, exl3_f8& c
++)
++{
++    union { uint4 u; half2 h2[4]; } w;
++    w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
++    *((uint4*) (sb + lane * 8)) = w.u;
++
++    union { uint2 u[2]; exl3_h8 v; } a = {};
++    if (row_ok)
++    {
++        const uint2 lo = *((const uint2*) a_ptr);         // k = 4h + 0..3
++        const uint2 hi = *((const uint2*) (a_ptr + 8));   // k = 4h + 8..11
++        a.u[0] = make_uint2(lo.x, hi.x);                  // -> k = 4h + {0,1,8,9,2,3,10,11}
++        a.u[1] = make_uint2(lo.y, hi.y);
++    }
++
++    __builtin_amdgcn_wave_barrier();
++    union { uint2 u[2]; exl3_h8 v; } b;
++    b.u[0] = *((const uint2*) (sb + b_off));
++    b.u[1] = *((const uint2*) (sb + b_off + 8));
++    c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a.v, b.v, c);
++}
++
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++__device__ __forceinline__ void exl3_gemv_wmma_body
++(
++    const half* __restrict__ A,     // this slab's rotated rows, size_k apart
++    const uint16_t* __restrict__ B, // the matrix's trellis
++    const int n_tiles,              // N-tiles of this matrix
++    const int tile_n,
++    const int size_k,
++    void* Cb,
++    const int64_t row_off,
++    const int ldc,
++    const int size_m,
++    const half* __restrict__ svh,
++    int* seg_counters               // this slot's counters, indexed by segment
++)
++{
++#if defined(__gfx1200__) || defined(__gfx1201__)
++    const int warp_id = threadIdx.x / 32;
++    const int lane = threadIdx.x % 32;
++
++    extern __shared__ char shared_mem[];
++    half* sb = ((half*) shared_mem) + warp_id * U * 256;
++    float* sh_red = (float*) (shared_mem + WARPS_PER_BLOCK * U * 256 * sizeof(half));
++
++    constexpr int tile_elements = Exl3Width<bits>::tile_u16;
++
++    const int num_k_tiles = size_k / 16;
++    const int chunk = (num_k_tiles + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
++    const int kb0 = warp_id * chunk;
++    const int kb1 = kb0 + chunk < num_k_tiles ? kb0 + chunk : num_k_tiles;
++
++    const int h = lane >> 4;
++    const int r = lane & 15;
++    const bool row_ok = r < size_m;
++    const half* a_row = A + (int64_t) (row_ok ? r : 0) * size_k + 4 * h;
++    // A for the unrolled loop: wave-uniform base + constant 32-bit lane offset (global_load saddr form). Rows
++    // past size_m read row 0: they only land in output rows the epilogue never stores, so no branch is needed.
++    typedef __attribute__((address_space(1))) const uint2 exl3_g_u2;
++    exl3_g_char* a_g = (exl3_g_char*) (const char*) exl3_uni_ptr(A);
++    uint32_t a_off = (uint32_t) (((row_ok ? r : 0) * size_k + 4 * h) * sizeof(half));
++    const int b_off = 32 * (r & 7) + 4 * (r >> 3) + 16 * h;   // r doubles as the column for B
++
++    // Trellis through the RDNA tiles core's decoder (exl3_gemv_tiles_rdna.cuh): per-lane raw-word plan computed
++    // once, wave-uniform tile base + constant lane offsets (global_load saddr form), full-rate hash and byte sum.
++    // It leaves frag0/frag1 exactly as dq_dispatch would, so the LDS layout above is unchanged.
++    constexpr int R = Exl3LanePlan<bits>::R;
++    constexpr int tile_bytes = Exl3Width<bits>::tile_bytes;
++    const Exl3LanePlan<bits> lp = exl3_lane_plan<bits>(lane);
++    uint32_t off[R];
++    #pragma unroll
++    for (int i = 0; i < R; ++i) off[i] = lp.off[i];
++    const uint32_t b_stride = (uint32_t) exl3_uni(n_tiles) * tile_bytes;
++    exl3_g_char* b_c = (exl3_g_char*) (const char*) exl3_uni_ptr(B)
++                       + ((size_t) exl3_uni(kb0) * exl3_uni(n_tiles) + exl3_uni(tile_n)) * tile_bytes;
++
++    // One accumulator per unrolled tile so the U WMMAs of a batch do not wait on each other; the A loads and
++    // trellis loads of the batch are all issued before the first decode
++    exl3_f8 cu[U];
++    #pragma unroll
++    for (int u = 0; u < U; ++u) cu[u] = exl3_f8{};
++    int kt = exl3_uni(kb0);
++    const int kend = exl3_uni(kb1);
++    for (; kt + U <= kend; kt += U)
++    {
++        #pragma unroll
++        for (int i = 0; i < R; ++i) exl3_opaque(off[i]);
++        uint32_t raw[U][R];
++        #pragma unroll
++        for (int u = 0; u < U; ++u)
++            #pragma unroll
++            for (int i = 0; i < R; ++i)
++                raw[u][i] = exl3_ld_g(b_c + (size_t) u * b_stride, off[i]);
++        union AV { uint2 u2[2]; exl3_h8 v; };
++        AV av[U];
++        exl3_opaque(a_off);
++        #pragma unroll
++        for (int u = 0; u < U; ++u)
++        {
++            exl3_g_char* ap = a_g + (size_t) (kt + u) * 32;
++            const uint2 lo = *(exl3_g_u2*) (ap + a_off);          // k = 4h + 0..3
++            const uint2 hi = *(exl3_g_u2*) (ap + a_off + 16);     // k = 4h + 8..11
++            av[u].u2[0] = make_uint2(lo.x, hi.x);                 // -> k = 4h + {0,1,8,9,2,3,10,11}
++            av[u].u2[1] = make_uint2(lo.y, hi.y);
++        }
++        #pragma unroll
++        for (int u = 0; u < U; ++u)
++        {
++            FragB f0, f1;
++            exl3_dq_tile_decode<bits, cb>(raw[u], lp, f0, f1);
++            union { uint4 u4; half2 h2[4]; } w;
++            w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
++            *((uint4*) (sb + u * 256 + lane * 8)) = w.u4;
++        }
++        __builtin_amdgcn_wave_barrier();
++        #pragma unroll
++        for (int u = 0; u < U; ++u)
++        {
++            union { uint2 u2[2]; exl3_h8 v; } b;
++            b.u2[0] = *((const uint2*) (sb + u * 256 + b_off));
++            b.u2[1] = *((const uint2*) (sb + u * 256 + b_off + 8));
++            cu[u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[u].v, b.v, cu[u]);
++        }
++        __builtin_amdgcn_wave_barrier();
++        b_c += (size_t) U * b_stride;
++    }
++    for (; kt < kend; ++kt)
++    {
++        uint32_t raw[R];
++        #pragma unroll
++        for (int i = 0; i < R; ++i) raw[i] = exl3_ld_g(b_c, off[i]);
++        FragB f0, f1;
++        exl3_dq_tile_decode<bits, cb>(raw, lp, f0, f1);
++        exl3_gemv_wmma_tile(sb, f0, f1, a_row + kt * 16, row_ok, lane, b_off, cu[0]);
++        __builtin_amdgcn_wave_barrier();
++        b_c += b_stride;
++    }
++    exl3_f8 c = cu[0];
++    #pragma unroll
++    for (int u = 1; u < U; ++u) c += cu[u];
++
++    if (lane < 16)
++    {
++        #pragma unroll
++        for (int i = 0; i < 8; ++i) sh_red[(warp_id * 8 + i) * 16 + lane] = c[i];
++    }
++    __syncthreads();
++    if (warp_id != 0) return;
++
++    float acc[8];
++    #pragma unroll
++    for (int i = 0; i < 8; ++i)
++    {
++        float t = 0.0f;
++        if (lane < 16)
++        {
++            #pragma unroll
++            for (int w = 0; w < WARPS_PER_BLOCK; ++w) t += sh_red[(w * 8 + i) * 16 + lane];
++        }
++        acc[i] = t;
++    }
++    exl3_gemv_fused_epilogue_mr<c_fp32, 8>
++    (
++        acc, Cb, row_off, ldc, size_m, tile_n, lane, svh, seg_counters + tile_n / 8
++    );
++#else
++    __builtin_trap();
++#endif
++}
++
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++static __global__
++__launch_bounds__(WARPS_PER_BLOCK * 32)
++__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
++void exl3_gemv_wmma_dot_single
++(
++    Exl3GemvMrParams* __restrict__ pb,
++    const int size_k,
++    const int size_n,
++    const int size_m
++)
++{
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    (
++        pb->A_had, pb->B, size_n / 16, blockIdx.x, size_k,
++        pb->C, 0, size_n, size_m, pb->svh, pb->seg_counters
++    );
++}
++
++// Multi-matrix form (exl3_gemv_mr_dot_multi's unweighted path): blockIdx.y is the slot
++template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int U>
++static __global__
++__launch_bounds__(WARPS_PER_BLOCK * 32)
++__attribute__((amdgpu_flat_work_group_size(WARPS_PER_BLOCK * 32, WARPS_PER_BLOCK * 32)))
++void exl3_gemv_wmma_dot_multi
++(
++    Exl3GemvMrParams* __restrict__ pb,
++    const uintptr_t* __restrict__ B_list,
++    const uintptr_t* __restrict__ svh_list,
++    const half* __restrict__ A_had,
++    const int size_k,
++    const int size_n,
++    const int size_m,
++    const int bszm,
++    const int min_index,
++    const int max_index,
++    const int* __restrict__ size_n_list,
++    void* const* __restrict__ c_list
++)
++{
++    const int j = blockIdx.y;
++    const int tile_n = blockIdx.x;
++    int orig_pos;
++    const int mat_index = exl3_mgemv_mat_index(pb->indices, j, bszm, min_index, max_index, &orig_pos);
++    if (mat_index < 0) return;   // block-uniform
++    const int n_j = size_n_list ? size_n_list[mat_index] : size_n;
++    if (tile_n >= n_j / 16) return;   // block-uniform
++    exl3_gemv_wmma_body<bits, c_fp32, cb, WARPS_PER_BLOCK, U>
++    (
++        A_had + (int64_t) j * size_m * size_k, (const uint16_t*) B_list[mat_index], n_j / 16, tile_n, size_k,
++        c_list ? c_list[mat_index] : pb->Cm,
++        c_list ? 0 : (int64_t) j * size_m * size_n,
++        c_list ? n_j : size_n,
++        size_m, (const half*) svh_list[mat_index], pb->seg_counters + j * (size_n / 128)
++    );
++}
++
++static inline bool exl3_gemv_wmma_enabled()
++{
++    const char* env = std::getenv("EXL3_GEMV_WMMA");
++    return env && atoi(env) != 0;
++}
++
++// k-tiles decoded per WMMA batch: 1, 2 or 4 (default)
++static inline int exl3_gemv_wmma_unroll()
++{
++    const char* env = std::getenv("EXL3_GEMV_WMMA_U");
++    int v = env ? atoi(env) : 4;
++    return v >= 4 ? 4 : (v >= 2 ? 2 : 1);
++}
++
+ template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
+ static __global__
+ __launch_bounds__(WARPS_PER_BLOCK * 32)
+@@ -742,6 +1023,40 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
+         case EXL3_HALF_BITS(3): LAUNCH_MR_CB(EXL3_HALF_BITS(3), 2, kernel_name, __VA_ARGS__); break; \
+     }
+ 
++// K x codebook x warps x U dispatch for the WMMA entry points (integer bitrates)
++#define LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, u_val, ...) \
++    if (c_fp32) hipLaunchKernelGGL((kernel<bits_val, true, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__); \
++    else hipLaunchKernelGGL((kernel<bits_val, false, codebook, warps_val, u_val>), grid, block, smem, stream, __VA_ARGS__);
++#define LAUNCH_WMMA_W(kernel, bits_val, codebook, warps_val, ...) \
++    switch (u) { \
++        case 1: LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, 1, __VA_ARGS__) break; \
++        case 2: LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, 2, __VA_ARGS__) break; \
++        default: LAUNCH_WMMA_U(kernel, bits_val, codebook, warps_val, 4, __VA_ARGS__) break; \
++    }
++#define LAUNCH_WMMA_CB(kernel, bits_val, codebook, ...) \
++    switch (warps) { \
++        case 4:  LAUNCH_WMMA_W(kernel, bits_val, codebook, 4, __VA_ARGS__) break; \
++        case 8:  LAUNCH_WMMA_W(kernel, bits_val, codebook, 8, __VA_ARGS__) break; \
++        case 16: LAUNCH_WMMA_W(kernel, bits_val, codebook, 16, __VA_ARGS__) break; \
++    }
++#define LAUNCH_WMMA_K(kernel, bits_val, ...) \
++    switch (cb) { \
++        case 0: LAUNCH_WMMA_CB(kernel, bits_val, 0, __VA_ARGS__) break; \
++        case 1: LAUNCH_WMMA_CB(kernel, bits_val, 1, __VA_ARGS__) break; \
++        case 2: LAUNCH_WMMA_CB(kernel, bits_val, 2, __VA_ARGS__) break; \
++    }
++#define LAUNCH_WMMA(kernel, ...) \
++    switch (K) { \
++        case 1: LAUNCH_WMMA_K(kernel, 1, __VA_ARGS__) break; \
++        case 2: LAUNCH_WMMA_K(kernel, 2, __VA_ARGS__) break; \
++        case 3: LAUNCH_WMMA_K(kernel, 3, __VA_ARGS__) break; \
++        case 4: LAUNCH_WMMA_K(kernel, 4, __VA_ARGS__) break; \
++        case 5: LAUNCH_WMMA_K(kernel, 5, __VA_ARGS__) break; \
++        case 6: LAUNCH_WMMA_K(kernel, 6, __VA_ARGS__) break; \
++        case 7: LAUNCH_WMMA_K(kernel, 7, __VA_ARGS__) break; \
++        case 8: LAUNCH_WMMA_K(kernel, 8, __VA_ARGS__) break; \
++    }
++
+ bool exl3_gemv_multirow_try_launch
+ (
+     const half* A_ptr,
+@@ -791,6 +1106,19 @@ bool exl3_gemv_multirow_try_launch
+         }
+     }
+ 
++    // 2w. gfx12 WMMA GEMV (see exl3_gemv_wmma_dot_single), integer bitrates
++    if (exl3_gemv_wmma_enabled() && K >= 1 && K <= 8 && size_m >= 2)
++    {
++        const int n_tiles = size_n / 16;
++        const int warps = exl3_gemv_mr_warps(size_k, n_tiles, 1);
++        dim3 grid(n_tiles, 1);
++        dim3 block(warps * 32);
++        const int u = exl3_gemv_wmma_unroll();
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        LAUNCH_WMMA(exl3_gemv_wmma_dot_single, pb, size_k, size_n, size_m)
++        return true;
++    }
++
+     // 2. GEMV, M rows per warp, fused output epilogue
+     {
+         const int n_tiles = size_n / 16;
+@@ -880,6 +1208,20 @@ bool exl3_mgemv_multirow_try_launch
+         }
+     }
+ 
++    // 2w. gfx12 WMMA GEMV, unweighted single-token calls at integer bitrates
++    if (exl3_gemv_wmma_enabled() && !weighted && num_tokens == 1 && K >= 1 && K <= 8 && size_m >= 2)
++    {
++        const int n_tiles = size_n / 16;
++        const int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm);
++        const int u = exl3_gemv_wmma_unroll();
++        dim3 grid(n_tiles, bszm);
++        dim3 block(warps * 32);
++        size_t smem = exl3_gemv_wmma_smem_bytes(warps, u);
++        LAUNCH_WMMA(exl3_gemv_wmma_dot_multi, pb, B_ptr_ptr, svh_ptr_ptr, A_had_ptr,
++                    size_k, size_n, size_m, bszm, min_index, max_index, size_n_list, c_list)
++        return true;
++    }
++
+     // 2. GEMV
+     {
+         const int n_tiles = size_n / 16;
+@@ -901,6 +1243,11 @@ bool exl3_mgemv_multirow_try_launch
+     return true;
+ }
+ 
++#undef LAUNCH_WMMA
++#undef LAUNCH_WMMA_K
++#undef LAUNCH_WMMA_CB
++#undef LAUNCH_WMMA_W
++#undef LAUNCH_WMMA_U
+ #undef LAUNCH_MR
+ #undef LAUNCH_MR_K
+ #undef LAUNCH_MR_CB

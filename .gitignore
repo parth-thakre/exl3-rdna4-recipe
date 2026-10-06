@@ -1,0 +1,15 @@
+# Created by the setup scripts; never commit these
+/.venv/
+/exllamav3/
+/tabbyAPI/
+/deps/
+/models/
+/requant_work/
+/logs/
+/gpqa/
+# Kernel experiment builds
+/kernels/wmma_layout_probe
+/kernels/graph_setparams_repro
+/kernels/*.so
+__pycache__/
+*.pyc

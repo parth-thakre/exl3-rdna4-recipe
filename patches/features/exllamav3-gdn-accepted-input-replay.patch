@@ -1,0 +1,2355 @@
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index 7d6a775..24cd7b2 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -85,6 +85,22 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
+ the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
+ force the torch path, for A/B testing.
+ 
++### `EXL3_GDN_REPLAY` (default: `0`)
++
++Accepted-input replay for gated-delta-net layers under speculative decoding. Set to `1` and the
++cache keeps no per-draft-token recurrent-state history (about 0.15 GB per draft token on a
++48-layer model): the verify pass reads the committed state without writing it, and the rewind
++replays only the accepted prefix of the recorded verify inputs. The resulting state is bit-identical
++to the history path. Mamba2 layers keep their history.
++
++### `EXL3_BC_GDN_REPLAY` (default: `1`)
++
++With `EXL3_GDN_REPLAY=1`, the verify pass also runs as the graph-captured C++ call. Its conv
++input, post-conv q/k/v, beta and g stay in per-layer buffers (about 0.33 MB per layer for an
++8-row verify; shapes share power-of-two row buckets), and two launches per rewind (recurrent state, conv window) commit the accepted
++prefix of every layer (`batched_gdn_replay`). Set to `0` to verify on the torch path and replay layer by layer, for
++A/B testing.
++
+ ### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
+ 
+ Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
+diff --git a/exllamav3/cache/cache.py b/exllamav3/cache/cache.py
+index 3589188..2c82243 100644
+--- a/exllamav3/cache/cache.py
++++ b/exllamav3/cache/cache.py
+@@ -208,6 +208,11 @@ class Cache:
+         if model is None:
+             model = self.model
+ 
++        # Unresolved GDN verifications die with the cache (TP: on every worker), and with them their
++        # claims on the modules' shared replay storage. An uninitialized cache holds none
++        if model is self.model and self.initialized:
++            self._discard_replay()
++
+         del model.cache_weakrefs[id(self)]
+ 
+         cl = model.get_cache_layers()
+@@ -366,10 +371,24 @@ class Cache:
+         )
+ 
+ 
++    def _discard_replay(self, slot = None):
++        if not any(getattr(layer, "replay_enabled", False) for layer in self.recurrent_layers.values()):
++            return
++        if self.model.loaded_tp:
++            from ..modules.gated_delta_net import mp_cache_recurrent_discard_replay
++            self.model.tp_dispatch_all(mp_cache_recurrent_discard_replay, (id(self), slot))
++        else:
++            for layer in self.recurrent_layers.values():
++                discard = getattr(layer, "discard_replay", None)
++                if discard is not None:
++                    discard(slot)
++
++
+     def release_state(self, state):
+         """
+-        Return state to the pool
++        Return state to the pool, dropping any abandoned verification before slot reuse.
+         """
++        self._discard_replay(state.slot)
+         self.free_list.appendleft(state.slot)
+ 
+ 
+@@ -377,6 +396,7 @@ class Cache:
+         """
+         Return every state slot to the pool. A Generator calls this when it takes ownership of the cache.
+         """
++        self._discard_replay()
+         self.free_list = deque(range(self.num_slots))
+ 
+ 
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index b7a8fb5..44fbcde 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -232,10 +232,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+ 
+     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
+     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
+-    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
++    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule",
++        py::arg("mixed_qkv"), py::arg("g"), py::arg("beta"), py::arg("recurrent_state"),
++        py::arg("core_attn_out"), py::arg("num_k_heads"), py::arg("num_v_heads"),
++        py::arg("k_head_dim"), py::arg("v_head_dim"), py::arg("slots"), py::arg("history"),
++        py::arg("save_state") = true);
+     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
+     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
+-    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
++    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update",
++        py::arg("x"), py::arg("conv_state"), py::arg("slots"), py::arg("weight"), py::arg("bias"),
++        py::arg("out"), py::arg("activation"), py::arg("history"), py::arg("save_state") = true);
+     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
+     m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
+         { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
+@@ -252,6 +258,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+         .def(py::init<uintptr_t, uintptr_t, int64_t>());
+     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
+     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
++    py::class_<GDNReplayJob>(m, "GDNReplayJob")
++        .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t>());
++    m.def("batched_gdn_replay", &batched_gdn_replay,
++        py::arg("jobs"), py::arg("device_index"), py::arg("accepted"), py::arg("seqlen"),
++        py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
++        py::arg("conv_dim"), py::arg("conv_k"), py::arg("conv_stride"), py::arg("channelwise"));
+ 
+     m.def("argmax_sample", &argmax_sample, "argmax_sample");
+     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");
+diff --git a/exllamav3/exllamav3_ext/gdn.cu b/exllamav3/exllamav3_ext/gdn.cu
+index 37e7f56..d15ccdb 100644
+--- a/exllamav3/exllamav3_ext/gdn.cu
++++ b/exllamav3/exllamav3_ext/gdn.cu
+@@ -423,7 +423,7 @@ void mamba2_dt_op
+ // delta-correction readback: no q/k L2 norm, v used raw (beta = dt scales it in the update),
+ // output y = q.S + D*v with no 1/sqrt(dk) scale. Input layout is the conv channel order
+ // [x (v_dim), B (k_dim), C (k_dim)] with x->v, B->k, C->q
+-template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT, bool MAMBA2 = false>
++template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT, bool MAMBA2 = false, bool SAVE_STATE = true>
+ __global__ __launch_bounds__(MAX_HEAD_DIM * SUBK)
+ void cuda_recurrent_gated_delta_rule_kernel
+ (
+@@ -481,6 +481,19 @@ void cuda_recurrent_gated_delta_rule_kernel
+     __shared__ float sh_dot1[SUBK][MAX_HEAD_DIM];
+     __shared__ float sh_dot2[SUBK][MAX_HEAD_DIM];
+ 
++    // Read-only verification carries each thread's k-slice locally across the whole sequence.
++    // Loading committed state once avoids both state/history writes and a per-token reset.
++    float thread_state[SAVE_STATE ? 1 : MAX_HEAD_DIM / SUBK];
++    if constexpr (!SAVE_STATE)
++    {
++        if (t < v_chunk_dim)
++        {
++            const float* rs = final_state + head * (k_head_dim * v_head_dim) + v_start + t + bt * bts * v_head_dim;
++            for (int i = 0; i < bts; ++i)
++                thread_state[i] = rs[i * v_head_dim];
++        }
++    }
++
+     // Iterate over sequence dim
+     for (int s = 0; s < seqlen; ++s)
+     {
+@@ -504,7 +517,7 @@ void cuda_recurrent_gated_delta_rule_kernel
+ 
+         float* gl_rs_r;
+         float* gl_rs_w;
+-        if constexpr (save_history)
++        if constexpr (save_history && SAVE_STATE)
+         {
+             bool first = (s == 0);
+             bool last = (s == seqlen - 1);
+@@ -589,7 +602,10 @@ void cuda_recurrent_gated_delta_rule_kernel
+                 {
+                     #pragma unroll
+                     for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
+-                        sum = sum + *sh_k_rd * *rs_rd;
++                    {
++                        float state = SAVE_STATE ? *rs_rd : thread_state[i * 8 + j];
++                        sum = sum + *sh_k_rd * state;
++                    }
+                 }
+                 sh_dot1[bt][t] = sum;
+             }
+@@ -624,9 +640,12 @@ void cuda_recurrent_gated_delta_rule_kernel
+                 for (int j = 0; j < 8; ++j, rs_r += v_head_dim, rs_w += v_head_dim, sh_k_rd++, sh_q_rd++)
+                 {
+                     // State update step, k x v
+-                    float state = *rs_r;
++                    float state = SAVE_STATE ? *rs_r : thread_state[i * 8 + j];
+                     state = state * g_h + *sh_k_rd * v * beta_h;
+-                    *rs_w = state;
++                    if constexpr (SAVE_STATE)
++                        *rs_w = state;
++                    else
++                        thread_state[i * 8 + j] = state;
+ 
+                     // Accumulate attn output
+                     v_out = v_out + *sh_q_rd * state;
+@@ -657,28 +676,23 @@ void cuda_recurrent_gated_delta_rule_kernel
+     }
+ }
+ 
+-template <bool save_history, int V_SPLIT, bool CHANNELWISE = false>
+-__global__ __launch_bounds__(128 * SUBK)
+-void cuda_recurrent_gated_delta_rule_kernel_128
++// One (head, v-chunk) block of the 128x128 rule over a single batch row, with every pointer
++// already offset to that row (slot_state: the row's slot, plane 0 = committed state). Shared by
++// the batched kernel below and the accepted-input replay kernel. OUTPUT = false (replay) skips
++// only the core_attn_out readout; the state update arithmetic is identical either way
++template <bool save_history, int V_SPLIT, bool CHANNELWISE, bool SAVE_STATE, bool OUTPUT>
++__device__ __forceinline__
++void gated_delta_rule_128_row
+ (
+-                                                // k_head_dim = v_head_dim = 128
+-    const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, (k_dim + k_dim + v_dim)]
+-    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)], or
+-                                                // [bsz, seqlen, heads, 128] log-decay per
+-                                                // k-channel when CHANNELWISE (KDA)
+-    const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
+-    float* __restrict__ recurrent_state,        // [num_slots, max_history + 1, (group * num_k_heads), 128, 128]
+-    bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, 128]
+-    const int bsz,
++    const bfloat16* __restrict__ mixed_qkv,     // [seqlen, (k_dim + k_dim + v_dim)]
++    const float* __restrict__ g,                // [seqlen, (group * num_k_heads)] or [seqlen, heads, 128]
++    const bfloat16* __restrict__ beta,          // [seqlen, (group * num_k_heads)]
++    float* __restrict__ slot_state,             // [max_history + 1, (group * num_k_heads), 128, 128]
++    bfloat16* __restrict__ core_attn_out,       // [seqlen, num_v_heads, 128], unused if !OUTPUT
+     const int seqlen,
+     const int num_k_heads,
+     const int num_v_heads,
+-    const int k_head_dim,
+-    const int v_head_dim,
+-    const float scale,
+-    const int* __restrict__ slots,              // [bsz]
+-    const int history_stride,                   // max_history + 1
+-    const float* __restrict__ D                 // unused, matches the generic kernel signature
++    const float scale
+ )
+ {
+     constexpr int HEAD_DIM = 128;
+@@ -688,16 +702,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
+     int group = num_v_heads / num_k_heads;
+     constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+     const size_t state_size = group * num_k_heads * HEAD_STATE_SIZE;
+-    const size_t slot_size = (size_t) history_stride * state_size;
+-
+-    int bi = blockIdx.x;
+-    mixed_qkv +=        bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads));
+-    g +=                (size_t) bi * seqlen * (group * num_k_heads) * (CHANNELWISE ? HEAD_DIM : 1);
+-    beta +=             bi * seqlen * (group * num_k_heads);
+-    int state_slot = slots ? slots[bi] : bi;
+-    float* slot_state = recurrent_state + (size_t) state_slot * slot_size;
+     float* final_state = slot_state;
+-    core_attn_out +=    bi * seqlen * num_v_heads * HEAD_DIM;
+ 
+     int t = threadIdx.x;
+     int bt = threadIdx.y;
+@@ -716,16 +721,27 @@ void cuda_recurrent_gated_delta_rule_kernel_128
+     __shared__ float sh_dot2[SUBK][HEAD_DIM];
+     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
+ 
++    float thread_state[SAVE_STATE ? 1 : BTS];
++    if constexpr (!SAVE_STATE)
++    {
++        if (t < V_CHUNK_DIM)
++        {
++            const float* rs = final_state + head * HEAD_STATE_SIZE + v_start + t + bt * BTS * HEAD_DIM;
++            #pragma unroll
++            for (int i = 0; i < BTS; ++i)
++                thread_state[i] = rs[i * HEAD_DIM];
++        }
++    }
++
+     for (int s = 0; s < seqlen; ++s)
+     {
+         const bfloat16* gl_q = mixed_qkv + k_head * HEAD_DIM;
+         const bfloat16* gl_k = mixed_qkv + (num_k_heads + k_head) * HEAD_DIM;
+         const bfloat16* gl_v = mixed_qkv + (2 * num_k_heads * HEAD_DIM) + head * HEAD_DIM + v_start;
+-        bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
+ 
+         float* gl_rs_r;
+         float* gl_rs_w;
+-        if constexpr (save_history)
++        if constexpr (save_history && SAVE_STATE)
+         {
+             bool first = (s == 0);
+             bool last = (s == seqlen - 1);
+@@ -790,11 +806,12 @@ void cuda_recurrent_gated_delta_rule_kernel_128
+                 #pragma unroll
+                 for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
+                 {
++                    float state = SAVE_STATE ? *rs_rd : thread_state[i * 8 + j];
+                     if constexpr (CHANNELWISE)
+                         // Decay folded per k-channel: kv_mem reads the decayed state
+-                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
++                        sum = sum + *sh_k_rd * *sh_g_rd * state;
+                     else
+-                        sum = sum + *sh_k_rd * *rs_rd;
++                        sum = sum + *sh_k_rd * state;
+                 }
+             }
+             sh_dot1[bt][t] = sum;
+@@ -823,31 +840,85 @@ void cuda_recurrent_gated_delta_rule_kernel_128
+                 #pragma unroll
+                 for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
+                 {
+-                    float state = *rs_r;
++                    float state = SAVE_STATE ? *rs_r : thread_state[i * 8 + j];
+                     state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
+-                    *rs_w = state;
+-                    v_out = v_out + *sh_q_rd * state;
++                    if constexpr (SAVE_STATE)
++                        *rs_w = state;
++                    else
++                        thread_state[i * 8 + j] = state;
++                    if constexpr (OUTPUT)
++                        v_out = v_out + *sh_q_rd * state;
+                 }
+             }
+-            sh_dot2[bt][t] = v_out;
++            if constexpr (OUTPUT)
++                sh_dot2[bt][t] = v_out;
+         }
+         __syncthreads();
+ 
+-        if (t < V_CHUNK_DIM && bt == 0)
++        if constexpr (OUTPUT)
+         {
+-            float v_out = 0.0f;
+-            #pragma unroll
+-            for (int s = 0; s < SUBK; ++s) v_out += sh_dot2[s][t];
+-            out[t] = __float2bfloat16_rz(v_out * scale);
++            if (t < V_CHUNK_DIM && bt == 0)
++            {
++                bfloat16* out = core_attn_out + head * HEAD_DIM + v_start;
++                float v_out = 0.0f;
++                #pragma unroll
++                for (int s = 0; s < SUBK; ++s) v_out += sh_dot2[s][t];
++                out[t] = __float2bfloat16_rz(v_out * scale);
++            }
++            core_attn_out += num_v_heads * HEAD_DIM;
+         }
+ 
+         mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
+         g +=                num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);
+         beta +=             num_v_heads;
+-        core_attn_out +=    num_v_heads * HEAD_DIM;
+     }
+ }
+ 
++template <bool save_history, int V_SPLIT, bool CHANNELWISE = false, bool SAVE_STATE = true>
++__global__ __launch_bounds__(128 * SUBK)
++void cuda_recurrent_gated_delta_rule_kernel_128
++(
++                                                // k_head_dim = v_head_dim = 128
++    const bfloat16* __restrict__ mixed_qkv,     // [bsz, seqlen, (k_dim + k_dim + v_dim)]
++    const float* __restrict__ g,                // [bsz, seqlen, (group * num_k_heads)], or
++                                                // [bsz, seqlen, heads, 128] log-decay per
++                                                // k-channel when CHANNELWISE (KDA)
++    const bfloat16* __restrict__ beta,          // [bsz, seqlen, (group * num_k_heads)]
++    float* __restrict__ recurrent_state,        // [num_slots, max_history + 1, (group * num_k_heads), 128, 128]
++    bfloat16* __restrict__ core_attn_out,       // [bsz, seqlen, num_v_heads, 128]
++    const int bsz,
++    const int seqlen,
++    const int num_k_heads,
++    const int num_v_heads,
++    const int k_head_dim,
++    const int v_head_dim,
++    const float scale,
++    const int* __restrict__ slots,              // [bsz]
++    const int history_stride,                   // max_history + 1
++    const float* __restrict__ D                 // unused, matches the generic kernel signature
++)
++{
++    constexpr int HEAD_DIM = 128;
++    int group = num_v_heads / num_k_heads;
++    const size_t state_size = group * num_k_heads * (size_t) (HEAD_DIM * HEAD_DIM);
++    const size_t slot_size = (size_t) history_stride * state_size;
++
++    int bi = blockIdx.x;
++    int state_slot = slots ? slots[bi] : bi;
++    gated_delta_rule_128_row<save_history, V_SPLIT, CHANNELWISE, SAVE_STATE, true>
++    (
++        mixed_qkv +     bi * seqlen * (3 * HEAD_DIM * num_k_heads + HEAD_DIM * (num_v_heads - num_k_heads)),
++        g +             (size_t) bi * seqlen * (group * num_k_heads) * (CHANNELWISE ? HEAD_DIM : 1),
++        beta +          bi * seqlen * (group * num_k_heads),
++        recurrent_state + (size_t) state_slot * slot_size,
++        core_attn_out + bi * seqlen * num_v_heads * HEAD_DIM,
++        seqlen,
++        num_k_heads,
++        num_v_heads,
++        scale
++    );
++}
++
+ void cuda_recurrent_gated_delta_rule_gr
+ (
+     const at::Tensor& mixed_qkv,
+@@ -861,7 +932,8 @@ void cuda_recurrent_gated_delta_rule_gr
+     int v_head_dim,
+     const c10::optional<at::Tensor>& slots,
+     bool history,
+-    Graph* graph
++    Graph* graph,
++    bool save_state
+ )
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
+@@ -896,7 +968,7 @@ void cuda_recurrent_gated_delta_rule_gr
+                 "beta must be [bsz, seqlen, num_v_heads]");
+     TORCH_CHECK(recurrent_state.dim() == 5 &&
+                 recurrent_state.size(0) >= (slots.has_value() ? 1 : bsz) &&
+-                recurrent_state.size(1) >= (history ? seqlen : 1) &&
++                recurrent_state.size(1) >= (history && save_state ? seqlen : 1) &&
+                 recurrent_state.size(2) == num_v_heads &&
+                 recurrent_state.size(3) == k_head_dim &&
+                 recurrent_state.size(4) == v_head_dim,
+@@ -963,7 +1035,29 @@ void cuda_recurrent_gated_delta_rule_gr
+         }                                                                                 \
+     }
+ 
+-    if (channelwise)
++    if (!save_state)
++    {
++        // Verification never reads/writes history, even when the caller requests history.
++        if (channelwise)
++        {
++            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, true, false>)
++            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, true, false>)
++        }
++        else if (k_head_dim == 128 && v_head_dim == 128)
++        {
++            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 4, false, false>)
++            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel_128<false, 1, false, false>)
++        }
++        else if (threads.x <= 128)
++        {
++            if (v_split == 4) LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 4, false, false>)
++            else              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<128, false, 1, false, false>)
++        }
++        else if (threads.x <= 256)
++                              LAUNCH_RULE(cuda_recurrent_gated_delta_rule_kernel<256, false, 1, false, false>)
++        else TORCH_CHECK(false, "Max head dim exceeded");
++    }
++    else if (channelwise)
+     {
+         if (!history)
+         {
+@@ -1026,12 +1120,13 @@ void cuda_recurrent_gated_delta_rule
+     int k_head_dim,
+     int v_head_dim,
+     const c10::optional<at::Tensor>& slots,
+-    bool history
++    bool history,
++    bool save_state
+ )
+ {
+     cuda_recurrent_gated_delta_rule_gr(
+         mixed_qkv, g, beta, recurrent_state, core_attn_out,
+-        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
++        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr, save_state);
+ }
+ 
+ // Mamba2 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float, row
+@@ -1316,8 +1411,10 @@ void cuda_recurrent_mamba2
+ // concatenation of conv_state[slot,d,0:K] and x[b,d,0:seqlen]. Without history, the last K
+ // inputs are written back to conv_state[slot,d,0:K]; with history, the last
+ // min(state_size, K+seqlen) inputs are written to the tail of the state buffer (rewindable).
++// SAVE_STATE = false (accepted-input replay verification) reads the committed window and writes
++// nothing back; the accepted prefix is committed later by batched_gdn_replay.
+ 
+-template <bool ACT, bool HISTORY>
++template <bool ACT, bool HISTORY, bool SAVE_STATE = true>
+ __global__ __launch_bounds__(CONV1D_NUM_THREADS)
+ void conv1d_update_kernel
+ (
+@@ -1377,7 +1474,9 @@ void conv1d_update_kernel
+             if (k < K - 1) win[k] = win[k + 1];
+     }
+ 
+-    if constexpr (!HISTORY)
++    if constexpr (!SAVE_STATE)
++        return;
++    else if constexpr (!HISTORY)
+     {
+         #pragma unroll
+         for (int k = 0; k < CONV1D_MAX_K; ++k)
+@@ -1415,12 +1514,14 @@ void cuda_causal_conv1d_update_gr
+     at::Tensor& out,
+     bool activation,
+     bool history,
+-    Graph* graph
++    Graph* graph,
++    bool save_state
+ )
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(x.device());
+     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+     TORCH_CHECK(!graph || slots.has_value(), "cuda_causal_conv1d_update: graph capture requires slots");
++    TORCH_CHECK(save_state || !history, "cuda_causal_conv1d_update: history requires save_state");
+ 
+     int bsz = x.size(0);
+     int dim = x.size(1);
+@@ -1479,7 +1580,12 @@ void cuda_causal_conv1d_update_gr
+         }                                                                                 \
+     }
+ 
+-    if (activation)
++    if (!save_state)
++    {
++        if (activation) LAUNCH_CONV(conv1d_update_kernel<true, false, false>)
++        else            LAUNCH_CONV(conv1d_update_kernel<false, false, false>)
++    }
++    else if (activation)
+     {
+         if (history) LAUNCH_CONV(conv1d_update_kernel<true, true>)
+         else         LAUNCH_CONV(conv1d_update_kernel<true, false>)
+@@ -1504,10 +1610,11 @@ void cuda_causal_conv1d_update
+     const c10::optional<at::Tensor>& bias,
+     at::Tensor& out,
+     bool activation,
+-    bool history
++    bool history,
++    bool save_state
+ )
+ {
+-    cuda_causal_conv1d_update_gr(x, conv_state, slots, weight, bias, out, activation, history, nullptr);
++    cuda_causal_conv1d_update_gr(x, conv_state, slots, weight, bias, out, activation, history, nullptr, save_state);
+ }
+ 
+ // Split-projection (Qwen3.5) decode helper. Replaces the qkv transpose/cast done in Torch plus
+@@ -2008,3 +2115,138 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
+         cuda_check(cudaPeekAtLastError());
+     }
+ }
++
++// Accepted-input replay commit (EXL3_GDN_REPLAY): after a noncommitting verify, advance each
++// layer's committed recurrent state and conv window over the accepted prefix of the recorded
++// inputs. One launch of each kernel covers every layer of a rewind, instead of a recurrent scan
++// plus a conv update per layer.
++
++#define REPLAY_MAX_JOBS 64
++
++struct GDNReplayStateJob { float* state; const bfloat16* qkv; const float* g; const bfloat16* beta; };
++struct GDNReplayConvJob { bfloat16* conv_state; const bfloat16* conv_input; };
++struct GDNReplayStateBatch { GDNReplayStateJob jobs[REPLAY_MAX_JOBS]; };
++struct GDNReplayConvBatch { GDNReplayConvJob jobs[REPLAY_MAX_JOBS]; };
++
++// Same per-row scan as the verify kernel's committing variant without history (and the eager
++// replay), over the first `accepted` recorded tokens. Grid: (job, v_head, v_chunk)
++template <int V_SPLIT, bool CHANNELWISE>
++__global__ __launch_bounds__(128 * SUBK)
++void gdn_replay_state_kernel_128
++(
++    GDNReplayStateBatch batch,
++    const int accepted,
++    const int num_k_heads,
++    const int num_v_heads
++)
++{
++    GDNReplayStateJob j = batch.jobs[blockIdx.x];
++    gated_delta_rule_128_row<false, V_SPLIT, CHANNELWISE, true, false>
++    (
++        j.qkv, j.g, j.beta, j.state, nullptr,
++        accepted, num_k_heads, num_v_heads, 0.0f
++    );
++}
++
++// conv_state[slot, d, 0:K] <- last K of concat(conv_state[slot, d, 0:K], x[d, 0:accepted]), i.e.
++// conv1d_update_kernel's write-back with seqlen = accepted. x is the recorded channel-major
++// conv input with `seqlen` columns. Pure bf16 copies, read into registers before any write
++__global__ __launch_bounds__(REWIND_CONV_THREADS)
++void gdn_replay_conv_kernel
++(
++    GDNReplayConvBatch batch,
++    const int accepted,
++    const int seqlen,
++    const int dim,
++    const int K,
++    const int state_stride
++)
++{
++    GDNReplayConvJob j = batch.jobs[blockIdx.y];
++    int d = blockIdx.x * REWIND_CONV_THREADS + threadIdx.x;
++    if (d >= dim) return;
++
++    const bfloat16* x_d = j.conv_input + (size_t) d * seqlen;
++    bfloat16* state_d = j.conv_state + (size_t) d * state_stride;
++
++    bfloat16 old_state[CONV1D_MAX_K];
++    #pragma unroll
++    for (int k = 0; k < CONV1D_MAX_K; ++k)
++        if (k < K) old_state[k] = state_d[k];
++    #pragma unroll
++    for (int k = 0; k < CONV1D_MAX_K; ++k)
++    {
++        if (k < K)
++        {
++            int src_t = accepted + k;
++            state_d[k] = (src_t < K) ? old_state[src_t] : x_d[src_t - K];
++        }
++    }
++}
++
++void batched_gdn_replay
++(
++    std::vector<GDNReplayJob> const& jobs,
++    int device_index,
++    int accepted,
++    int seqlen,
++    int num_k_heads,
++    int num_v_heads,
++    int k_head_dim,
++    int v_head_dim,
++    int conv_dim,
++    int conv_k,
++    int conv_stride,
++    bool channelwise
++)
++{
++    // Every check precedes the first launch: a failed call submits nothing
++    TORCH_CHECK(0 <= accepted && accepted <= seqlen, "batched_gdn_replay: accepted must be in [0, seqlen]");
++    if (jobs.empty() || accepted == 0) return;
++    TORCH_CHECK(num_k_heads > 0 && num_v_heads > 0, "batched_gdn_replay: head counts must be positive");
++    TORCH_CHECK(num_v_heads % num_k_heads == 0, "batched_gdn_replay: num_v_heads must be divisible by num_k_heads");
++    TORCH_CHECK(k_head_dim == 128 && v_head_dim == 128, "batched_gdn_replay: requires 128x128 head dims");
++    TORCH_CHECK(conv_dim > 0 && 0 < conv_k && conv_k <= CONV1D_MAX_K && conv_k <= conv_stride,
++                "batched_gdn_replay: bad conv geometry");
++    c10::cuda::CUDAGuard device_guard((c10::DeviceIndex) device_index);
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
++
++    // Matches the eager replay's single-row launch (v_split depends only on geometry there)
++    int v_split = num_v_heads <= 64 ? 4 : 1;
++    dim3 threads(128, SUBK);
++
++    for (size_t base = 0; base < jobs.size(); base += REPLAY_MAX_JOBS)
++    {
++        int n = (int) MIN(jobs.size() - base, (size_t) REPLAY_MAX_JOBS);
++        GDNReplayStateBatch state_batch;
++        GDNReplayConvBatch conv_batch;
++        for (int i = 0; i < n; ++i)
++        {
++            GDNReplayJob const& j = jobs[base + i];
++            state_batch.jobs[i] = { (float*) j.recurrent_state, (const bfloat16*) j.conv_out,
++                                    (const float*) j.g, (const bfloat16*) j.beta };
++            conv_batch.jobs[i] = { (bfloat16*) j.conv_state, (const bfloat16*) j.conv_input };
++        }
++
++        dim3 blocks(n, num_v_heads, v_split);
++        #define LAUNCH_REPLAY(...) \
++            __VA_ARGS__<<<blocks, threads, 0, stream>>>(state_batch, accepted, num_k_heads, num_v_heads);
++        if (channelwise)
++        {
++            if (v_split == 4) LAUNCH_REPLAY(gdn_replay_state_kernel_128<4, true>)
++            else              LAUNCH_REPLAY(gdn_replay_state_kernel_128<1, true>)
++        }
++        else
++        {
++            if (v_split == 4) LAUNCH_REPLAY(gdn_replay_state_kernel_128<4, false>)
++            else              LAUNCH_REPLAY(gdn_replay_state_kernel_128<1, false>)
++        }
++        #undef LAUNCH_REPLAY
++        cuda_check(cudaPeekAtLastError());
++
++        dim3 conv_blocks(CEIL_DIVIDE(conv_dim, REWIND_CONV_THREADS), n);
++        gdn_replay_conv_kernel<<<conv_blocks, REWIND_CONV_THREADS, 0, stream>>>
++            (conv_batch, accepted, seqlen, conv_dim, conv_k, conv_stride);
++        cuda_check(cudaPeekAtLastError());
++    }
++}
+diff --git a/exllamav3/exllamav3_ext/gdn.cuh b/exllamav3/exllamav3_ext/gdn.cuh
+index e341d77..d638d90 100644
+--- a/exllamav3/exllamav3_ext/gdn.cuh
++++ b/exllamav3/exllamav3_ext/gdn.cuh
+@@ -33,6 +33,7 @@ void gated_delta_net_fused_op_2
+     const float beta_scale
+ );
+ 
++// save_state=false reads committed state and produces outputs without changing state or history.
+ void cuda_recurrent_gated_delta_rule
+ (
+     const at::Tensor& mixed_qkv,
+@@ -45,7 +46,8 @@ void cuda_recurrent_gated_delta_rule
+     int k_head_dim,
+     int v_head_dim,
+     const c10::optional<at::Tensor>& slots,
+-    bool history
++    bool history,
++    bool save_state = true
+ );
+ 
+ void cuda_recurrent_gated_delta_rule_gr
+@@ -61,7 +63,8 @@ void cuda_recurrent_gated_delta_rule_gr
+     int v_head_dim,
+     const c10::optional<at::Tensor>& slots,
+     bool history,
+-    Graph* graph
++    Graph* graph,
++    bool save_state = true
+ );
+ 
+ // Mamba2 discretization: dt = clamp(softplus(dt_raw + dt_bias), dt_min, dt_max), g = -exp(a_log) * dt
+@@ -129,6 +132,7 @@ void cuda_recurrent_mamba2_gr
+     Graph* graph
+ );
+ 
++// save_state=false reads the committed window and leaves conv_state unchanged (requires !history)
+ void cuda_causal_conv1d_update
+ (
+     const at::Tensor& x,
+@@ -138,7 +142,8 @@ void cuda_causal_conv1d_update
+     const c10::optional<at::Tensor>& bias,
+     at::Tensor& out,
+     bool activation,
+-    bool history
++    bool history,
++    bool save_state = true
+ );
+ 
+ void cuda_causal_conv1d_update_gr
+@@ -151,7 +156,8 @@ void cuda_causal_conv1d_update_gr
+     at::Tensor& out,
+     bool activation,
+     bool history,
+-    Graph* graph
++    Graph* graph,
++    bool save_state = true
+ );
+ 
+ // Split-projection (Qwen3.5) helper: cast/transpose qkv to bf16 mixed_qkv and compute beta/g from
+@@ -248,3 +254,42 @@ struct StateRewindJob
+ 
+ void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
+ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
++
++// Accepted-input replay commit for one state slot of one layer (EXL3_GDN_REPLAY). Addresses are
++// row/slot bases: recurrent_state = the slot's committed plane (float [Nv, 128, 128]), conv_state =
++// the slot's window (bf16 [F, conv_stride]); the recorded verify row holds conv_input (bf16
++// [F, seqlen], channel-major), conv_out (bf16 [seqlen, F]), beta (bf16 [seqlen, Nv]) and g (float
++// [seqlen, Nv], or [seqlen, Nv, 128] channelwise)
++struct GDNReplayJob
++{
++    uintptr_t recurrent_state;
++    uintptr_t conv_state;
++    uintptr_t conv_input;
++    uintptr_t conv_out;
++    uintptr_t beta;
++    uintptr_t g;
++
++    GDNReplayJob() = default;
++    GDNReplayJob(uintptr_t _recurrent_state, uintptr_t _conv_state, uintptr_t _conv_input,
++                 uintptr_t _conv_out, uintptr_t _beta, uintptr_t _g) :
++        recurrent_state(_recurrent_state), conv_state(_conv_state), conv_input(_conv_input),
++        conv_out(_conv_out), beta(_beta), g(_g) {}
++};
++
++// Commit the first `accepted` recorded tokens of every job: one recurrent-scan launch and one
++// conv-window launch per 64 jobs. All jobs share the geometry and record length `seqlen`
++void batched_gdn_replay
++(
++    std::vector<GDNReplayJob> const& jobs,
++    int device_index,
++    int accepted,
++    int seqlen,
++    int num_k_heads,
++    int num_v_heads,
++    int k_head_dim,
++    int v_head_dim,
++    int conv_dim,
++    int conv_k,
++    int conv_stride,
++    bool channelwise
++);
+diff --git a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.cpp b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.cpp
+index 88c49b1..22d09aa 100644
+--- a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.cpp
+@@ -62,11 +62,12 @@ void BC_GatedDeltaNet::run_bsz1_b
+     o_proj->run(core_attn_out_f, y);
+ }
+ 
+-bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history)
++bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history, bool replay)
+ {
+     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= seqlen && seqlen <= MAX_QLEN,
+                 "BC_GatedDeltaNetSplit: shape out of range");
+-    return !slot(bsz, seqlen, history).configured;
++    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
++    return !slot(bsz, seqlen, history, replay).configured;
+ }
+ 
+ void BC_GatedDeltaNetSplit::configure_slot
+@@ -85,10 +86,12 @@ void BC_GatedDeltaNetSplit::configure_slot
+     at::Tensor core_attn_out_f,
+     at::Tensor qkv_xh,
+     at::Tensor z_xh,
+-    at::Tensor o_xh
++    at::Tensor o_xh,
++    bool replay
+ )
+ {
+-    Slot& s = slot(bsz, seqlen, history);
++    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
++    Slot& s = slot(bsz, seqlen, history, replay);
+ 
+     s.qkv             = std::move(qkv);
+     s.z               = std::move(z);
+@@ -149,10 +152,12 @@ void BC_GatedDeltaNetSplit::configure_slot_kda
+     at::Tensor core_attn_out,
+     at::Tensor core_attn_out_f,
+     at::Tensor qkv_xh,
+-    at::Tensor o_xh
++    at::Tensor o_xh,
++    bool replay
+ )
+ {
+-    Slot& s = slot(bsz, seqlen, history);
++    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
++    Slot& s = slot(bsz, seqlen, history, replay);
+ 
+     s.qkv             = std::move(qkv);
+     s.z               = std::move(z);
+@@ -221,6 +226,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
+     at::Tensor& recurrent_state,
+     const at::Tensor& slots,
+     bool history,
++    bool replay,
+     Slot& s,
+     Graph* graph
+ )
+@@ -287,6 +293,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
+         );
+     }
+ 
++    // Replay verify: both read the committed conv window / state and write neither (save_state =
++    // false), leaving s.mixed_qkv, s.conv_out, s.beta and s.g as the record to commit on rewind
+     cuda_causal_conv1d_update_gr
+     (
+         s.mixed_qkv,
+@@ -297,7 +305,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
+         s.conv_out,
+         true,
+         history,
+-        graph
++        graph,
++        !replay
+     );
+ 
+     cuda_recurrent_gated_delta_rule_gr
+@@ -313,7 +322,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
+         v_head_dim,
+         slots,
+         history,
+-        graph
++        graph,
++        !replay
+     );
+ 
+     norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
+@@ -330,7 +340,8 @@ void BC_GatedDeltaNetSplit::run_bszN
+     at::Tensor& conv_state,
+     at::Tensor& recurrent_state,
+     const at::Tensor& slots,
+-    bool history
++    bool history,
++    bool replay
+ )
+ {
+     py::gil_scoped_release release;
+@@ -341,12 +352,13 @@ void BC_GatedDeltaNetSplit::run_bszN
+     int seqlen = (int) x.size(1);
+     TORCH_CHECK(bsz >= 1 && bsz <= MAX_BSZ && seqlen >= 1 && seqlen <= MAX_QLEN,
+                 "BC_GatedDeltaNetSplit::run_bszN: shape out of range");
+-    Slot& s = slot(bsz, seqlen, history);
++    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit::run_bszN: replay verify never writes history");
++    Slot& s = slot(bsz, seqlen, history, replay);
+     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
+ 
+     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+     {
+-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
++        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, nullptr);
+         s.graph->ready_to_record = true;
+         s.graph_state_size = (int) conv_state.size(2);
+         s.graph_hist_stride = (int) recurrent_state.size(1);
+@@ -359,14 +371,14 @@ void BC_GatedDeltaNetSplit::run_bszN
+     if ((int) conv_state.size(2) != s.graph_state_size ||
+         (int) recurrent_state.size(1) != s.graph_hist_stride)
+     {
+-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
++        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, nullptr);
+         return;
+     }
+ 
+     if (!s.graph->ready)
+     {
+         s.graph->capture_begin();
+-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
++        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, s.graph.get());
+         s.graph->capture_end();
+     }
+ 
+@@ -414,6 +426,7 @@ void BC_GatedDeltaNetSplit::run_bszN
+         args.emplace_back(GP_add_z, (void*) y.data_ptr());
+     }
+     s.graph->launch(args, stream);
++    if (replay) replay_graph_launches++;
+ }
+ 
+ bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history)
+diff --git a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
+index cb5d991..97f66a3 100644
+--- a/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
++++ b/exllamav3/exllamav3_ext/libtorch/gated_delta_net.h
+@@ -105,6 +105,11 @@ struct BC_GatedDeltaNet
+ // Split-projection GDN, generalized over (bsz, seqlen) up to MAX_BSZ x MAX_QLEN and over
+ // save_history (captured graph is tied to a specific history-branch kernel). Each (bsz, seqlen)
+ // shape gets its own lazily-configured Slot with exact-size scratch statics
++//
++// replay = true is the accepted-input replay verify (EXL3_GDN_REPLAY): conv and recurrent scan
++// read the committed state without writing it, and the slot's mixed_qkv / conv_out / beta / g
++// statics double as the verification record (python makes them per-layer for these slots), which
++// batched_gdn_replay later commits up to the accepted length. Its own slot set, never history
+ struct BC_GatedDeltaNetSplit
+ {
+     static constexpr int MAX_BSZ = 8;
+@@ -192,6 +197,8 @@ struct BC_GatedDeltaNetSplit
+     };
+     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
+     std::vector<Slot> slots_hist;   // history == true
++    std::vector<Slot> slots_replay; // replay == true (noncommitting verify)
++    long replay_graph_launches = 0; // captured-graph launches of replay slots (tests)
+ 
+ 
+     BC_GatedDeltaNetSplit
+@@ -230,11 +237,12 @@ struct BC_GatedDeltaNetSplit
+     {
+         slots.resize(MAX_BSZ * MAX_QLEN);
+         slots_hist.resize(MAX_BSZ * MAX_QLEN);
++        slots_replay.resize(MAX_BSZ * MAX_QLEN);
+     }
+ 
+-    Slot& slot(int bsz, int seqlen, bool history)
++    Slot& slot(int bsz, int seqlen, bool history, bool replay = false)
+     {
+-        std::vector<Slot>& v = history ? slots_hist : slots;
++        std::vector<Slot>& v = replay ? slots_replay : history ? slots_hist : slots;
+         return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
+     }
+ 
+@@ -283,9 +291,10 @@ struct BC_GatedDeltaNetSplit
+     {
+         slots.resize(MAX_BSZ * MAX_QLEN);
+         slots_hist.resize(MAX_BSZ * MAX_QLEN);
++        slots_replay.resize(MAX_BSZ * MAX_QLEN);
+     }
+ 
+-    bool needs_configure(int bsz, int seqlen, bool history);
++    bool needs_configure(int bsz, int seqlen, bool history, bool replay = false);
+ 
+     void configure_slot_kda
+     (
+@@ -305,7 +314,8 @@ struct BC_GatedDeltaNetSplit
+         at::Tensor core_attn_out,
+         at::Tensor core_attn_out_f,
+         at::Tensor qkv_xh,
+-        at::Tensor o_xh
++        at::Tensor o_xh,
++        bool replay = false
+     );
+ 
+     void configure_slot
+@@ -324,7 +334,8 @@ struct BC_GatedDeltaNetSplit
+         at::Tensor core_attn_out_f,
+         at::Tensor qkv_xh,
+         at::Tensor z_xh,
+-        at::Tensor o_xh
++        at::Tensor o_xh,
++        bool replay = false
+     );
+ 
+     void run_bszN_gr
+@@ -335,6 +346,7 @@ struct BC_GatedDeltaNetSplit
+         at::Tensor& recurrent_state,
+         const at::Tensor& slots,
+         bool history,
++        bool replay,
+         Slot& s,
+         Graph* graph
+     );
+@@ -346,7 +358,8 @@ struct BC_GatedDeltaNetSplit
+         at::Tensor& conv_state,
+         at::Tensor& recurrent_state,
+         const at::Tensor& slots,
+-        bool history
++        bool history,
++        bool replay = false
+     );
+ };
+ 
+diff --git a/exllamav3/exllamav3_ext/libtorch/gated_delta_net_bc.h b/exllamav3/exllamav3_ext/libtorch/gated_delta_net_bc.h
+index 2041610..2e7fdf6 100644
+--- a/exllamav3/exllamav3_ext/libtorch/gated_delta_net_bc.h
++++ b/exllamav3/exllamav3_ext/libtorch/gated_delta_net_bc.h
+@@ -127,7 +127,13 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
+     py::arg("norm"),
+     py::arg("beta_scale")
+ )
+-.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure)
++.def_readonly("replay_graph_launches", &BC_GatedDeltaNetSplit::replay_graph_launches)
++.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure,
++    py::arg("bsz"),
++    py::arg("seqlen"),
++    py::arg("history"),
++    py::arg("replay") = false
++)
+ .def("configure_slot_kda", &BC_GatedDeltaNetSplit::configure_slot_kda,
+     py::arg("bsz"),
+     py::arg("seqlen"),
+@@ -145,7 +151,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
+     py::arg("core_attn_out"),
+     py::arg("core_attn_out_f"),
+     py::arg("qkv_xh"),
+-    py::arg("o_xh")
++    py::arg("o_xh"),
++    py::arg("replay") = false
+ )
+ .def("configure_slot", &BC_GatedDeltaNetSplit::configure_slot,
+     py::arg("bsz"),
+@@ -162,9 +169,18 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
+     py::arg("core_attn_out_f"),
+     py::arg("qkv_xh"),
+     py::arg("z_xh"),
+-    py::arg("o_xh")
++    py::arg("o_xh"),
++    py::arg("replay") = false
++)
++.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN,
++    py::arg("x"),
++    py::arg("y"),
++    py::arg("conv_state"),
++    py::arg("recurrent_state"),
++    py::arg("slots"),
++    py::arg("history"),
++    py::arg("replay") = false
+ )
+-.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN)
+ .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
+     py::arg("ptrs_trellis"),
+     py::arg("ptrs_suh"),
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index f6e669c..a0f8544 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -1267,9 +1267,12 @@ class Generator:
+                             job.prepare_logit_mask()
+                             job.prepare_sampling_past_ids()
+ 
+-                # Make sure outgoing state is valid if entire draft was accepted
++                # Full acceptance also commits pending GDN replay. Completed rows need no
++                # commit: release_state discards their unresolved verification inputs.
+                 if batch_states and draft_tokens is not None and rejected == 0:
+-                    batch_states[j].rewind(0)
++                    state = batch_states[j]
++                    if not (eos and not rq and getattr(state, "replay_enabled", False)):
++                        state.rewind(0)
+ 
+                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
+                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
+diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
+index f61698a..e2e5df2 100644
+--- a/exllamav3/modules/gated_delta_net.py
++++ b/exllamav3/modules/gated_delta_net.py
+@@ -12,14 +12,21 @@ from ..cache import Cache
+ from ..util.tensor import g_tensor_cache
+ from .multilinear import SlicedMultiLinear
+ import os
++import weakref
+ 
+ # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
+ # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
+ # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
+ # the cooperative GEMM)
+ _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
++# Accepted-input replay keeps only the committed state and the small verification inputs.
++_gdn_replay_enable = os.environ.get("EXL3_GDN_REPLAY", "0") == "1"
+ # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
+ _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
++# Replay verification also runs in the BC graph: noncommitting conv and scan, with the record kept
++# in per-layer statics and committed for all layers by one batched call per rewind (GDNReplayBuffers).
++# EXL3_BC_GDN_REPLAY=0 sends replay verification back to the eager path, for A/B testing
++_bc_replay_enable = os.environ.get("EXL3_BC_GDN_REPLAY", "1") != "0"
+ # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
+ # EXL3_GDN_PROJ_FP32=1 restores fp32
+ _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
+@@ -48,10 +55,21 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+     launching them all under one device index dereferences foreign pointers (illegal memory
+     access on any multi-GPU split). Only GDNLayerState instances (GDN and Mamba2 alike) are
+     batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
+-    falls back to its own .rewind() call, unchanged."""
++    falls back to its own .rewind() call, unchanged. Replay-enabled GDN layers instead
++    contribute to the second return value, a replay plan (slot, eager layers, batched job
++    groups by device and geometry), validated here for every layer before anything runs."""
+     jobs_by_device = {}
++    accepted = last_history + 1 - num_tokens
++    replay_eager = []
++    replay_groups = {}
+     for l in layers:
+-        if isinstance(l, GDNLayerState):
++        if isinstance(l, GDNLayerState) and l.replay_enabled:
++            plan = l.prepare_replay(slot, accepted)
++            if plan == "eager":
++                replay_eager.append((l, accepted))
++            elif plan is not None:
++                replay_groups.setdefault(plan[0], []).append((l, plan[1]))
++        elif isinstance(l, GDNLayerState):
+             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
+             # torch.device, so normalize rather than assume a .index attribute
+             device_index = torch.device(l.device).index
+@@ -64,15 +82,35 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+                 state_jobs.append(sj)
+         else:
+             l.rewind(slot, last_history, num_tokens)
+-    return jobs_by_device
++    return jobs_by_device, (slot, replay_eager, replay_groups)
+ 
+ 
+-def _dispatch_rewind_jobs(jobs_by_device):
++def _dispatch_rewind_jobs(jobs):
++    jobs_by_device, replay_plan = jobs
+     for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
+         if conv_jobs:
+             ext.batched_conv_rewind(conv_jobs, device_index)
+         if state_jobs:
+             ext.batched_state_rewind(state_jobs, device_index)
++    _dispatch_replay(*replay_plan)
++
++
++def _dispatch_replay(slot: int, replay_eager: list, replay_groups: dict):
++    """Commit a validated replay plan. Each record is released only once its commit has been
++    submitted; a commit that raises marks its records failed (GDNLayerState.fail_replay), since
++    part of it may already have run and a retry would advance the state twice"""
++    for l, accepted in replay_eager:
++        l.commit_replay_eager(slot, accepted)
++    # Key: (GDNLayerState.replay_key, accepted, record seqlen), see GDNLayerState.prepare_replay
++    for ((device_index, *geometry), accepted, seqlen), entries in replay_groups.items():
++        try:
++            ext.batched_gdn_replay([job for _, job in entries], device_index, accepted, seqlen, *geometry)
++        except BaseException:
++            for l, _ in entries:
++                l.fail_replay(slot)
++            raise
++        for l, _ in entries:
++            l._pop_replay(slot)
+ 
+ 
+ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
+@@ -81,8 +119,103 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
+     _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
+ 
+ 
++def mp_cache_recurrent_discard_replay(local_context: dict, cache_id: int, slot: int | None):
++    for module in local_context["recurrent_modules"]:
++        layer = module.tp_recurrent_lookup[cache_id]
++        discard = getattr(layer, "discard_replay", None)
++        if discard is not None:
++            discard(slot)
++
++
++class GDNReplayBuffers:
++    """Statics of one BC replay-verify graph slot (bsz, seqlen): conv input, post-conv qkv, beta
++    and g, viewing the start of a GDNReplayStorage bucket at fixed addresses (baked into the
++    graph). Row i of the slot's last verify is the replay record (buffers, i) of the batch's
++    i-th state until it is committed, discarded or evicted"""
++
++    def __init__(self, storage: GDNReplayStorage, tensors: tuple):
++        self.storage = storage
++        self.tensors = tensors
++        self.seqlen = tensors[1].shape[1]
++        # Row addresses are integer arithmetic on the base pointers, like the rewind jobs
++        self.ptrs = [t.data_ptr() for t in tensors]
++        self.row_bytes = [t.stride(0) * t.element_size() for t in tensors]
++
++    def row_ptrs(self, row: int):
++        return [p + row * b for p, b in zip(self.ptrs, self.row_bytes)]
++
++    def eager_record(self, row: int):
++        # Private copy in the eager record layout (channel-major bf16 conv input)
++        conv_input, conv_out, beta, g = (t[row:row + 1].clone() for t in self.tensors)
++        return conv_input, conv_out, beta, g, False
++
++
++class GDNReplayStorage:
++    """Per-layer recording storage behind all BC replay-verify slots of a GatedDeltaNet. Slots view
++    the start of a capacity bucket of a power-of-two number of token rows. A bucket is never
++    reallocated, so captured graphs and cached replay jobs stay valid; a larger shape adds a new
++    bucket for itself, and all buckets together stay under twice the largest.
++
++    Slots alias, so `claims` holds every unresolved record in this storage, from any cache.
++    evict() runs before each replay verify and copies those records into private eager records
++    (normally there are none). A cache abandoned with records pending, or one interleaved with
++    another cache, therefore costs one copy instead of blocking the graph path."""
++
++    def __init__(self, module: GatedDeltaNet):
++        self.module = module
++        self.bucket = None      # (rows, conv_input, conv_out, beta, g), flat
++        self.claims = {}        # (id(layer_state), slot) -> (weakref(layer_state), slot, record)
++        self.evictions = 0
++
++    def buffers(self, bsz: int, seqlen: int):
++        m = self.module
++        rows = bsz * seqlen
++        f, nv = m.fdim_qkv, m.num_v_heads
++        g_inner = (nv, m.k_head_dim) if m.kda else (nv,)
++        g_row = nv * (m.k_head_dim if m.kda else 1)
++        if self.bucket is None or self.bucket[0] < rows:
++            cap = 1 << (rows - 1).bit_length()
++            self.bucket = (
++                cap,
++                torch.empty((cap * f,), dtype = torch.bfloat16, device = m.device),
++                torch.empty((cap * f,), dtype = torch.bfloat16, device = m.device),
++                torch.empty((cap * nv,), dtype = torch.bfloat16, device = m.device),
++                torch.empty((cap * g_row,), dtype = torch.float, device = m.device),
++            )
++        _, conv_input, conv_out, beta, g = self.bucket
++        return GDNReplayBuffers(self, (
++            conv_input[:rows * f].view(bsz, f, seqlen),
++            conv_out[:rows * f].view(bsz, seqlen, f),
++            beta[:rows * nv].view(bsz, seqlen, nv),
++            g[:rows * g_row].view(bsz, seqlen, *g_inner),
++        ))
++
++    def claim(self, layer_state: GDNLayerState, slot: int, record: tuple):
++        self.claims[(id(layer_state), slot)] = (weakref.ref(layer_state), slot, record)
++
++    def release(self, layer_state: GDNLayerState, slot: int):
++        self.claims.pop((id(layer_state), slot), None)
++
++    def evict(self):
++        # Stream-ordered: the copies are queued before the verify that overwrites the storage
++        for ref, slot, record in list(self.claims.values()):
++            state = ref()
++            if state is not None and state.pending_replay.get(slot) is record:
++                state.pending_replay[slot] = record[0].eager_record(record[1])
++                self.evictions += 1
++        self.claims.clear()
++
++
++# Pending-replay marker for a commit that raised partway, see GDNLayerState.fail_replay
++_REPLAY_FAILED = "failed"
++
++
+ class GDNState:
+ 
++    @property
++    def replay_enabled(self):
++        return _gdn_replay_enable
++
+     def __init__(
+         self,
+         cache: Cache,
+@@ -124,6 +257,8 @@ class GDNState:
+ 
+ 
+     def rewind(self, num_tokens: int):
++        # Metadata advanced over every verify row. Replay commits M - num_tokens inputs,
++        # including the seed row, before the rejected suffix is removed from the position.
+         if not self.cache.model.loaded_tp:
+             _dispatch_rewind_jobs(_collect_rewind_jobs(
+                 self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
+@@ -192,13 +327,21 @@ class GDNLayerState:
+         cache_id: int,
+     ):
+         self.module = module
++        # Mamba2 shares this state class but still uses its original history implementation.
++        self.replay_enabled = _gdn_replay_enable and isinstance(module, GatedDeltaNet)
++        history_slots = 0 if self.replay_enabled else max_history
++        # slot -> eager record (conv_input, mixed_qkv, beta, g, token_major), BC record
++        # (GDNReplayBuffers, row) or _REPLAY_FAILED. Remove entries only through _pop_replay
++        self.pending_replay = {}
++        self.replay_key = None
++        self.replay_job_cache = {}
+         self.conv_state = torch.empty(
+-            (max_batch_size, module.fdim_qkv, module.conv_kernel_size + max_history),
++            (max_batch_size, module.fdim_qkv, module.conv_kernel_size + history_slots),
+             dtype = torch.bfloat16,
+             device = "meta"
+         )
+         self.recurrent_state = torch.empty(
+-            (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
++            (max_batch_size, history_slots + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
+             dtype = torch.float,
+             device = "meta"
+         )
+@@ -225,15 +368,26 @@ class GDNLayerState:
+         self.conv_state.zero_()
+         self.recurrent_state.zero_()
+         self.device = device
++        if self.replay_enabled:
++            # Device and geometry arguments of ext.batched_gdn_replay, also its job grouping key
++            m = self.module
++            self.replay_key = (
++                torch.device(device).index, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim,
++                m.fdim_qkv, m.conv_kernel_size, self.conv_state.stride(1), bool(m.kda)
++            )
++            self.replay_job_cache = {}
+ 
+ 
+     def free(self):
++        self.discard_replay()
++        self.replay_job_cache = {}
+         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
+         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+         self.device = None
+ 
+ 
+     def clear(self, idx: int):
++        self.discard_replay(idx)
+         if self.device is not None:
+             self.conv_state[idx].zero_()
+             self.recurrent_state[idx].zero_()
+@@ -246,7 +400,134 @@ class GDNLayerState:
+         )
+ 
+ 
++    def _pop_replay(self, slot: int):
++        record = self.pending_replay.pop(slot, None)
++        if isinstance(record, tuple) and isinstance(record[0], GDNReplayBuffers):
++            record[0].storage.release(self, slot)
++        return record
++
++
++    def discard_replay(self, slot: int | None = None):
++        for s in (list(self.pending_replay) if slot is None else [slot]):
++            self._pop_replay(s)
++
++
++    def record_replay_bc(self, states, buffers: GDNReplayBuffers):
++        # The BC graph already wrote the inputs into the layer's statics; row i belongs to states[i]
++        for i, state in enumerate(states):
++            assert state.slot not in self.pending_replay, "Unresolved GDN verification"
++            record = (buffers, i)
++            self.pending_replay[state.slot] = record
++            buffers.storage.claim(self, state.slot, record)
++
++
++    def record_replay(self, states, conv_input, mixed_qkv, beta, g, token_major):
++        # Keep the original dtypes and layout, including token-major fp16/fp32 conv inputs.
++        # q is retained with k/v so the existing packed recurrent kernel can replay unchanged.
++        for i, state in enumerate(states):
++            assert state.slot not in self.pending_replay, "Unresolved GDN verification"
++            self.pending_replay[state.slot] = (
++                conv_input[i:i + 1], mixed_qkv[i:i + 1], beta[i:i + 1], g[i:i + 1], token_major
++            )
++
++
++    def prepare_replay(self, slot: int, accepted: int):
++        """Validate the slot's pending verification and plan its commit, consuming nothing: None
++        (nothing to commit), "eager" (commit_replay_eager) or (group key, ext.GDNReplayJob) for
++        _dispatch_replay. Only accepted = 0, which commits nothing, releases the record here"""
++        record = self.pending_replay.get(slot)
++        # A one-row non-speculative forward has no pending inputs and already committed.
++        if record is None:
++            return None
++        if record is _REPLAY_FAILED:
++            raise RuntimeError(f"GDN replay of slot {slot} failed partway; its state stays undefined "
++                               "until the slot is cleared, restored or released")
++        bc = isinstance(record[0], GDNReplayBuffers)
++        seqlen = record[0].seqlen if bc else record[1].shape[1]
++        if not 0 <= accepted <= seqlen:
++            raise ValueError(f"Invalid GDN accepted length {accepted} for a {seqlen}-row verification")
++        if not accepted:
++            self._pop_replay(slot)
++            return None
++        if not bc:
++            return "eager"
++        buffers, row = record
++        # Addresses depend only on (statics, row, slot), all fixed between alloc() and free()
++        job = self.replay_job_cache.get((buffers, row, slot))
++        if job is None:
++            rs, cs = self.recurrent_state, self.conv_state
++            job = ext.GDNReplayJob(
++                rs.data_ptr() + slot * rs.stride(0) * rs.element_size(),
++                cs.data_ptr() + slot * cs.stride(0) * cs.element_size(),
++                *buffers.row_ptrs(row),
++            )
++            self.replay_job_cache[(buffers, row, slot)] = job
++        return (self.replay_key, accepted, buffers.seqlen), job
++
++
++    def commit_replay_eager(self, slot: int, accepted: int):
++        try:
++            self._replay_eager(slot, accepted, *self.pending_replay[slot])
++        except BaseException:
++            self.fail_replay(slot)
++            raise
++        self._pop_replay(slot)
++
++
++    def fail_replay(self, slot: int):
++        # Part of the commit may have run. Keep the slot unresolved, so forwards, checkpoints and
++        # replays refuse it, until it is cleared, restored or released
++        self._pop_replay(slot)
++        self.pending_replay[slot] = _REPLAY_FAILED
++
++
++    def replay(self, slot: int, accepted: int):
++        plan = self.prepare_replay(slot, accepted)
++        if plan == "eager":
++            _dispatch_replay(slot, [(self, accepted)], {})
++        elif plan is not None:
++            _dispatch_replay(slot, [], {plan[0]: [(self, plan[1])]})
++
++
++    def _replay_eager(self, slot: int, accepted: int, conv_input, mixed_qkv, beta, g, token_major):
++        assert 0 <= accepted <= mixed_qkv.shape[1], "Invalid GDN accepted length"
++        if accepted:
++            module = self.module
++            # Reuse exactly the recurrent scan used for verification, even for long blocks.
++            # Slicing the slot gives a contiguous single-state batch, so no slot map is needed.
++            gated_delta_rule_fn(
++                mixed_qkv = mixed_qkv[:, :accepted].contiguous(),
++                beta = beta[:, :accepted].contiguous(),
++                g = g[:, :accepted].contiguous(),
++                recurrent_state = self.recurrent_state[slot:slot + 1],
++                recurrent_slots = None,
++                history = False,
++                save_state = True,
++                num_k_heads = module.num_k_heads,
++                num_v_heads = module.num_v_heads,
++                k_dim = module.k_dim,
++                v_dim = module.v_dim,
++                k_head_dim = module.k_head_dim,
++                v_head_dim = module.v_head_dim,
++                channelwise_g = module.kda,
++                force_recurrent = True,
++            )
++            conv_prefix = conv_input[:, :accepted] if token_major else conv_input[:, :, :accepted]
++            causal_conv1d_update(
++                mixed_qkv = conv_prefix.contiguous(),
++                conv_state = self.conv_state[slot:slot + 1],
++                recurrent_slots = None,
++                conv1d_weight = module.conv1d_weight_flat,
++                conv1d_bias = module.conv1d_bias,
++                history = False,
++                token_major = token_major,
++            )
++
++
+     def rewind(self, slot: int, last_history: int, num_tokens: int):
++        if self.replay_enabled:
++            self.replay(slot, last_history + 1 - num_tokens)
++            return
+         assert num_tokens <= last_history
+         if num_tokens > 0:
+             r_state = self.recurrent_state[slot, 0]
+@@ -299,6 +580,7 @@ class GDNLayerState:
+ 
+ 
+     def stash(self, slot, position: int = 0):
++        assert slot not in self.pending_replay, "Commit GDN verification before checkpointing"
+         cdim = self.module.conv_kernel_size
+         return (
+             host_copy(self.recurrent_state[slot, :1]),
+@@ -307,6 +589,7 @@ class GDNLayerState:
+ 
+ 
+     def unstash(self, slot, stashed, position: int = 0):
++        self.discard_replay(slot)
+         cdim = self.module.conv_kernel_size
+         s, c = stashed
+         self.recurrent_state[slot, :1].copy_(s)
+@@ -596,6 +879,8 @@ class GatedDeltaNet(Module):
+ 
+         self.bc = None
+         self.bc_split = False
++        self.bc_replay_buffers = {}
++        self.bc_replay_storage = None
+         self.bsz1_pa_args = []
+         self.ba_weight_t = None
+         self.ba_bias = None
+@@ -837,6 +1122,8 @@ class GatedDeltaNet(Module):
+             self.bc = None
+             self.bc_split = False
+             self.bsz1_pa_args = []
++        self.bc_replay_buffers = {}
++        self.bc_replay_storage = None
+         self.ba_weight_t = None
+         self.ba_bias = None
+         self.ba_weight_filled = False
+@@ -898,7 +1185,18 @@ class GatedDeltaNet(Module):
+         return mixed_qkv, z, b, a
+ 
+ 
+-    def _bc_configure_slot_kda(self, bsz: int, seqlen: int, history: bool):
++    def _bc_replay_statics(self, bsz: int, seqlen: int):
++        """Per-layer conv input, post-conv qkv, beta and g for a replay-verify slot. They hold the
++        verification record until rewind, so unlike the other statics they cannot be shared
++        between layers through g_tensor_cache (see GDNReplayStorage)"""
++        if self.bc_replay_storage is None:
++            self.bc_replay_storage = GDNReplayStorage(self)
++        buffers = self.bc_replay_storage.buffers(bsz, seqlen)
++        self.bc_replay_buffers[(bsz, seqlen)] = buffers
++        return buffers.tensors
++
++
++    def _bc_configure_slot_kda(self, bsz: int, seqlen: int, history: bool, replay: bool = False):
+         device = self.device
+         f = self.fdim_qkv
+         nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
+@@ -908,10 +1206,13 @@ class GatedDeltaNet(Module):
+         fa_out          = g_tensor_cache.get(device, (bsz, seqlen, hk), torch.float, "s_kfa")
+         fb_out          = g_tensor_cache.get(device, (bsz, seqlen, nv * hk), torch.float, "s_kfb")
+         ga_out          = g_tensor_cache.get(device, (bsz, seqlen, hv), torch.float, "s_kga")
+-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
+-        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
++        if replay:
++            mixed_qkv, conv_out, beta, g = self._bc_replay_statics(bsz, seqlen)
++        else:
++            beta        = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
++            g           = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
++            mixed_qkv   = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
++            conv_out    = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
+         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
+         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
+@@ -919,7 +1220,7 @@ class GatedDeltaNet(Module):
+         self.bc.configure_slot_kda(
+             bsz, seqlen, history,
+             qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
+-            core_attn_out, core_attn_out_f, qkv_xh, o_xh,
++            core_attn_out, core_attn_out_f, qkv_xh, o_xh, replay,
+         )
+ 
+     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
+@@ -961,20 +1262,23 @@ class GatedDeltaNet(Module):
+         return qkv, z
+ 
+ 
+-    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
++    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool, replay: bool = False):
+         """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
+         statics for the BC_GatedDeltaNetSplit graph slot and hand them to C++. Called at most
+-        once per (bsz, seqlen, history) combination per layer instance"""
++        once per (bsz, seqlen, history, replay) combination per layer instance"""
+         device = self.device
+         f = self.fdim_qkv
+         nv, hv = self.num_v_heads, self.v_head_dim
+         qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
+         z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
+         ba              = g_tensor_cache.get(device, (bsz, seqlen, 2 * nv), torch.float, "s_ba")
+-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
+-        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
++        if replay:
++            mixed_qkv, conv_out, beta, g = self._bc_replay_statics(bsz, seqlen)
++        else:
++            beta        = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
++            g           = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
++            mixed_qkv   = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
++            conv_out    = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
+         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
+         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
+@@ -983,7 +1287,7 @@ class GatedDeltaNet(Module):
+         self.bc.configure_slot(
+             bsz, seqlen, history,
+             qkv, z, ba, beta, g, mixed_qkv, conv_out, core_attn_out, core_attn_out_f,
+-            qkv_xh, z_xh, o_xh,
++            qkv_xh, z_xh, o_xh, replay,
+         )
+ 
+ 
+@@ -1036,6 +1340,10 @@ class GatedDeltaNet(Module):
+             save_state = False
+             save_history = False  # no SD without prior state, for simplicity
+ 
++        replay_verify = bool(save_state and rsl.replay_enabled and save_history)
++        if save_state and rsl.replay_enabled:
++            assert all(s.slot not in rsl.pending_replay for s in rsg), "Unresolved GDN verification"
++
+         # Deferred fill of the merged b/a projection (weights are materialized by now)
+         if self.bc_split and not self.ba_weight_filled and self.kda:
+             self.dt_bias_bc.copy_(self.dt_bias)
+@@ -1063,18 +1371,29 @@ class GatedDeltaNet(Module):
+         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
+         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
+         # history) shape from the third invocation of that shape on
+-        if (
+-            self.bc_split and save_state and
++        use_bc = (
++            _bc_gdn_enable and self.bc_split and save_state and
+             recurrent_slots is not None and
+             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
+-        ):
+-            if self.bc.needs_configure(bsz, seqlen, save_history):
++        )
++        # Replay verify through its own noncommitting graph slot, whose statics are this layer's
++        # records until rewind; any still unresolved (other slots or caches) are evicted to
++        # private copies first. Head dims batched_gdn_replay lacks verify eagerly
++        if use_bc and replay_verify:
++            use_bc = _bc_replay_enable and self.k_head_dim == 128 and self.v_head_dim == 128
++            if use_bc and self.bc_replay_storage is not None and self.bc_replay_storage.claims:
++                self.bc_replay_storage.evict()
++        if use_bc:
++            bc_history = save_history and not replay_verify
++            if self.bc.needs_configure(bsz, seqlen, bc_history, replay_verify):
+                 if self.kda:
+-                    self._bc_configure_slot_kda(bsz, seqlen, save_history)
++                    self._bc_configure_slot_kda(bsz, seqlen, bc_history, replay_verify)
+                 else:
+-                    self._bc_configure_slot(bsz, seqlen, save_history)
++                    self._bc_configure_slot(bsz, seqlen, bc_history, replay_verify)
+             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
+-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
++            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, bc_history, replay_verify)
++            if replay_verify:
++                rsl.record_replay_bc(rsg, self.bc_replay_buffers[(bsz, seqlen)])
+             if self.tp_reduce:
+                 self.tp_collect(params["backend"], y)
+             return to2(y, out_dtype, self.out_dtype)
+@@ -1164,14 +1483,18 @@ class GatedDeltaNet(Module):
+                 self.beta_scale
+             )
+ 
+-        # Convolution
++        # Verification convolves against a private, K-entry window. The committed window
++        # stays untouched until acceptance. This temporary is small, unlike a recurrent state.
++        conv_input = mixed_qkv if replay_verify else None
++        conv_work = conv_state.index_select(0, recurrent_slots) if replay_verify else conv_state
++        conv_slots = None if replay_verify else recurrent_slots
+         mixed_qkv = causal_conv1d_update(
+             mixed_qkv = mixed_qkv,
+-            conv_state = conv_state,
+-            recurrent_slots = recurrent_slots,
++            conv_state = conv_work,
++            recurrent_slots = conv_slots,
+             conv1d_weight = self.conv1d_weight_flat,
+             conv1d_bias = self.conv1d_bias,
+-            history = save_history,
++            history = save_history and not replay_verify,
+             params = params,
+             token_major = conv_token_major,
+         )
+@@ -1184,7 +1507,7 @@ class GatedDeltaNet(Module):
+             recurrent_state = recurrent_state,
+             recurrent_slots = recurrent_slots,
+             history = save_history,
+-            save_state = save_state,
++            save_state = save_state and not replay_verify,
+             num_k_heads = self.num_k_heads,
+             num_v_heads = self.num_v_heads,
+             k_dim = self.k_dim,
+@@ -1194,7 +1517,9 @@ class GatedDeltaNet(Module):
+             params = params,
+             channelwise_g = self.kda,
+         )
+-        del mixed_qkv, beta, g
++        if replay_verify:
++            rsl.record_replay(rsg, conv_input, mixed_qkv, beta, g, conv_token_major)
++        del mixed_qkv, beta, g, conv_input, conv_work
+ 
+         # Norm
+         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)
+diff --git a/exllamav3/modules/gated_delta_net_fn/conv1d.py b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+index a8b194f..1d36da3 100644
+--- a/exllamav3/modules/gated_delta_net_fn/conv1d.py
++++ b/exllamav3/modules/gated_delta_net_fn/conv1d.py
+@@ -420,7 +420,8 @@ def causal_conv1d_update(
+         conv_state = torch.zeros((bsz, dim, conv1d_weight.shape[-1]), dtype = torch.bfloat16, device = mixed_qkv.device)
+         dummy_slots = True
+     else:
+-        dummy_slots = False
++        # A compact private batch, such as replay's conv window, needs no slot indirection.
++        dummy_slots = recurrent_slots is None
+ 
+     if (
+         not token_major and
+diff --git a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+index 2dd4345..9b440a1 100644
+--- a/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
++++ b/exllamav3/modules/gated_delta_net_fn/gated_delta_rule.py
+@@ -134,16 +134,20 @@ def gated_delta_rule_fn(
+     v_head_dim: int,
+     params: dict = None,
+     channelwise_g: bool = False,
++    force_recurrent: bool = False,
+ ):
+     if params is None:
+         params = {}
+ 
+     bsz, seqlen, _ = mixed_qkv.shape
++    # Preserve the ordinary no-cache scan's temporary-state writes. Only a real committed
++    # state supplied with save_state=False needs the read-only recurrent specialization.
++    commit_recurrent = save_state or recurrent_state is None
+ 
+     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
+     # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
+     if channelwise_g:
+-        if seqlen >= num_v_heads and not history:
++        if seqlen >= num_v_heads and not history and not force_recurrent:
+             from ...vendor.fla import chunk_kda
+             q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+             q = q.view(bsz, seqlen, -1, k_head_dim)
+@@ -187,12 +191,13 @@ def gated_delta_rule_fn(
+             k_head_dim,
+             v_head_dim,
+             recurrent_slots,
+-            history,
++            history and commit_recurrent,
++            commit_recurrent,
+         )
+         return core_attn_out
+ 
+     # Chunked rule
+-    if seqlen >= num_v_heads and not history:
++    if seqlen >= num_v_heads and not history and not force_recurrent:
+         from ...vendor.fla import chunk_gated_delta_rule
+ 
+         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
+@@ -243,7 +248,8 @@ def gated_delta_rule_fn(
+             k_head_dim,
+             v_head_dim,
+             recurrent_slots,
+-            history,
++            history and commit_recurrent,
++            commit_recurrent,
+         )
+ 
+     return core_attn_out
+diff --git a/test_gdn_replay.py b/test_gdn_replay.py
+new file mode 100644
+index 0000000..d81f3df
+--- /dev/null
++++ b/test_gdn_replay.py
+@@ -0,0 +1,632 @@
++#!/usr/bin/env python3
++"""GPU-owner A/B test for GDN replay. Do not run alongside another GPU job.
++
++Source the workspace env.sh, build/install this checkout, then run this file.
++The parent imports only the standard library. Each replay mode loads both models
++in a fresh child, so EXL3_GDN_REPLAY is set before torch/exllamav3 imports.
++Mode 0 is history slots, mode 1 is replay with BC-graph verification and the batched
++replay commit (EXL3_BC_GDN_REPLAY=1), and the optional mode 2 (--eager-replay) is
++replay with eager verification and per-layer replay (EXL3_BC_GDN_REPLAY=0).
++Mode 1 must launch every GDN layer's captured replay-verify graph repeatedly;
++--alternating-cache (mode 1) also verifies on two caches with records pending in both,
++and --graph-reinst N runs every child with EXL3_GRAPH_REINST=N.
++Defaults match smoke_test.py's loading, warmup and timing conventions, with
++DFlash2, seven draft tokens, an approximately 400-token prompt and 400 output tokens.
++Children skip interpreter shutdown to avoid the gfx1201 HSA exit-handler problem.
++"""
++
++import argparse
++import importlib.machinery
++import json
++import math
++import os
++from pathlib import Path
++import subprocess
++import sys
++import time
++import traceback
++
++CHECKOUT = Path(__file__).resolve().parent
++WORKSPACE = CHECKOUT.parent
++RESULT_PREFIX = "GDN_REPLAY_RESULT "
++QUESTION = """Write a complete Python implementation of an LRU cache and tests for it.
++The cache must use a dictionary and a doubly linked list. Do not use OrderedDict
++or functools.lru_cache. Start with a short explanation of the data structures,
++then give the implementation, then give pytest tests. Use type hints and clear
++docstrings. Keep all code in your answer so that it can be copied into two files.
++
++The constructor accepts a positive integer capacity. Reject zero and negative
++capacities with ValueError. Support get, put, delete, and len. A successful get
++moves the entry to the most recently used end. A missing get returns a caller
++supplied default without changing the cache. Updating an existing key changes
++its value and moves it to the most recently used end without growing the cache.
++Inserting a new key into a full cache evicts the least recently used entry.
++Deleting an existing key returns True; deleting a missing key returns False.
++Stored values may be None, so do not confuse a stored None with an absent key.
++
++Use sentinel nodes to simplify the linked list operations. Describe the list
++invariant and the dictionary invariant. Each public operation should take
++constant time. Avoid recursion and avoid walking the list to find an entry.
++The implementation does not need thread safety, persistence, or expiration.
++
++The tests should cover insertion, retrieval, replacement, eviction order after
++retrieval, eviction order after replacement, deletion, missing keys, None values,
++a capacity of one, invalid capacities, and repeated operations on the same key.
++Include one sequence of operations that alternates deletions and insertions to
++exercise links at both ends of the list. Finish by explaining why dictionary
++lookups and pointer updates make the required operations constant time."""
++DEFAULT_PROMPT = (
++    f"<|im_start|>user\n{QUESTION}<|im_end|>\n"
++    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
++)
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--model", type=Path, default=WORKSPACE / "models/Qwen3.8-27B-EXL3-3.0bpw")
++    parser.add_argument("--draft", type=Path, default=WORKSPACE / "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw")
++    parser.add_argument("--cache", type=int, default=8192)
++    parser.add_argument("--max-new", "--max_new", dest="max_new", type=int, default=400)
++    parser.add_argument("--draft-tokens", type=int, default=7)
++    parser.add_argument("--warmup", type=int, default=16, help="warmup output tokens; 0 disables warmup")
++    parser.add_argument("--runs", type=int, default=1, help="measured runs per child; compare every token sequence")
++    parser.add_argument("--order", choices=("0,1", "1,0"), default="0,1", help="child execution order")
++    parser.add_argument("--eager-replay", action="store_true",
++                        help="also run mode 2: replay with eager verification (EXL3_BC_GDN_REPLAY=0), last")
++    parser.add_argument("--alternating-cache", action="store_true",
++                        help="mode 1: interleave verifies of two extra caches on one graph slot, compare states exactly")
++    parser.add_argument("--graph-reinst", type=int, help="set EXL3_GRAPH_REINST for every child (e.g. 1000)")
++    parser.add_argument("--min-graph-launches", type=int, default=10,
++                        help="mode 1: captured replay-verify graph launches required per GDN layer")
++    parser.add_argument("--prompt-file", type=Path, help="UTF-8 file containing the complete chat-formatted prompt")
++    parser.add_argument("--show-text", action="store_true", help="print each measured completion")
++    parser.add_argument("--json", action="store_true", help="also print the full results, including token IDs, as JSON")
++    parser.add_argument("--state-check", action="store_true", help="check low-level recurrent/conv replay before model load")
++    parser.add_argument("--state-check-only", action="store_true", help="run kernel checks without models")
++    parser.add_argument("--state-channelwise", action="store_true", help="also check channelwise decay; implies --state-check")
++    parser.add_argument("--state-atol", type=float, default=2e-6)
++    parser.add_argument("--state-rtol", type=float, default=2e-5)
++    parser.add_argument("--_child-mode", choices=("0", "1", "2"), help=argparse.SUPPRESS)
++    args = parser.parse_args()
++    for name in ("cache", "max_new", "draft_tokens", "runs"):
++        if getattr(args, name) <= 0:
++            parser.error(f"--{name.replace('_', '-')} must be positive")
++    if args.warmup < 0:
++        parser.error("--warmup must be nonnegative")
++    if not all(math.isfinite(value) and value >= 0 for value in (args.state_atol, args.state_rtol)):
++        parser.error("State-check tolerances must be finite and nonnegative")
++    args.state_check = args.state_check or args.state_check_only or args.state_channelwise
++    if args.draft_tokens > 7:
++        parser.error("DFlash2's eight-token block supports at most seven draft tokens")
++    args.model = args.model.resolve()
++    args.draft = args.draft.resolve()
++    if args.prompt_file:
++        args.prompt_file = args.prompt_file.resolve()
++    return args
++
++
++def check_environment(args):
++    expected_venv = WORKSPACE / "exllamav3-rocm/.venv-rocm"
++    activated = os.environ.get("VIRTUAL_ENV")
++    if not activated or Path(activated).resolve() != expected_venv.resolve() or Path(sys.prefix).resolve() != expected_venv.resolve():
++        raise RuntimeError(f"Source {WORKSPACE / 'env.sh'} and use its python interpreter before running this test")
++    if os.environ.get("HIP_VISIBLE_DEVICES") != "0":
++        raise RuntimeError("Require HIP_VISIBLE_DEVICES=0 exactly; do not expose the iGPU")
++    headers = str(WORKSPACE / "deps/usr/include/python3.12")
++    if os.environ.get("ROCM_HOME") != "/usr" or os.environ.get("ROCM_PATH") != "/usr" or headers not in os.environ.get("CPATH", "").split(os.pathsep):
++        raise RuntimeError(f"Runtime environment is incomplete; source {WORKSPACE / 'env.sh'}")
++    if not args.state_check_only:
++        for directory in (args.model, args.draft):
++            if not (directory / "config.json").is_file():
++                raise RuntimeError(f"Model config not found in {directory}")
++    # ext.py falls back to a JIT build if it cannot find a compiled extension.
++    # Require this checkout's in-place extension instead of silently using another build.
++    if not any((CHECKOUT / ("exllamav3_ext" + suffix)).is_file() for suffix in importlib.machinery.EXTENSION_SUFFIXES):
++        raise RuntimeError(f"No in-place exllamav3_ext in {CHECKOUT}; build this checkout first")
++
++
++def clean_child_exit(code):
++    # Follow smoke_test.py: flush output, release cached allocations, then bypass
++    # the HSA interpreter-exit handler. Also use this path after child exceptions.
++    torch = sys.modules.get("torch")
++    try:
++        if torch is not None and torch.cuda.is_initialized():
++            import gc
++            torch.cuda.synchronize()
++            gc.collect()
++            torch.cuda.empty_cache()
++            torch.cuda.synchronize()
++            time.sleep(1.5)
++    except BaseException:
++        traceback.print_exc()
++        code = 1
++    finally:
++        sys.stdout.flush()
++        sys.stderr.flush()
++        os._exit(code)
++
++
++def check_kernel_states(torch, args):
++    """Exercise both v-split paths, nonidentity int32 slots and all acceptance lengths."""
++    from exllamav3.ext import exllamav3_ext as ext
++
++    rows, kh, vh, kd, vd, conv_k = 8, 2, 6, 128, 128, 4
++    features = 2 * kh * kd + vh * vd
++    checks = []
++
++    def compare(name, actual, expected, exact=False):
++        delta = (actual.float() - expected.float()).abs().max().item()
++        passed = torch.equal(actual, expected) if exact else torch.allclose(
++            actual, expected, atol=args.state_atol, rtol=args.state_rtol)
++        checks.append(dict(name=name, max_abs_delta=delta, allclose=bool(passed), exact=exact))
++        if not passed:
++            raise RuntimeError(f"State check failed: {name}, max delta={delta:.9g}, "
++                               f"atol={args.state_atol}, rtol={args.state_rtol}, exact={exact}")
++
++    def recurrent(qkv, g, beta, state, slots, history, save_state):
++        out = torch.empty((qkv.shape[0], qkv.shape[1], vh, vd), device="cuda:0", dtype=torch.bfloat16)
++        ext.cuda_recurrent_gated_delta_rule(qkv, g, beta, state, out,
++                                          kh, vh, kd, vd, slots, history, save_state)
++        return out
++
++    def convolution(x, state, slots, weight, bias, history, save_state=True):
++        out = torch.empty((x.shape[0], x.shape[2], features), device="cuda:0", dtype=torch.bfloat16)
++        ext.cuda_causal_conv1d_update(x, state, slots, weight, bias, out, True, history, save_state)
++        return out
++
++    # 33 layer copies: one rewind batches every layer, and bsz=2 (66 jobs) spans two launches
++    replay_copies = 33
++
++    def batched_replay(states, convs, slot_ids, conv_input, conv_out, g, beta, accepted, channelwise):
++        # Jobs as GDNLayerState.replay_job builds them: slot bases plus per-row record bases
++        jobs = []
++        for state, conv in zip(states, convs):
++            for bi, slot in enumerate(slot_ids):
++                jobs.append(ext.GDNReplayJob(
++                    state.data_ptr() + slot * state.stride(0) * state.element_size(),
++                    conv.data_ptr() + slot * conv.stride(0) * conv.element_size(),
++                    conv_input[bi].data_ptr(), conv_out[bi].data_ptr(),
++                    beta[bi].data_ptr(), g[bi].data_ptr()))
++        ext.batched_gdn_replay(jobs, 0, accepted, rows, kh, vh, kd, vd, features, conv_k,
++                               convs[0].stride(1), channelwise)
++
++    for bsz in (1, 2):
++        for channelwise in ((False, True) if args.state_channelwise else (False,)):
++            torch.manual_seed(1729 + bsz + 10 * int(channelwise))
++            tag = f"bsz={bsz}, decay={'channelwise' if channelwise else 'scalar'}"
++            start_check = len(checks)
++            # Slots exercise indexing rather than relying only on the identity mapping.
++            slots = torch.tensor([1] if bsz == 1 else [2, 0], device="cuda:0", dtype=torch.int32)
++            slot_ids = [1] if bsz == 1 else [2, 0]
++            x = torch.randn((bsz, features, rows), device="cuda:0", dtype=torch.bfloat16)
++            weight = torch.randn((features, conv_k), device="cuda:0", dtype=torch.bfloat16) * 0.1
++            bias = torch.randn((features,), device="cuda:0", dtype=torch.bfloat16) * 0.1
++            conv_seed = torch.randn((3, features, conv_k), device="cuda:0", dtype=torch.bfloat16)
++            conv_history = torch.randn((3, features, conv_k + rows - 1), device="cuda:0", dtype=torch.bfloat16)
++            conv_history[:, :, :conv_k].copy_(conv_seed)
++            history_out = convolution(x, conv_history, slots, weight, bias, True)
++            conv_committed = conv_seed.clone()
++            private_conv = conv_committed.index_select(0, slots.long())
++            private_out = convolution(x, private_conv, None, weight, bias, False)
++            compare(tag + " conv private output", private_out, history_out)
++            compare(tag + " conv committed untouched", conv_committed, conv_seed, exact=True)
++            # BC replay verify: slot-indexed conv straight off the committed window, no write-back
++            readonly_conv = conv_seed.clone()
++            readonly_conv_out = convolution(x, readonly_conv, slots, weight, bias, False, save_state=False)
++            compare(tag + " conv read-only output", readonly_conv_out, history_out, exact=True)
++            compare(tag + " conv read-only untouched", readonly_conv, conv_seed, exact=True)
++
++            g_shape = (bsz, rows, vh, kd) if channelwise else (bsz, rows, vh)
++            g = -torch.rand(g_shape, device="cuda:0", dtype=torch.float32) * 0.5
++            beta = torch.rand((bsz, rows, vh), device="cuda:0", dtype=torch.bfloat16)
++            seeded = torch.randn((3, rows, vh, kd, vd), device="cuda:0", dtype=torch.float32) * 0.1
++            history = seeded.clone()
++            baseline_out = recurrent(history_out, g, beta, history, slots, True, True)
++            readonly = seeded.clone()
++            readonly_out = recurrent(private_out, g, beta, readonly, slots, False, False)
++            compare(tag + " recurrent read-only output", readonly_out, baseline_out)
++            compare(tag + " recurrent all planes untouched", readonly, seeded, exact=True)
++            one_plane = seeded[:, :1].contiguous()
++            one_plane_seed = one_plane.clone()
++            one_plane_out = recurrent(private_out, g, beta, one_plane, slots, False, False)
++            compare(tag + " recurrent one-plane output", one_plane_out, baseline_out)
++            compare(tag + " recurrent one-plane untouched", one_plane, one_plane_seed, exact=True)
++
++            eager_states = []
++            for accepted in range(rows + 1):
++                # Normal batched prefix update is the conv reference; replay is a private
++                # single-slot call, matching the actual accepted-input commit path.
++                direct_conv = conv_seed.clone()
++                if accepted:
++                    convolution(x[:, :, :accepted].contiguous(), direct_conv, slots, weight, bias, False)
++                for bi, slot in enumerate(slot_ids):
++                    label = f"{tag}, slot={slot}, L={accepted}"
++                    replay_state = seeded[slot:slot + 1, :1].clone()
++                    replay_conv = conv_seed[slot:slot + 1].clone()
++                    if accepted:
++                        recurrent(private_out[bi:bi + 1, :accepted].contiguous(),
++                                  g[bi:bi + 1, :accepted].contiguous(),
++                                  beta[bi:bi + 1, :accepted].contiguous(),
++                                  replay_state, None, False, True)
++                        convolution(x[bi:bi + 1, :, :accepted].contiguous(),
++                                    replay_conv, None, weight, bias, False)
++                    expected_state = seeded[slot, 0] if accepted == 0 else history[slot, accepted % rows]
++                    compare(label + " recurrent committed plane", replay_state[0, 0], expected_state,
++                            exact=accepted == 0)
++                    compare(label + " conv replay vs direct", replay_conv[0], direct_conv[slot], exact=True)
++                    # The history buffer holds concat(seed, inputs)[1:], so the window
++                    # after L>0 starts at L-1. L=0 must retain the entire seeded window.
++                    expected_conv = conv_seed[slot] if accepted == 0 else conv_history[slot, :, accepted - 1:accepted - 1 + conv_k]
++                    compare(label + " conv replay vs history", replay_conv[0], expected_conv, exact=True)
++                    eager_states.append((slot, replay_state[0, 0], replay_conv[0]))
++                # Batched replay commit (BC path) must reproduce the per-layer eager replay exactly
++                batch_states = [seeded[:, :1].clone() for _ in range(replay_copies)]
++                batch_convs = [conv_seed.clone() for _ in range(replay_copies)]
++                batched_replay(batch_states, batch_convs, slot_ids, x, private_out, g, beta, accepted, channelwise)
++                for slot, eager_state, eager_conv in eager_states:
++                    label = f"{tag}, slot={slot}, L={accepted}"
++                    compare(label + " batched replay state vs eager", torch.stack([b[slot, 0] for b in batch_states]),
++                            eager_state.unsqueeze(0).expand(replay_copies, *eager_state.shape), exact=True)
++                    compare(label + " batched replay conv vs eager", torch.stack([b[slot] for b in batch_convs]),
++                            eager_conv.unsqueeze(0).expand(replay_copies, *eager_conv.shape), exact=True)
++                untouched = [s for s in range(3) if s not in slot_ids]
++                for s_idx in untouched:
++                    compare(f"{tag}, slot={s_idx}, L={accepted} batched replay other slots untouched",
++                            torch.stack([b[s_idx] for b in batch_states]),
++                            seeded[s_idx, :1].unsqueeze(0).expand(replay_copies, 1, vh, kd, vd), exact=True)
++                eager_states.clear()
++            torch.cuda.synchronize()
++            group = checks[start_check:]
++            worst = max(check["max_abs_delta"] for check in group)
++            print(f"state-check PASS {tag}: {len(group)} comparisons, max delta={worst:.9g}, "
++                  f"atol={args.state_atol}, rtol={args.state_rtol}", flush=True)
++    return checks
++
++
++def cache_bytes(caches):
++    """Device bytes of the caches' KV and recurrent-state tensors: unique storages, rounded up to
++    the caching allocator's 512-byte blocks as torch.cuda.memory_allocated() counts them"""
++    storages = {}
++    for cache in caches:
++        tensors = list(cache.get_all_tensors())
++        for layer in cache.recurrent_layers.values():
++            tensors += list(layer.get_state_tensors())
++        for t in tensors:
++            if t is not None and t.is_cuda:
++                storage = t.untyped_storage()
++                storages[storage.data_ptr()] = -(-storage.nbytes() // 512) * 512
++    return sum(storages.values())
++
++
++def check_alternating_caches(torch, model, caches, rows):
++    """Verify on cache A, then on cache B through the same captured graph slot while A's records
++    are still pending (B's verify evicts them to private copies), then rewind both. A and B get
++    different inputs, so an eviction that aliased the shared storage would hand A B's record.
++    Every GDN conv window and committed state, and each verify's logits, must equal the same
++    cache's uninterleaved run."""
++    from exllamav3.constants import PAGE_SIZE
++    from exllamav3.modules.gated_delta_net import GatedDeltaNet
++
++    if rows < 2:
++        raise RuntimeError("Alternating caches need a verification block of at least two rows")
++    # Keep at least one accepted row, and reject some unless the block is only two rows long
++    rejected = min(3, rows - 1)
++    prefix_len = 64
++    assert prefix_len + rows <= PAGE_SIZE, "Alternating caches hold one page per sequence"
++    vocab = model.config.vocab_size
++
++    def inputs(seed):
++        # Full-length prefix and verification block regardless of prompt length
++        g = torch.Generator().manual_seed(seed)
++        ids = torch.randint(0, vocab, (1, prefix_len + rows), generator=g, dtype=torch.long)
++        return ids[:, :prefix_len], ids[:, prefix_len:]
++
++    gdn = [m for m in model if isinstance(m, GatedDeltaNet)]
++
++    def forward(cache, state, ids, past_len, history):
++        params = {"attn_mode": "flash_attn", "cache": cache, "batch_shape": (1, PAGE_SIZE),
++                  "past_len": past_len, "recurrent_states": [state]}
++        if history:
++            params["recurrent_history"] = True
++        return model.forward(ids, params)
++
++    def verify(cache, ids):
++        prefix, block = ids
++        state = cache.get_new_state()
++        forward(cache, state, prefix, 0, False)
++        return state, forward(cache, state, block, prefix.shape[1], True)
++
++    def snapshot(cache, state):
++        layers = [l for l in cache.recurrent_layers.values() if isinstance(l.module, GatedDeltaNet)]
++        return [(l.conv_state[state.slot].clone(), l.recurrent_state[state.slot, 0].clone()) for l in layers]
++
++    def launches():
++        return [m.bc.replay_graph_launches for m in gdn]
++
++    def evictions():
++        return sum(m.bc_replay_storage.evictions for m in gdn)
++
++    cache_a, cache_b = caches
++    ids_a, ids_b = inputs(1), inputs(2)
++    with torch.inference_mode():
++        # Uninterleaved references, each on its own cache
++        references = []
++        for cache, ids in ((cache_a, ids_a), (cache_b, ids_b)):
++            state, ref_logits = verify(cache, ids)
++            state.rewind(rejected)
++            references.append((ref_logits, snapshot(cache, state)))
++            state.free()
++
++        launches0, evictions0 = launches(), evictions()
++        state_a, logits_a = verify(cache_a, ids_a)
++        state_b, logits_b = verify(cache_b, ids_b)
++        evicted = evictions() - evictions0
++        state_a.rewind(rejected)
++        state_b.rewind(rejected)
++        torch.cuda.synchronize()
++        after = launches()
++        results = [snapshot(cache_a, state_a), snapshot(cache_b, state_b)]
++        state_a.free()
++        state_b.free()
++
++    if evicted != len(gdn):
++        raise RuntimeError(f"Alternating caches: expected {len(gdn)} evictions, got {evicted}")
++    if min(b - a for a, b in zip(launches0, after)) < 2:
++        raise RuntimeError("Alternating caches: interleaved verifies did not launch the captured graphs")
++    (ref_logits_a, ref_a), (ref_logits_b, ref_b) = references
++    if torch.equal(ref_logits_a, ref_logits_b) or all(
++            torch.equal(x[1], y[1]) for x, y in zip(ref_a, ref_b)):
++        raise RuntimeError("Alternating caches: A and B references coincide, so aliasing would go undetected")
++    for name, logits, ref_logits in (("A", logits_a, ref_logits_a), ("B", logits_b, ref_logits_b)):
++        if not torch.equal(logits, ref_logits):
++            raise RuntimeError(f"Alternating caches: cache {name} verify logits differ from its reference")
++    for name, result, reference in (("A", results[0], ref_a), ("B", results[1], ref_b)):
++        for index, ((conv, rec), (ref_conv, ref_rec)) in enumerate(zip(result, reference)):
++            if not torch.equal(conv, ref_conv) or not torch.equal(rec, ref_rec):
++                raise RuntimeError(f"Alternating caches: cache {name}, GDN layer {index} state differs from its reference")
++    print(f"alternating-cache PASS: {len(gdn)} layers, {evicted} evictions, {rows}-row verify, "
++          f"{rejected} rejected; states and logits exact, each against its own reference", flush=True)
++    return dict(layers=len(gdn), evictions=evicted, rows=rows, rejected=rejected)
++
++
++def run_child(args):
++    mode = args._child_mode
++    if os.environ.get("EXL3_GDN_REPLAY") != ("0" if mode == "0" else "1") or \
++            os.environ.get("EXL3_BC_GDN_REPLAY") != ("0" if mode == "2" else "1"):
++        raise RuntimeError("Child replay environment does not match its mode")
++    # These are deliberately child-only imports, after all environment checks.
++    import torch
++    import exllamav3
++    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
++
++    if Path(exllamav3.__file__).resolve().parent != CHECKOUT / "exllamav3":
++        raise RuntimeError(f"Imported another checkout: {exllamav3.__file__}")
++    if not torch.version.hip or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
++        raise RuntimeError("Require a ROCm torch build with exactly one visible GPU")
++    torch.manual_seed(0)
++    bc_gdn = os.environ.get("EXL3_BC_GDN", "1")
++    print(f"mode={mode}, GPU={torch.cuda.get_device_name(0)}, HIP={torch.version.hip}, "
++          f"EXL3_BC_GDN={bc_gdn}, EXL3_BC_GDN_REPLAY={os.environ['EXL3_BC_GDN_REPLAY']}", flush=True)
++    state_checks = check_kernel_states(torch, args) if args.state_check else []
++    if args.state_check_only:
++        return dict(mode=int(mode), bc_gdn=bc_gdn, state_checks=state_checks, state_check_only=True)
++    # Re-seed after optional kernel checks so enabling them does not alter model runs.
++    torch.manual_seed(0)
++    started = time.perf_counter()
++    draft_config = Config.from_directory(str(args.draft))
++    draft_model = Model.from_config(draft_config, component="text")
++    draft_cache = Cache(draft_model, max_num_tokens=args.cache)
++    draft_model.load(progressbar=True)
++    config = Config.from_directory(str(args.model))
++    model = Model.from_config(config)
++    cache = Cache(model, max_num_tokens=args.cache, max_batch_size=1, max_history=args.draft_tokens)
++    # One page each; created before load so the loader allocates them. Replay-mode states are small
++    alt_caches = [Cache(model, max_num_tokens=256, max_batch_size=1, max_history=args.draft_tokens)
++                  for _ in range(2)] if args.alternating_cache and mode == "1" else None
++    model.load(progressbar=True)
++    tokenizer = Tokenizer.from_config(config)
++    generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
++                          draft_model=draft_model, draft_cache=draft_cache,
++                          num_draft_tokens=args.draft_tokens, dynamic_draft_tokens=False)
++    torch.cuda.synchronize()
++    # The auxiliary caches must exist before load (the loader allocates them) but are not part of
++    # the configuration under test: exclude them from the after-load figures, report them apart
++    aux_cache_bytes = cache_bytes(alt_caches) if alt_caches else 0
++    allocated = torch.cuda.memory_allocated() - aux_cache_bytes
++    reserved = torch.cuda.memory_reserved() - aux_cache_bytes
++    load_seconds = time.perf_counter() - started
++    print(f"loaded in {load_seconds:.1f}s, VRAM allocated {allocated / 1e9:.2f} GB, "
++          f"reserved {reserved / 1e9:.2f} GB, draft={generator.num_draft_tokens}"
++          + (f" (excluding {aux_cache_bytes / 1e6:.1f} MB of auxiliary caches)" if aux_cache_bytes else ""), flush=True)
++    prompt = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else DEFAULT_PROMPT
++    ids = tokenizer.encode(prompt, encode_special_tokens=True)
++    prompt_tokens = ids.shape[-1]
++    if prompt_tokens + max(args.max_new, args.warmup) + args.draft_tokens + 1 > args.cache:
++        raise RuntimeError("Prompt plus output and draft slack exceed --cache")
++    stop = [tokenizer.single_id("<|im_end|>")]
++
++    def generate(max_new):
++        job = Job(input_ids=ids, max_new_tokens=max_new, stop_conditions=stop, sampler=ArgmaxSampler())
++        generator.enqueue(job)
++        chunks, token_ids = [], []
++        first = None
++        terminal = None
++        torch.cuda.synchronize()
++        start = time.perf_counter()
++        while generator.num_remaining_jobs():
++            for event in generator.iterate():
++                if event.get("stage") != "streaming":
++                    continue
++                chunk = event.get("text", "")
++                if chunk and first is None:
++                    first = time.perf_counter()
++                chunks.append(chunk)
++                tokens = event.get("token_ids")
++                if tokens is not None:
++                    token_ids.extend(tokens.flatten().tolist())
++                if event.get("eos"):
++                    terminal = event
++        torch.cuda.synchronize()
++        end = time.perf_counter()
++        if terminal is None or not token_ids:
++            raise RuntimeError("Generation did not return a completion with output tokens")
++        # Stop tokens are excluded from streamed IDs; include them in correctness checks.
++        sampled_ids = list(token_ids)
++        stop_id = terminal.get("eos_triggering_token_id")
++        if stop_id is not None:
++            sampled_ids.append(int(stop_id))
++        decode = (len(token_ids) - 1) / (end - first) if first is not None and len(token_ids) > 1 and end > first else None
++        return dict(token_ids=sampled_ids, text="".join(chunks), emitted_tokens=len(token_ids),
++                    eos_reason=terminal.get("eos_reason"), elapsed_seconds=end - start,
++                    ttft_ms=(first - start) * 1000 if first is not None else None,
++                    decode_tok_s=decode, total_tok_s=len(token_ids) / (end - start),
++                    accepted_draft_tokens=terminal.get("accepted_draft_tokens"),
++                    rejected_draft_tokens=terminal.get("rejected_draft_tokens"),
++                    cached_tokens=terminal.get("cached_tokens"))
++
++    if args.warmup:
++        generate(args.warmup)  # Same-prompt warmup, as in smoke_test.py; measured prefill may hit cache.
++    runs = [generate(args.max_new) for _ in range(args.runs)]
++    # Captured-graph launches of each GDN layer's replay-verify slots (eager first runs, captures
++    # and eager-path verifies don't count), and the per-layer recording storage behind them
++    from exllamav3.modules.gated_delta_net import GatedDeltaNet
++    gdn = [module for module in model if isinstance(module, GatedDeltaNet)]
++    launches = [module.bc.replay_graph_launches if module.bc_split else 0 for module in gdn]
++    bc_replay_layers = sum(1 for n in launches if n)
++    storage = {}
++    for module in gdn:
++        for buffers in module.bc_replay_buffers.values():
++            for t in buffers.tensors:
++                storage[t.untyped_storage().data_ptr()] = t.untyped_storage().nbytes()
++    print(f"BC replay-verify graph launches per GDN layer: min {min(launches, default=0)}, "
++          f"max {max(launches, default=0)}, layers launched {bc_replay_layers}/{len(gdn)}; "
++          f"replay storage {sum(storage.values()) / 1e6:.1f} MB", flush=True)
++    if mode == "1" and bc_gdn != "0" and min(launches, default=0) < args.min_graph_launches:
++        raise RuntimeError(f"Mode 1: some GDN layer launched its captured replay-verify graph fewer "
++                           f"than {args.min_graph_launches} times")
++    if mode != "1" and bc_replay_layers:
++        raise RuntimeError(f"Mode {mode} unexpectedly launched replay-verify graphs")
++    alternating = None
++    if alt_caches:
++        alternating = check_alternating_caches(torch, model, alt_caches, generator.num_draft_tokens + 1)
++    return dict(mode=int(mode), model=str(args.model), draft=str(args.draft),
++                bc_gdn=bc_gdn, bc_replay_layers=bc_replay_layers, gdn_layers=len(gdn),
++                replay_graph_launches_min=min(launches, default=0), alternating_cache=alternating,
++                replay_storage_bytes=sum(storage.values()), aux_cache_bytes=aux_cache_bytes,
++                state_checks=state_checks, state_check_only=False,
++                draft_tokens=generator.num_draft_tokens, prompt_tokens=prompt_tokens,
++                prompt_ids=ids.flatten().tolist(), warmup_tokens=args.warmup,
++                load_seconds=load_seconds, memory_allocated_after_load=allocated,
++                memory_reserved_after_load=reserved, runs=runs)
++
++
++def first_difference(left, right):
++    for index, (a, b) in enumerate(zip(left, right)):
++        if a != b:
++            return f"token {index}: reference ID {a}, observed ID {b}"
++    if len(left) != len(right):
++        return f"different lengths: reference {len(left)}, observed {len(right)}"
++    return None
++
++
++def parent_main(args):
++    results = {}
++    modes = args.order.split(",") + (["2"] if args.eager_replay else [])
++    for mode in modes:
++        env = os.environ.copy()
++        env["EXL3_GDN_REPLAY"] = "0" if mode == "0" else "1"
++        env["EXL3_BC_GDN_REPLAY"] = "0" if mode == "2" else "1"
++        if args.graph_reinst is not None:
++            env["EXL3_GRAPH_REINST"] = str(args.graph_reinst)
++        env["PYTHONUNBUFFERED"] = "1"
++        # Run from the checkout, not the workspace's installed editable package.
++        print(f"Starting fresh child for mode {mode}: EXL3_GDN_REPLAY={env['EXL3_GDN_REPLAY']}, "
++              f"EXL3_BC_GDN_REPLAY={env['EXL3_BC_GDN_REPLAY']}, "
++              f"EXL3_GRAPH_REINST={env.get('EXL3_GRAPH_REINST', 'default')}", flush=True)
++        process = subprocess.run([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--_child-mode", mode],
++                                 cwd=str(CHECKOUT), env=env, stdout=subprocess.PIPE,
++                                 stderr=subprocess.STDOUT, text=True)
++        payloads = []
++        for line in process.stdout.splitlines():
++            if line.startswith(RESULT_PREFIX):
++                payloads.append(line[len(RESULT_PREFIX):])
++            else:
++                print(line)
++        if process.returncode or len(payloads) != 1:
++            raise RuntimeError(f"Replay={mode} child failed, exit={process.returncode}, result records={len(payloads)}")
++        results[int(mode)] = json.loads(payloads[0])
++
++    if args.state_check_only:
++        if args.json:
++            print(json.dumps({"results": results, "state_checks_pass": True}, allow_nan=False))
++        count = sum(len(result["state_checks"]) for result in results.values())
++        print(f"PASS: {count} low-level comparisons across {len(results)} fresh children; no models loaded")
++        return 0
++    print("\nmode  run  prompt  output  TTFT ms  decode tok/s  total tok/s  allocated GB  cached tok")
++    for mode in sorted(results):
++        result = results[mode]
++        for index, run in enumerate(result["runs"], start=1):
++            ttft = run["ttft_ms"] if run["ttft_ms"] is not None else math.nan
++            speed = run["decode_tok_s"] if run["decode_tok_s"] is not None else math.nan
++            print(f"{mode:4d} {index:4d} {result['prompt_tokens']:7d} {run['emitted_tokens']:7d} "
++                  f"{ttft:8.1f} {speed:13.1f} {run['total_tok_s']:12.1f} "
++                  f"{result['memory_allocated_after_load'] / 1e9:13.2f} {str(run['cached_tokens']):>11}")
++            if args.show_text:
++                print(f"\nreplay={mode}, run={index}\n{run['text']}\n")
++    print("Decode timing follows smoke_test.py; same-prompt warmup can reuse prompt cache.")
++    errors = []
++    if results[0]["prompt_ids"] != results[1]["prompt_ids"]:
++        errors.append("Prompt token IDs differ between children")
++    baseline = results[0]["runs"][0]
++    for mode in sorted(results):
++        for index, run in enumerate(results[mode]["runs"], start=1):
++            difference = first_difference(baseline["token_ids"], run["token_ids"])
++            if difference:
++                errors.append(f"mode={mode}, run={index}: {difference}")
++            if run["eos_reason"] != baseline["eos_reason"]:
++                errors.append(f"mode={mode}, run={index}: termination reason differs")
++    if args.json:
++        print(json.dumps({"results": results, "tokens_match": not errors}, allow_nan=False))
++    if errors:
++        print("FAIL: token comparison", file=sys.stderr)
++        for error in errors:
++            print(error, file=sys.stderr)
++        print("Rerun with EXL3_BC_GDN=0 to compare both modes on eager GDN and isolate replay "
++              "from BC/eager projection rounding. A mismatch is not evidence of a near-tie without logits.",
++              file=sys.stderr)
++        return 1
++    print(f"PASS: all {len(results) * args.runs} greedy completions match, including any stop token")
++    off = sum(run["total_tok_s"] for run in results[0]["runs"]) / args.runs
++    for mode in sorted(results)[1:]:
++        on = sum(run["total_tok_s"] for run in results[mode]["runs"]) / args.runs
++        delta = results[mode]["memory_allocated_after_load"] - results[0]["memory_allocated_after_load"]
++        print(f"Mode {mode} total-throughput ratio {on / off:.3f}x vs mode 0; allocated-after-load delta "
++              f"{delta / 1e6:+.1f} MB; BC replay-verify layers {results[mode]['bc_replay_layers']}/"
++              f"{results[mode]['gdn_layers']} (min {results[mode]['replay_graph_launches_min']} graph launches), "
++              f"replay storage {results[mode]['replay_storage_bytes'] / 1e6:.1f} MB")
++    return 0
++
++
++def main():
++    args = parse_args()
++    if args._child_mode is not None:
++        code = 1
++        try:
++            check_environment(args)
++            result = run_child(args)
++            print(RESULT_PREFIX + json.dumps(result, allow_nan=False), flush=True)
++            code = 0
++        except BaseException:
++            traceback.print_exc()
++        finally:
++            clean_child_exit(code)
++    try:
++        check_environment(args)
++        return parent_main(args)
++    except (RuntimeError, OSError, ValueError) as error:
++        print(f"ERROR: {error}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
