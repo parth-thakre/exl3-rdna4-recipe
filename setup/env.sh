@@ -25,8 +25,11 @@ export CPATH="$DEPS_DIR/usr/include:$DEPS_DIR/usr/include/python3.12${CPATH:+:$C
 # Expandable segments cut allocator fragmentation, which otherwise can OOM a long prefill after concurrent use
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# HIP graphs stay on. Graph::launch re-instantiates every 100k node updates (EXL3_GRAPH_REINST), which avoids the
-# kernel-argument pool exhaustion in libamdhip64 (segfault after ~1.6M updates, about 1 h of serving).
+# HIP graphs stay on. Each node update leaks ~4 KB of device memory until the graph is re-instantiated
+# (ROCm/rocm-systems#10713), so Graph::launch re-instantiates every EXL3_GRAPH_REINST node updates. The patch's
+# built-in default of 100k is too high with several requests at once: the server segfaulted inside
+# hipGraphExecKernelNodeSetParams after 16-23 min of sustained 3-request load. 10k costs no measurable speed.
+export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-10000}
 
 # gfx12 WMMA multi-row GEMV for draft verification.
 export EXL3_GEMV_WMMA=1
