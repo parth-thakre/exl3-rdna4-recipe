@@ -15,7 +15,7 @@ didn't work.
 | OS | Fedora 44, kernel 7.2 |
 | ROCm | Fedora's system ROCm 7.1.1 packages to compile; PyTorch 2.13.0+rocm7.2 wheels (they ship their own ROCm libraries) to run |
 | Python | 3.12.14, triton-rocm 3.7.1 |
-| ExLlamaV3 | `dev` at 0662fac + `patches/exllamav3-rdna4.patch` (+ optional upstream PR #423) |
+| ExLlamaV3 | `dev` at 0662fac + `patches/exllamav3-rdna4.patch` |
 | TabbyAPI | `main` at 2fd6cc7, unpatched |
 | Model | `turboderp/Qwen3.8-27B-exl3`, 3.00bpw branch |
 | Draft | DFlash2 draft requantized to EXL3 3.0 bpw from the bf16 release |
@@ -24,7 +24,8 @@ didn't work.
 f1cf869 with the same patches, and TabbyAPI f07131c with a small patch that let it load on ROCm (upstream has since
 made that unnecessary). The recipe now pins the newer upstream commits above. On the new base we have only run a
 smoke test (`bench/smoke_test.py`, same settings on both bases, 400 greedy tokens): 150.4 tok/s, vs 150.2 on the old
-base. With PR #423 applied it gave 150.2; that PR only changes sampled decoding, which the smoke test doesn't use.
+base. With the optional PR #423 patch applied it gave 150.2; that PR only changes sampled decoding, which the smoke test
+doesn't use.
 
 ## Quick start
 
@@ -45,8 +46,7 @@ Run everything from the repo root:
 ```bash
 setup/fetch_deps.sh          # unpack missing -devel headers into deps/ (no sudo; or dnf install them, see the script)
 setup/make_venv.sh           # .venv/ with torch 2.13.0+rocm7.2 and the tested package versions
-setup/build_exllamav3.sh     # clone exllamav3 @ 0662fac, apply the patches, compile for gfx1201, pip install -e
-                             #   (WITH_PR423=0 to leave out the optional PR #423 patch)
+setup/build_exllamav3.sh     # clone exllamav3 @ 0662fac, apply the patch, compile for gfx1201, pip install -e
 setup/install_tabby.sh       # clone TabbyAPI @ 2fd6cc7, write tabbyAPI/config.yml
 setup/download_models.sh     # main model (13.8 GB) + the bf16 DFlash2 draft (3.8 GB)
 setup/requant_draft.sh       # bf16 draft -> models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw (uses the GPU, a few minutes)
@@ -258,12 +258,21 @@ length (712 kernel-level comparisons), and the greedy output is identical. That 
 profile go from 96k to 128k. Run the test from the exllamav3 checkout (`bench/README.md`). The idea comes from
 TensorFold.
 
-**Optional: PR #423, DFlash2 rejection sampling** (by Rafa, [@rafatxf](https://github.com/rafatxf); applied by
-default, `WITH_PR423=0` skips it). For sampled requests, the draft path is sampled from the drafter's own distribution
-and accepted with probability min(1, p/q), instead of only accepting draft tokens that match a sample from the target.
-The output distribution is unchanged. Greedy decoding doesn't use it. It's an open upstream PR that hasn't been through our own review yet,
-which is why it can be switched off. We ship its commit unchanged and haven't measured its effect on sampled decode
-speed. Details in `patches/README.md`.
+**Optional, not recommended yet: PR #423, DFlash2 rejection sampling** (by Rafa,
+[@rafatxf](https://github.com/rafatxf); off by default, `WITH_PR423=1 setup/build_exllamav3.sh` opts in). This is an
+open upstream PR. For sampled requests, the draft path is sampled from the drafter's own distribution and accepted with
+probability min(1, p/q), instead of only accepting draft tokens that match a sample from the target. Greedy decoding
+doesn't use it. Our review of the PR's code (at the commit we ship) found these problems:
+
+- A sampled request's speculative verify skips job-level token masks (`min_new_tokens`, banned-string continuations),
+  so a stop token can end generation before `min_new_tokens`.
+- `probs()` keeps exactly k tokens at a top-k tie, while the fused sampler keeps all tied tokens, so the two
+  distributions can differ.
+- The sampled DFlash2 path doesn't export `draft_conf`, which silently turns off confidence calibration.
+- Extra device-to-host syncs.
+
+We don't recommend it until these are fixed upstream. We ship the PR's commit unchanged and haven't measured its effect
+on sampled decode speed. Details in `patches/README.md`.
 
 **Draft requantization** (not a patch). The bf16 DFlash2 draft converted to EXL3 3.0 bpw (`setup/requant_draft.sh`)
 is 0.89 GB instead of 1.4 GB for the 5.0 bpw quant, at the same speed (154.3 vs 153.8 tok/s in the generator). The

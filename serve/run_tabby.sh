@@ -14,6 +14,13 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TABBY_TREE=${TABBY_TREE:-${TABBY_DIR:-$ROOT/tabbyAPI}}
 exl3_explicit=${EXL3_TREE:+1}
 EXL3_TREE=${EXL3_TREE:-$ROOT/exllamav3}
+# Absolute paths: PYTHONPATH is used after the cd into TabbyAPI below, and stop_tabby.sh compares the server's cwd
+TABBY_TREE=$(cd "$TABBY_TREE" 2>/dev/null && pwd -P) || { echo "run_tabby.sh: no TabbyAPI checkout; run setup/install_tabby.sh" >&2; exit 1; }
+if [ -d "$EXL3_TREE" ]; then
+    EXL3_TREE=$(cd "$EXL3_TREE" && pwd -P)
+elif [ -n "$exl3_explicit" ]; then
+    echo "run_tabby.sh: EXL3_TREE=$EXL3_TREE doesn't exist" >&2; exit 1
+fi
 PIDFILE=${TABBY_PIDFILE:-$ROOT/logs/tabby.pid}
 
 source "$ROOT/setup/env.sh" || { echo "run_tabby.sh: environment setup failed" >&2; exit 1; }

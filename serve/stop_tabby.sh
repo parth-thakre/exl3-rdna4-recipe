@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stop the TabbyAPI server started from this repo (or from TABBY_TREE), and nothing else.
-# A process counts as ours if it is `python main.py` with its working directory in our TabbyAPI checkout: the PID in
+# A process counts as ours if it is `python main.py` (see is_ours) running in our TabbyAPI checkout: the PID in
 # logs/tabby.pid (TABBY_PIDFILE) is checked that way, and any other such process of this user is stopped too.
 # Waits up to STOP_TIMEOUT seconds (default 60) for each to exit, then sends SIGKILL.
 set -euo pipefail
@@ -8,13 +8,28 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 TABBY_DIR=$(cd "${TABBY_TREE:-${TABBY_DIR:-$ROOT/tabbyAPI}}" 2>/dev/null && pwd -P) || { echo "no TabbyAPI checkout; nothing to stop"; exit 0; }
 PIDFILE=${TABBY_PIDFILE:-$ROOT/logs/tabby.pid}
 timeout=${STOP_TIMEOUT:-60}
+VENV_PY=$(readlink -f "${VENV:-$ROOT/.venv}/bin/python" 2>/dev/null || true)
 
-is_ours() {   # is_ours PID
-    local pid=$1
+# is_ours PID: owned by this user, working directory is our TabbyAPI checkout, and argv is exactly
+# <python> main.py [args...], where <python> is python, python3, python3.N or the venv's python, and main.py is the
+# file in our checkout (given as "main.py" or as a path to it). The cmdline is read as NUL-separated argv, so text
+# inside later arguments can't match.
+is_ours() {
+    local pid=$1 argv=() exe
     [ -r "/proc/$pid/cmdline" ] || return 1
-    [ "$(stat -c %u "/proc/$pid")" = "$(id -u)" ] || return 1
+    [ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$(id -u)" ] || return 1
     [ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" = "$TABBY_DIR" ] || return 1
-    tr '\0' ' ' < "/proc/$pid/cmdline" | grep -qE '(^|/)python[0-9.]* main\.py( |$)'
+    mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+    [ ${#argv[@]} -ge 2 ] || return 1
+    exe=${argv[0]##*/}
+    if ! [[ $exe =~ ^python(3(\.[0-9]+)?)?$ ]]; then
+        [ -n "$VENV_PY" ] && [ "$(readlink -f "${argv[0]}" 2>/dev/null)" = "$VENV_PY" ] || return 1
+    fi
+    case ${argv[1]} in
+        main.py) return 0 ;;
+        */main.py) [ "$(cd "/proc/$pid/cwd" 2>/dev/null && readlink -f "${argv[1]}")" = "$TABBY_DIR/main.py" ] ;;
+        *) return 1 ;;
+    esac
 }
 
 pids=()

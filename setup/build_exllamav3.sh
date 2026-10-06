@@ -1,10 +1,10 @@
 #!/bin/bash
-# Clone ExLlamaV3 at the pinned commit, apply the RDNA4 patch (and, by default, the optional PR #423 patch), build the
-# extension for gfx1201 and install it (editable) into the venv.
+# Clone ExLlamaV3 at the pinned commit, apply the RDNA4 patch (plus, if WITH_PR423=1, the optional PR #423 patch),
+# build the extension for gfx1201 and install it (editable) into the venv.
 #
 # Environment overrides:
 #   EXLLAMAV3_GIT_URL / EXLLAMAV3_COMMIT / EXLLAMAV3_PATCH   see setup/versions.sh (a local mirror works as the URL)
-#   WITH_PR423=0       skip patches/optional/pr423-dflash2-rejection-sampling.patch
+#   WITH_PR423=1       also apply patches/optional/pr423-dflash2-rejection-sampling.patch (off by default; known bugs)
 #   EXLLAMAV3_DIR      checkout location (default: exllamav3/ in the repo root)
 #   RESET=1            discard local changes, other patches and build outputs in EXLLAMAV3_DIR, then patch afresh
 #   VENV               venv to build with and install into (default: .venv/)

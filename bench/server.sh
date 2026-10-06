@@ -4,6 +4,7 @@
 # Settings: TABBY_URL (default http://127.0.0.1:8096/v1), START_TIMEOUT seconds (default 900).
 
 TABBY_URL=${TABBY_URL:-http://127.0.0.1:8096/v1}
+while [[ $TABBY_URL == */ ]]; do TABBY_URL=${TABBY_URL%/}; done   # same as common.py's rstrip("/")
 SERVER_PID=
 
 api_key() {

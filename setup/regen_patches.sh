@@ -39,31 +39,52 @@ base=$1 branch=$2
 # any .hip file, and we warn below if that ever changes.
 excludes=(':(exclude)build' ':(exclude)*.so' ':(exclude)*.o' ':(exclude)*.hip' ':(exclude)**/__pycache__'
           ':(exclude)*.egg-info' ':(exclude)**/__disk_lru_cache__')
+# Check everything before writing anything: the repo, both refs, and the .hip guard
+git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "$repo is not a git checkout" >&2; exit 1; }
+git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null || { echo "unknown BASE: $base" >&2; exit 1; }
 if [ "$branch" = WORKTREE ]; then
     [ "$mode" = diff ] || { echo "WORKTREE only works for a plain diff" >&2; exit 2; }
     range=("$base")
 else
+    git -C "$repo" rev-parse --verify --quiet "$branch^{commit}" >/dev/null || { echo "unknown BRANCH: $branch" >&2; exit 1; }
     range=("$base" "$branch")
 fi
-tracked_hip=$(git -C "$repo" diff --name-only "${range[@]}" -- '*.hip' || true)
+tracked_hip=$(git -C "$repo" diff --name-only "${range[@]}" -- '*.hip')
 [ -z "$tracked_hip" ] || echo "warning: excluded tracked .hip changes: $tracked_hip" >&2
 
+# Generate into a temporary file or directory next to the destination; replace the destination only on success
+tmp=
+trap '[ -n "$tmp" ] && rm -rf "$tmp"' EXIT
 case $mode in
     diff)
-        git -C "$repo" diff "${range[@]}" -- . "${excludes[@]}" > "$out.tmp"
-        mv "$out.tmp" "$out"
+        mkdir -p "$(dirname "$out")"
+        tmp=$(mktemp "$out.XXXXXX")
+        git -C "$repo" diff "${range[@]}" -- . "${excludes[@]}" > "$tmp"
+        [ -s "$tmp" ] || { echo "empty diff for ${range[*]}; not writing $out" >&2; exit 1; }
+        mv "$tmp" "$out"; tmp=
         echo "wrote $out ($(grep -c '^diff --git' "$out") files)"
         git -C "$repo" diff --stat "${range[@]}" -- . "${excludes[@]}" | tail -1
         ;;
     mail)
         mkdir -p "$(dirname "$out")"
-        git -C "$repo" format-patch --stdout --no-signature "$base..$branch" -- . "${excludes[@]}" > "$out.tmp"
-        mv "$out.tmp" "$out"
+        tmp=$(mktemp "$out.XXXXXX")
+        git -C "$repo" format-patch --stdout --no-signature "$base..$branch" -- . "${excludes[@]}" > "$tmp"
+        [ -s "$tmp" ] || { echo "no commits in $base..$branch; not writing $out" >&2; exit 1; }
+        mv "$tmp" "$out"; tmp=
         echo "wrote $out ($(grep -c '^From [0-9a-f]\{40\} ' "$out") commit(s), $(grep -c '^diff --git' "$out") file diffs)"
         ;;
     features)
+        parent=$(dirname "$features_dir")
+        mkdir -p "$parent"
+        tmp=$(mktemp -d "$parent/.features.XXXXXX")
+        git -C "$repo" format-patch -q --no-signature -o "$(cd "$tmp" && pwd)" "$base..$branch" -- . "${excludes[@]}"
+        compgen -G "$tmp/*.patch" >/dev/null || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
+        # Swap in the new set: other files in DIR are kept, old *.patch files are replaced
         mkdir -p "$features_dir"
         rm -f "$features_dir"/*.patch
-        git -C "$repo" format-patch --no-signature -o "$(cd "$features_dir" && pwd)" "$base..$branch" -- . "${excludes[@]}"
+        mv "$tmp"/*.patch "$features_dir"/
+        rm -rf "$tmp"; tmp=
+        echo "wrote $(ls "$features_dir"/*.patch | wc -l) patches to $features_dir:"
+        ls "$features_dir"/*.patch | sed 's#.*/#  #'
         ;;
 esac

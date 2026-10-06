@@ -20,15 +20,28 @@ log=logs/tabby_$label.log
 
 serve/stop_tabby.sh
 # wait for the previous server's VRAM to be released
-for _ in $(seq 1 60); do v=$(vram); [ -n "$v" ] && [ "$v" -lt 1000 ] && break; sleep 1; done
+# (no reading from amd-smi: nothing to wait on)
+for _ in $(seq 1 60); do v=$(vram); { [ -z "$v" ] || [ "$v" -lt 1000 ]; } && break; sleep 1; done
 
+# The model the server will load: --model-name from the arguments (last one wins, "--model-name X" or
+# "--model-name=X"), else model_name in the config of the TabbyAPI checkout the launcher uses
+tabby_tree=${TABBY_TREE:-${TABBY_DIR:-$ROOT/tabbyAPI}}
 model=$(python -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["model"]["model_name"])' \
-        "${TABBY_DIR:-$ROOT/tabbyAPI}/config.yml" 2>/dev/null || true)
-for ((i = 1; i <= $#; i++)); do [ "${!i}" = --model-name ] && { j=$((i + 1)); model=${!j}; }; done
+        "$tabby_tree/config.yml" 2>/dev/null || true)
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+        --model-name=*) model=${args[i]#--model-name=} ;;
+        --model-name) [ $((i + 1)) -lt ${#args[@]} ] || { echo "--model-name needs a value" >&2; exit 2; }
+                      model=${args[i + 1]} ;;
+    esac
+done
 [ -n "$model" ] || { echo "can't tell which model the server will load" >&2; exit 1; }
 
+echo "$label: starting TabbyAPI, expecting model $model"
 if ! start_server "$log" "$model" --max-seq-len $ctx --cache-size $ctx "$@"; then
-    echo "$label: LOAD FAILED: $(grep -oE '(RuntimeError|OutOfMemoryError|Error).*' "$log" | head -1)"
+    err=$(grep -oE '(RuntimeError|OutOfMemoryError|Error).*' "$log" 2>/dev/null | head -1 || true)
+    echo "$label: LOAD FAILED${err:+: $err}"
     exit 1
 fi
 trap 'echo "$label: failed, stopping the server"; stop_server' ERR
