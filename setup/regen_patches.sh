@@ -88,26 +88,43 @@ case $mode in
         # Staging lives inside DIR (same filesystem, so every move is a rename); cleanup is armed before anything
         # is created. The manifests are written before the first move, so rollback works from them and from what
         # is actually on disk, whatever point an interruption lands on.
-        tmp= old= moving= swapped=
+        tmp= old= moving= swapped= rb_complete=
+        # rollback sets rb_complete=1 only if every step is known to have worked; anything uncertain (an unreadable
+        # manifest, a failed lookup or move) leaves files in place and keeps $old with its manifests for recovery
         rollback() {
-            local n
+            local n r
+            rb_complete=1
             [ -n "$moving" ] || return 0   # nothing in DIR has been touched yet
-            while IFS= read -r n; do
-                grep -qxF -- "$n" "$old/.manifest-old" || rm -f -- "$dest/$n"
-            done < "$old/.manifest-new"
-            while IFS= read -r n; do
-                if [ -e "$old/$n" ]; then mv -T -- "$old/$n" "$dest/$n" || echo "could not restore $n; it is in $old" >&2; fi
-            done < "$old/.manifest-old"
+            if [ -r "$old/.manifest-new" ] && [ -r "$old/.manifest-old" ]; then
+                while IFS= read -r n; do
+                    grep -qxF -- "$n" "$old/.manifest-old"; r=$?
+                    if [ "$r" = 1 ]; then rm -f -- "$dest/$n" || rb_complete=
+                    elif [ "$r" != 0 ]; then rb_complete=; fi   # lookup error: don't guess, keep the file
+                done < "$old/.manifest-new" || rb_complete=
+                while IFS= read -r n; do
+                    if [ -e "$old/$n" ]; then mv -T -- "$old/$n" "$dest/$n" || rb_complete=; fi
+                done < "$old/.manifest-old" || rb_complete=
+            else
+                rb_complete=
+            fi
             return 0
         }
         cleanup() {
             # Runs from the EXIT trap: keep the script's exit status, and never stop halfway (no errexit in here)
             local rc=$?
             set +e
+            trap '' INT TERM   # a second interrupt must not cut the restore short
             if [ -n "$old" ]; then
-                [ -n "$swapped" ] || rollback
                 if [ -n "$swapped" ]; then rm -rf -- "$old"
-                else rm -f -- "$old"/.manifest-new "$old"/.manifest-old "$old"/.list.*; rmdir -- "$old" 2>/dev/null; fi
+                else
+                    rollback
+                    if [ -n "$rb_complete" ]; then
+                        rm -f -- "$old"/.manifest-new "$old"/.manifest-old "$old"/.list.*; rmdir -- "$old" 2>/dev/null
+                    else
+                        echo "could not fully restore $features_dir; the original patches and manifests are in $old" >&2
+                        [ "$rc" != 0 ] || rc=1
+                    fi
+                fi
             fi
             [ -z "$tmp" ] || rm -rf -- "$tmp"
             exit "$rc"
