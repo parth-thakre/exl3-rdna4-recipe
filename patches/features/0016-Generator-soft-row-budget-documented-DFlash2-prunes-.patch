@@ -1,7 +1,7 @@
 From 56b5c17edd9a79a6c7283b8be96756facc1393a2 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:25:08 +0530
-Subject: [PATCH 16/17] Generator: soft row budget documented; DFlash2 prunes
+Subject: [PATCH 16/18] Generator: soft row budget documented; DFlash2 prunes
  rows for any short draft
 
 - EXL3_DRAFT_ROW_BUDGET is soft. The one-token floor keeps AR draft-model

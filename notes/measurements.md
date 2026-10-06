@@ -181,7 +181,7 @@ it in VRAM doesn't fit at 128k. Images lower the DFlash2 draft's acceptance rate
 
 ## What the patches do
 
-`patches/exllamav3-rdna4.patch` is the combined patch the build applies; `patches/features/` has the same work as 17
+`patches/exllamav3-rdna4.patch` is the combined patch the build applies; `patches/features/` has the same work as 18
 commits for reading, and `patches/README.md` explains both. The runtime switches are set in `setup/env.sh`.
 
 **gfx12 WMMA multi-row GEMV** (`EXL3_GEMV_WMMA=1`). Speculative decoding verifies 2-8 draft tokens at once, and the
@@ -315,7 +315,7 @@ projections at ~25%. A token takes ~1,250-1,450 kernel launches.
 setup/     versions.sh (pinned commits and patch files), lib.sh, fetch_deps.sh, make_venv.sh, requirements*.txt,
            build_exllamav3.sh, install_tabby.sh, download_models.sh, requant_draft.sh, env.sh, regen_patches.sh
 serve/     run_tabby.sh, run_tabby_long.sh, run_tabby_xl.sh, stop_tabby.sh, config.example.yml, open-webui.md
-patches/   exllamav3-rdna4.patch, features/ (the same as 17 commits), optional/ (PR #423)
+patches/   exllamav3-rdna4.patch, features/ (the same as 18 commits), optional/ (PR #423)
 bench/     speed, context, batching, GPQA and kernel tests (bench/README.md)
 kernels/   standalone HIP experiments: WMMA layout probe, HIP graph repro, hand-written attention
 notes/     measurements.md (this file), research-log.md (the working notes), reviews.md (the code reviews)

@@ -3289,12 +3289,12 @@ index 867f3a5..de6fff5 100644
                      if "capture_sens" in params:
 diff --git a/test_gdn_replay.py b/test_gdn_replay.py
 new file mode 100644
-index 0000000..638e50c
+index 0000000..ed6d6c9
 --- /dev/null
 +++ b/test_gdn_replay.py
 @@ -0,0 +1,645 @@
 +#!/usr/bin/env python3
-+"""GPU-owner A/B test for GDN replay. Do not run alongside another GPU job.
++"""GPU A/B test for GDN replay. Do not run alongside another GPU job.
 +
 +Activate the venv this checkout is built for (in the recipe repo: source setup/env.sh),
 +build this checkout in place, then run this file with that venv's python.
@@ -3847,7 +3847,7 @@ index 0000000..638e50c
 +        if args.graph_reinst is not None:
 +            env["EXL3_GRAPH_REINST"] = str(args.graph_reinst)
 +        env["PYTHONUNBUFFERED"] = "1"
-+        # Run from the checkout, not the workspace's installed editable package.
++        # Run from the checkout, not an installed editable package.
 +        print(f"Starting fresh child for mode {mode}: EXL3_GDN_REPLAY={env['EXL3_GDN_REPLAY']}, "
 +              f"EXL3_BC_GDN_REPLAY={env['EXL3_BC_GDN_REPLAY']}, "
 +              f"EXL3_GRAPH_REINST={env.get('EXL3_GRAPH_REINST', 'default')}", flush=True)
@@ -3940,14 +3940,15 @@ index 0000000..638e50c
 +    raise SystemExit(main())
 diff --git a/test_gemv32.py b/test_gemv32.py
 new file mode 100644
-index 0000000..9966452
+index 0000000..f0449d0
 --- /dev/null
 +++ b/test_gemv32.py
-@@ -0,0 +1,258 @@
-+"""GPU-owner-only test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
+@@ -0,0 +1,259 @@
++"""GPU test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
 +
-+Loads the model and runs GPU kernels; do not run it in a code-only session. Run it with this checkout's
-+extension on PYTHONPATH and env.sh sourced (the script forces EXL3_GEMV_WMMA / _U / _MAX_M per check).
++Loads the model and runs GPU kernels, so run it with nothing else on the GPU. Run it with this checkout's
++extension on PYTHONPATH and the runtime environment set (source setup/env.sh, from the recipe); the script forces
++EXL3_GEMV_WMMA / _U / _MAX_M per check.
 +
 +Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 fc and an MLP):
 +  1. accuracy: rows 2..32 (or --rows), fp16 and fp32 output, U = 1/2/4, against reconstruct_hgemm; the
@@ -4204,11 +4205,11 @@ index 0000000..9966452
 +    main()
 diff --git a/test_greedy_equal.py b/test_greedy_equal.py
 new file mode 100644
-index 0000000..22d33a6
+index 0000000..d9e8f54
 --- /dev/null
 +++ b/test_greedy_equal.py
 @@ -0,0 +1,157 @@
-+"""GPU-owner-only: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
++"""GPU test: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
 +
 +Loads the target + DFlash2 draft like TabbyAPI (Q4 caches, max_history = draft tokens), runs each prompt
 +greedily, and writes the generated token ids to --out. Run it once per checkout (PYTHONPATH selects the tree),
@@ -4216,10 +4217,10 @@ index 0000000..22d33a6
 +PYTHONPATH entry (checked; this script's own directory is dropped from sys.path), and --compare requires
 +both files to hold this script's full prompt set.
 +
-+  source env.sh; export EXL3_GDN_REPLAY=1
-+  PYTHONPATH=$W/wt-dev   python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_dev.json
-+  PYTHONPATH=$W/wt-batch python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_batch.json
-+  python $W/wt-batch/test_greedy_equal.py --compare /tmp/greedy_dev.json /tmp/greedy_batch.json
++  source setup/env.sh (from the recipe); export EXL3_GDN_REPLAY=1
++  PYTHONPATH=/path/to/exllamav3-baseline python test_greedy_equal.py --out /tmp/greedy_baseline.json
++  PYTHONPATH=/path/to/exllamav3-rdna4    python test_greedy_equal.py --out /tmp/greedy_rdna4.json
++  python test_greedy_equal.py --compare /tmp/greedy_baseline.json /tmp/greedy_rdna4.json
 +
 +--bsz N runs the prompts as N concurrent jobs instead of one at a time. A batched verify is not expected to
 +be bit-identical to bs1 (the split-decode attention splits differently at another batch size, so its combine
@@ -4227,8 +4228,8 @@ index 0000000..22d33a6
 +"""
 +import argparse, json, os, sys, time
 +
-+# Python puts this script's directory (the wt-batch checkout) first on sys.path, ahead of PYTHONPATH, so
-+# without this every run would import wt-batch whatever PYTHONPATH says. Drop that entry only: when
++# Python puts this script's directory (the checkout it ships in) first on sys.path, ahead of PYTHONPATH, so
++# without this every run would import that checkout whatever PYTHONPATH says. Drop that entry only: when
 +# PYTHONPATH names this same checkout, its own (later) entry stays
 +_HERE = os.path.dirname(os.path.abspath(__file__))
 +if sys.path and os.path.abspath(sys.path[0] or os.curdir) == _HERE:
@@ -4320,7 +4321,7 @@ index 0000000..22d33a6
 +
 +    prompts = PROMPTS
 +    # The system prompt keeps every prompt above 32 tokens: a 9..32-token prefill now takes the WMMA GEMV
-+    # (rdna4-dev: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
++    # (before the batching series: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
 +    # the same kernels in both trees, so with longer prompts the outputs must match exactly
 +    system = ("Think efficiently. Work through the problem once, carefully. If you notice yourself re-deriving "
 +              "the same result, second-guessing a conclusion you already checked, or cycling between options, "

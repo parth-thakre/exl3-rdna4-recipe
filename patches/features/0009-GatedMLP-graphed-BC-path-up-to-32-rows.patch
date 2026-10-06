@@ -1,7 +1,7 @@
 From 6115431e3f7900df05c52da0b222eca443300936 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:25:05 +0530
-Subject: [PATCH 09/17] GatedMLP: graphed BC path up to 32 rows
+Subject: [PATCH 09/18] GatedMLP: graphed BC path up to 32 rows
 
 BC_GatedMLP::run_bszN took bsz * q_len <= MAX_BSZN (8) rows, so a batched
 verify (2 x 8, 4 x 8) and the DFlash2 draft block at bsz > 1 ran the dense

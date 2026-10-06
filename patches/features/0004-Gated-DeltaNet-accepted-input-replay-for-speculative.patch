@@ -1,7 +1,7 @@
 From a75bbc156380acea726511aadd551343e822e228 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:24 +0530
-Subject: [PATCH 04/17] Gated DeltaNet: accepted-input replay for speculative
+Subject: [PATCH 04/18] Gated DeltaNet: accepted-input replay for speculative
  verify (EXL3_GDN_REPLAY)
 
 Under speculative decoding every GDN layer keeps a recurrent-state and conv

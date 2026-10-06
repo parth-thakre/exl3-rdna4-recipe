@@ -6,9 +6,10 @@ All against ExLlamaV3 `dev` at 0662fac. TabbyAPI needs no patch at 2fd6cc7, whic
 |---|---|---|
 | `exllamav3-rdna4.patch` | always | Everything of ours: `git diff 0662fac rdna4-dev-batch`. |
 | `optional/pr423-dflash2-rejection-sampling.patch` | only with `WITH_PR423=1` (off by default) | Open upstream PR #423 by Rafa (@rafatxf), applied after ours. Has known bugs; not recommended yet. |
-| `features/*.patch` | no | Our work split into its 17 commits, for reading and review. |
+| `features/*.patch` | no | Our work split into its 18 commits, for reading and review. |
 
-The combined patch is the one that's guaranteed: it's what we compile and validate, and it touches only source,
+`rdna4-dev-batch` and `rdna4-dev-pr423` are our local work branches; they aren't published, and these patch files are
+their published form. The combined patch is the one that's guaranteed: it's what we compile and validate, and it touches only source,
 docs and three tests (`test_gdn_replay.py`, `test_gemv32.py`, `test_greedy_equal.py`). The files in `features/` are
 the commits of the `rdna4-dev-batch` branch as
 `git format-patch` output. Applied in order with `git apply` on 0662fac they give the same tree, but we only check
@@ -31,6 +32,11 @@ that for the combined patch.
      short drafts.
    - `0011`, `0017`: `test_gemv32.py` and `test_greedy_equal.py`.
    - `0013`: docs.
+7. `0018`: docstring and comment wording in the tests (no code change).
+
+The commit messages and the intermediate diffs in `features/` are our work history as it happened, so they mention
+local work branches and checkout names (`wt-tree`, `wt-dev`, `$W/...`); `0018` replaces the ones that ended up in the
+test files' docstrings. They don't affect the combined patch.
 
 The fixes from the code reviews (`notes/reviews.md`) are folded into these commits.
 

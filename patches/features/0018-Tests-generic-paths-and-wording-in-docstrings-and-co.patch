@@ -1,0 +1,99 @@
+From 604bc894d3357bba8063e766a23ee2ffc49ebb4f Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 15:30:10 +0530
+Subject: [PATCH 18/18] Tests: generic paths and wording in docstrings and
+ comments
+
+Docstring/comment-only: replace local checkout names and workspace paths
+with generic ones (/path/to/exllamav3-baseline, /path/to/exllamav3-rdna4,
+source setup/env.sh from the recipe) and drop internal jargon. No code
+lines change (checked: identical ASTs apart from docstrings).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ test_gdn_replay.py   |  4 ++--
+ test_gemv32.py       |  7 ++++---
+ test_greedy_equal.py | 16 ++++++++--------
+ 3 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/test_gdn_replay.py b/test_gdn_replay.py
+index 638e50c..ed6d6c9 100644
+--- a/test_gdn_replay.py
++++ b/test_gdn_replay.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""GPU-owner A/B test for GDN replay. Do not run alongside another GPU job.
++"""GPU A/B test for GDN replay. Do not run alongside another GPU job.
+ 
+ Activate the venv this checkout is built for (in the recipe repo: source setup/env.sh),
+ build this checkout in place, then run this file with that venv's python.
+@@ -552,7 +552,7 @@ def parent_main(args):
+         if args.graph_reinst is not None:
+             env["EXL3_GRAPH_REINST"] = str(args.graph_reinst)
+         env["PYTHONUNBUFFERED"] = "1"
+-        # Run from the checkout, not the workspace's installed editable package.
++        # Run from the checkout, not an installed editable package.
+         print(f"Starting fresh child for mode {mode}: EXL3_GDN_REPLAY={env['EXL3_GDN_REPLAY']}, "
+               f"EXL3_BC_GDN_REPLAY={env['EXL3_BC_GDN_REPLAY']}, "
+               f"EXL3_GRAPH_REINST={env.get('EXL3_GRAPH_REINST', 'default')}", flush=True)
+diff --git a/test_gemv32.py b/test_gemv32.py
+index 9966452..f0449d0 100644
+--- a/test_gemv32.py
++++ b/test_gemv32.py
+@@ -1,7 +1,8 @@
+-"""GPU-owner-only test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
++"""GPU test: gfx12 WMMA multi-row GEMV at rows 2..32 against reconstruct + hgemm.
+ 
+-Loads the model and runs GPU kernels; do not run it in a code-only session. Run it with this checkout's
+-extension on PYTHONPATH and env.sh sourced (the script forces EXL3_GEMV_WMMA / _U / _MAX_M per check).
++Loads the model and runs GPU kernels, so run it with nothing else on the GPU. Run it with this checkout's
++extension on PYTHONPATH and the runtime environment set (source setup/env.sh, from the recipe); the script forces
++EXL3_GEMV_WMMA / _U / _MAX_M per check.
+ 
+ Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 fc and an MLP):
+   1. accuracy: rows 2..32 (or --rows), fp16 and fp32 output, U = 1/2/4, against reconstruct_hgemm; the
+diff --git a/test_greedy_equal.py b/test_greedy_equal.py
+index 22d33a6..d9e8f54 100644
+--- a/test_greedy_equal.py
++++ b/test_greedy_equal.py
+@@ -1,4 +1,4 @@
+-"""GPU-owner-only: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
++"""GPU test: greedy DFlash2 output of one checkout, saved for an exact comparison against another.
+ 
+ Loads the target + DFlash2 draft like TabbyAPI (Q4 caches, max_history = draft tokens), runs each prompt
+ greedily, and writes the generated token ids to --out. Run it once per checkout (PYTHONPATH selects the tree),
+@@ -6,10 +6,10 @@ then --compare the two files: every prompt must match token for token. exllamav3
+ PYTHONPATH entry (checked; this script's own directory is dropped from sys.path), and --compare requires
+ both files to hold this script's full prompt set.
+ 
+-  source env.sh; export EXL3_GDN_REPLAY=1
+-  PYTHONPATH=$W/wt-dev   python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_dev.json
+-  PYTHONPATH=$W/wt-batch python $W/wt-batch/test_greedy_equal.py --out /tmp/greedy_batch.json
+-  python $W/wt-batch/test_greedy_equal.py --compare /tmp/greedy_dev.json /tmp/greedy_batch.json
++  source setup/env.sh (from the recipe); export EXL3_GDN_REPLAY=1
++  PYTHONPATH=/path/to/exllamav3-baseline python test_greedy_equal.py --out /tmp/greedy_baseline.json
++  PYTHONPATH=/path/to/exllamav3-rdna4    python test_greedy_equal.py --out /tmp/greedy_rdna4.json
++  python test_greedy_equal.py --compare /tmp/greedy_baseline.json /tmp/greedy_rdna4.json
+ 
+ --bsz N runs the prompts as N concurrent jobs instead of one at a time. A batched verify is not expected to
+ be bit-identical to bs1 (the split-decode attention splits differently at another batch size, so its combine
+@@ -17,8 +17,8 @@ rounds differently), so compare a batched file against a bs1 file for the common
+ """
+ import argparse, json, os, sys, time
+ 
+-# Python puts this script's directory (the wt-batch checkout) first on sys.path, ahead of PYTHONPATH, so
+-# without this every run would import wt-batch whatever PYTHONPATH says. Drop that entry only: when
++# Python puts this script's directory (the checkout it ships in) first on sys.path, ahead of PYTHONPATH, so
++# without this every run would import that checkout whatever PYTHONPATH says. Drop that entry only: when
+ # PYTHONPATH names this same checkout, its own (later) entry stays
+ _HERE = os.path.dirname(os.path.abspath(__file__))
+ if sys.path and os.path.abspath(sys.path[0] or os.curdir) == _HERE:
+@@ -110,7 +110,7 @@ def main():
+ 
+     prompts = PROMPTS
+     # The system prompt keeps every prompt above 32 tokens: a 9..32-token prefill now takes the WMMA GEMV
+-    # (rdna4-dev: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
++    # (before the batching series: the cooperative GEMM), which rounds differently by design. Decode / verify at bs1 (8 rows) runs
+     # the same kernels in both trees, so with longer prompts the outputs must match exactly
+     system = ("Think efficiently. Work through the problem once, carefully. If you notice yourself re-deriving "
+               "the same result, second-guessing a conclusion you already checked, or cycling between options, "
