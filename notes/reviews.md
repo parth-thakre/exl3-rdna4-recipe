@@ -61,8 +61,8 @@ test-only: the tests don't check which native extension build was loaded (they i
 replay determinism on the same path is no longer asserted.
 
 GPU validation: bs1 greedy output identical to the series' base; bs2 and bs4 batched outputs identical to bs1 over 400
-tokens; a 120k fill with 4 slots peaks at 16.13 GB; through TabbyAPI 132 tok/s for one request and 244 tok/s combined
-for 4 concurrent requests over a common window (282.8 in the generator alone).
+tokens; a 120k fill with 4 slots peaks at 16.13 GB; through TabbyAPI, 131-132 tok/s for one request and ~240-245 tok/s
+combined for 4 concurrent requests over a common window. Generator-only (no API): 282.8 tok/s at 4 at once.
 
 ## Review of upstream PR #423 (DFlash2 rejection sampling), 2026-10-06
 

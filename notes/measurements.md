@@ -73,7 +73,7 @@ figure.
 
 | Setup | Per-request mean rate, tok/s | Combined, tok/s |
 |---|---|---|
-| 1 request alone | 131-132 | 131-132 |
+| 1 request alone | 131-132 | ~128 (400 tokens in 3.119 s) |
 | 2 at once | 118, 83 | 161 (800 tokens in 5.0 s) |
 | 3 at once (two runs) | 90, 94, 68 / 90, 68, 95 | 194, 199 (1,200 tokens in 6.2 / 6.0 s) |
 | 4 at once (three runs) | 88, 84, 69, 62 / 66, 83, 62, 89 / 62, 87, 84, 69 | 244, 240, 245 (1,600 tokens in 6.5-6.7 s) |
@@ -81,10 +81,12 @@ figure.
 | Before the batching series, 2 at once with a 3-token draft | 58, 65 | 107 (800 tokens in 7.5 s) |
 | `EXL3_DRAFT_ROW_BUDGET=16` / `24`, 4 at once | 52, 50, 54, 73 / 58, 50, 59, 55 | 196 / 194 (1,600 tokens in 8.2 s) |
 
-The generator alone (`bench/bench_batch_sanity.py`, no server, common window): 188.0 tok/s at 2 at once (800 tokens
-in 4.3 s) and 282.8 at 4 (1,600 tokens in 5.7 s), against 130.3 tok/s for the same prompts one at a time. The gap to
-the API figures is request handling and prefill. Through the API, 4 at once is about 240-280 tok/s combined depending
-on how much of that overhead a window includes.
+Through the API, 4 at once is ~240-245 tok/s combined (239.6 / 243.6 / 244.6 across the three runs).
+
+Generator-only (no API), a separate measurement that should not be compared with the table:
+`bench/bench_batch_sanity.py` loads the model directly and times the same prompts over a common window. It gave
+188.0 tok/s at 2 at once (800 tokens in 4.3 s) and 282.8 at 4 (1,600 tokens in 5.7 s), against 130.3 tok/s for
+the same prompts one at a time. These leave out request handling.
 
 Before the series, a batched verify of 2 x 8 or 4 x 8 rows fell off the 8-row WMMA GEMV onto a slow fallback, so
 batching gave almost nothing. The 3-token-draft run (2 x 4 = 8 rows) is the diagnostic that showed it. The series
@@ -107,8 +109,9 @@ failed with 415 MB reserved but unallocated, which is fragmentation. With `PYTOR
 tools, context with the 106,294-token prompt recalled, speed) passed at 3 slots (peak 16.17 GB) and at 4 slots (peak
 16.28 of 16.3 GB). The config defaults to 3 slots (`max_batch_size: 3`) for the extra headroom.
 
-`EXL3_DRAFT_ROW_BUDGET` (shorter drafts when many requests are active, to stay within 16 or 24 rows) is in the patch
-but off: it was slower in every test (196 / 194 vs 244 tok/s at 4 at once).
+`EXL3_DRAFT_ROW_BUDGET` (shorter drafts when many requests are active, to stay within 16 or 24 rows) is an
+experimental setting, off by default, that didn't help: through the API it was slower in every test (196 / 194 vs
+~240-245 tok/s at 4 at once). 4 requests at once is the largest batch we document and test.
 
 ### Decode speed through the API
 
@@ -242,8 +245,8 @@ TensorFold.
 **Batching series.** The gfx12 WMMA GEMV runs 16 and 32 rows (two M tiles), so a batched verify of up to 4 requests
 x 8 rows stays on the fast kernel; the GatedMLP runs as a captured graph up to 32 rows, with graphs keyed by row count
 and output dtype; LoRA adapters and per-projection controls take the unfused path; DFlash2 skips the head and selector
-rows a short draft doesn't use. Effect: 4 requests at once go from 61 to about 244 tok/s combined through the API
-(282.8 in the generator alone; see Batching above).
+rows a short draft doesn't use. Effect, through the API: 4 requests at once go from 61 to ~240-245 tok/s combined
+(see Batching above).
 `EXL3_DRAFT_ROW_BUDGET` is included but off by default because it was slower.
 
 **Optional, not recommended yet: PR #423, DFlash2 rejection sampling** (by Rafa,
@@ -294,7 +297,7 @@ projections at ~25%. A token takes ~1,250-1,450 kernel launches.
 - A sequential draft-tree fallback, same bench: slower, 118.7 code and 54.2 prose. A real one-pass tree needs
   tree-masked attention and branched DeltaNet state.
 - `EXL3_DRAFT_ROW_BUDGET` (shorter drafts when many requests are active): 194-196 tok/s combined at 4 requests vs
-  244 without it. It's in the patch, off by default.
+  ~240-245 without it. It's in the patch as an experimental setting, off by default.
 - TensorFold itself has no working AMD path (its PR144 gives NaN logits on gfx1201). We ported the replay idea instead.
 - 2.5 bpw to free memory: costs too much accuracy (above).
 

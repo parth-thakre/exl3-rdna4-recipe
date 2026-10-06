@@ -1,9 +1,22 @@
 # Qwen3.8-27B on a 16 GB RX 9070 XT: ExLlamaV3 + TabbyAPI
 
-Run Qwen3.8-27B (EXL3, 3.0 bpw) on an AMD RX 9070 XT or RX 9070 under Linux, as an OpenAI-compatible server with a
-128k context, several chats at once and image input. It uses upstream
-[ExLlamaV3](https://github.com/turboderp-org/exllamav3) and [TabbyAPI](https://github.com/theroyallab/tabbyAPI) with
-our RDNA4 patches on top, and a DFlash2 draft model for speculative decoding.
+Run Qwen3.8-27B (EXL3, 3.0 bpw) on an AMD RX 9070 XT or RX 9070 under Linux as a local OpenAI-compatible server for
+coding agents and chat. It uses upstream [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and
+[TabbyAPI](https://github.com/theroyallab/tabbyAPI) with our RDNA4 patches on top, and a DFlash2 draft model for
+speculative decoding.
+
+## What you get
+
+- **Code, one request:** ~130 tok/s at short context, ~100 tok/s at 120k.
+- **Prose and conversation** (sampled, temperature ~0.8): ~55-65 tok/s; the draft is accepted less often on prose.
+- **128k-token context.** Prompt processing runs at about 1,300 tok/s for short prompts and 900 at 128k, so a full
+  128k prompt takes about 2.5 minutes before the first token.
+- **Tool calling and image input** work through the OpenAI API. Chats with images decode roughly 10-25% slower.
+- **Several requests:** handles up to 4 requests at once (e.g. agent subagents or parallel tool calls) instead of
+  queuing them; 3 by default (`max_batch_size` in `tabbyAPI/config.yml`); they share the 128k context.
+- **Setup:** a handful of scripts, below.
+
+Speeds are typical for an RX 9070 XT and depend on the content.
 
 This is an independent project, not affiliated with or endorsed by ExLlamaV3, TabbyAPI, DFlash2 or Qwen. It has been
 tested on one machine:
@@ -19,26 +32,13 @@ tested on one machine:
 
 - **WMMA GEMV for draft verification (gfx12):** checking 8 drafted tokens costs about 1.16x one normal decode step
   (was 1.55x), so speculative decoding pays off.
-- **Batching up to 32 rows:** 4 chats at once decode at about 240-280 tok/s combined, where they managed ~60 before.
+- **Batched verification up to 32 rows:** the WMMA GEMV and a graph-captured MLP keep 16- and 32-row verify batches
+  on the fast path.
 - **Attention tuned for Qwen's grouped heads, plus a 4-bit cache kernel:** faster decode at long context.
 - **DeltaNet replay:** about 1 GB less VRAM, which is what makes 128k fit next to the draft model.
 - **HIP graph re-instantiation:** fixes a crash after about an hour of serving, so HIP graphs can stay on.
 - **3.0 bpw DFlash2 draft (requant script):** 0.5 GB smaller than the 5.0 bpw quant, same speed.
 - **Setup scripts:** pinned versions, missing headers fetched without sudo, one command each to build and serve.
-
-## Expected speed
-
-Typical ranges on an RX 9070 XT; they depend on the content.
-
-| Workload | Speed |
-|---|---|
-| One chat, code | ~130 tok/s at short context, falling to ~100 at 120k |
-| One chat, prose or conversation (sampled, temperature ~0.8) | ~55-65 tok/s (the draft is accepted less often on prose) |
-| With images | roughly 10-25% slower than the same chat as text |
-| Several chats at once, code | 3 at once about 195-200 tok/s combined; 4 at once about 240-280 (60-90 each); prose is lower |
-
-Prompt processing runs at about 1,300 tok/s for short prompts and 900 at 128k, so a full 128k prompt takes about
-2.5 minutes before the first token.
 
 ## Requirements
 
@@ -81,10 +81,9 @@ curl -s http://127.0.0.1:8096/v1/chat/completions -H "Authorization: Bearer $KEY
   -d '{"model": "x", "messages": [{"role": "user", "content": "Write a haiku about VRAM."}], "max_tokens": 400}'
 ```
 
-Settings live in `tabbyAPI/config.yml` (copied from `serve/config.example.yml`). Up to 3 chats run at once
-(`max_batch_size: 3`); 4 also works, with less memory headroom. All chats share one 128k-token cache pool; it's not
-128k each. The server only listens on 127.0.0.1; to use it from other devices over Tailscale, set `network.host` to
-the machine's Tailscale IP. `serve/open-webui.md` sets up a chat UI.
+Settings live in `tabbyAPI/config.yml` (copied from `serve/config.example.yml`). The server only listens on
+127.0.0.1; to use it from other devices over Tailscale, set `network.host` to the machine's Tailscale IP.
+`serve/open-webui.md` sets up a chat UI.
 
 Two other profiles use the model's built-in MTP head instead of the draft model: `serve/run_tabby_long.sh` (128k, no
 draft model needed) and `serve/run_tabby_xl.sh` (160k, needs the whole GPU). Both are slower than the default.
