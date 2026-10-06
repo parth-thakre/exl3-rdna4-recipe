@@ -3,8 +3,9 @@
 Two review rounds by a second model (Sol, GPT-6.1 at high effort) on the exllamav3 changes. d6a4353 and 70ba2c2 are
 local work commits, not upstream ones; file:line references point into those trees.
 
-All six items of the first review are fixed in `patches/features/exllamav3-review-fixes.patch`. The five items of the
-second review are fixed in the DeltaNet replay patch: abandoned caches hand their pending records back on eviction,
+All six items of the first review were fixed in a review-fixes commit on the old base; in the port to 0662fac those
+fixes are folded into the commits in `patches/features/`. The five items of the second review are fixed in the
+DeltaNet replay commit: abandoned caches hand their pending records back on eviction,
 rewind validates every layer before consuming anything and marks failed commits, recording storage uses bounded
 power-of-two row buckets, the test counts real captured-graph launches, and `batched_gdn_replay` checks head counts
 before using them. Both are in the combined patch.

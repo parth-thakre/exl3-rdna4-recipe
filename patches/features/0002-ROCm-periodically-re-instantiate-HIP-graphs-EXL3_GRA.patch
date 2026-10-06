@@ -1,3 +1,47 @@
+From 9f91c4ccd153dcb5abe497f79d9293245c903b9d Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 11:55:03 +0530
+Subject: [PATCH 2/6] ROCm: periodically re-instantiate HIP graphs
+ (EXL3_GRAPH_REINST)
+
+hipGraphExecKernelNodeSetParams draws on a fixed per-exec kernel-argument
+pool that is never reclaimed: after about 1.6M updates the next one segfaults
+inside libamdhip64 (reproduced standalone on ROCm 7.2 / gfx1201; matches
+ROCm/rocm-systems#10713). With graph-captured decode that is about an hour of
+serving.
+
+Graph::launch now counts node parameter updates and, once it reaches
+EXL3_GRAPH_REINST (default 100000, 0 disables), synchronizes the stream,
+re-instantiates graph_exec and marks every node with a patch site for update,
+so the current node_params are applied again. ROCm builds only. Output is
+byte-identical even when re-instantiating every 1,000 updates.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                   |  8 ++++++++
+ exllamav3/exllamav3_ext/graph.cu  | 25 +++++++++++++++++++++++++
+ exllamav3/exllamav3_ext/graph.cuh |  2 ++
+ 3 files changed, 35 insertions(+)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index 47e8f7d..e203023 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -37,6 +37,14 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)
+ the regular dispatch path by design. Unexpected errors while building the path are raised, not
+ swallowed. Set to `0` to disable the path entirely.
+ 
++### `EXL3_GRAPH_REINST` (ROCm; default: `100000`)
++
++HIP keeps a fixed pool of kernel-argument space per instantiated graph and does not reclaim it
++on `hipGraphExecKernelNodeSetParams`: after about 1.6M parameter updates (around an hour of
++serving with graph-captured decode) the next update segfaults inside libamdhip64. A graph is
++therefore re-instantiated once it has taken this many node parameter updates, and its patched
++nodes are set again from their current values. `0` disables. No effect on CUDA builds.
++
+ ### `EXL3_BC_ATTN_TRACE` (default: `0`)
+ 
+ Print one line per attention module/cache-layer pair when the graph-captured decode path is
 diff --git a/exllamav3/exllamav3_ext/graph.cu b/exllamav3/exllamav3_ext/graph.cu
 index c16fec7..fb26172 100644
 --- a/exllamav3/exllamav3_ext/graph.cu

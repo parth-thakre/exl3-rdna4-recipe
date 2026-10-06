@@ -21,7 +21,25 @@ VARIANTS = {
 name = sys.argv[1]
 v = VARIANTS[name]
 out_path = os.path.join(GPQA_DIR, f"overthink_{name}.jsonl")
-done = {json.loads(l)["idx"] for l in open(out_path)} if os.path.exists(out_path) else set()
+def load_done():
+    # A crash mid-write can leave a torn last line: skip it (that question is asked again) and terminate it
+    # so the next record starts on its own line
+    if not os.path.exists(out_path):
+        return set()
+    if os.path.getsize(out_path):
+        with open(out_path, "rb+") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+    idx = set()
+    for line in open(out_path):
+        try:
+            idx.add(json.loads(line)["idx"])
+        except (json.JSONDecodeError, KeyError):
+            pass
+    return idx
+
+done = load_done()
 rows = list(csv.DictReader(open(os.path.join(GPQA_DIR, "gpqa_diamond.csv"))))
 
 # identical to gpqa_eval.py

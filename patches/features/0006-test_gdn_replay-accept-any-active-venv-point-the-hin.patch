@@ -1,0 +1,73 @@
+From 4cbf7faaff3aeb4cbb6ea8b9965c0b5663ccb45b Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 12:30:05 +0530
+Subject: [PATCH 6/6] test_gdn_replay: accept any active venv, point the hint
+ at setup/env.sh
+
+The check required the original workspace venv and its deps path. It now
+accepts whichever venv is active (as long as this python belongs to it),
+a single HIP_VISIBLE_DEVICES index, and any include dir with Python.h
+(system python3.12-devel or the recipe's unpacked copy on CPATH).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ test_gdn_replay.py | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/test_gdn_replay.py b/test_gdn_replay.py
+index d81f3df..638e50c 100644
+--- a/test_gdn_replay.py
++++ b/test_gdn_replay.py
+@@ -1,7 +1,8 @@
+ #!/usr/bin/env python3
+ """GPU-owner A/B test for GDN replay. Do not run alongside another GPU job.
+ 
+-Source the workspace env.sh, build/install this checkout, then run this file.
++Activate the venv this checkout is built for (in the recipe repo: source setup/env.sh),
++build this checkout in place, then run this file with that venv's python.
+ The parent imports only the standard library. Each replay mode loads both models
+ in a fresh child, so EXL3_GDN_REPLAY is set before torch/exllamav3 imports.
+ Mode 0 is history slots, mode 1 is replay with BC-graph verification and the batched
+@@ -23,6 +24,7 @@ import os
+ from pathlib import Path
+ import subprocess
+ import sys
++import sysconfig
+ import time
+ import traceback
+ 
+@@ -106,15 +108,26 @@ def parse_args():
+ 
+ 
+ def check_environment(args):
+-    expected_venv = WORKSPACE / "exllamav3-rocm/.venv-rocm"
++    # Any activated venv works; it must be the interpreter running this file, so the
++    # children (started with sys.executable) see the same torch and exllamav3.
+     activated = os.environ.get("VIRTUAL_ENV")
+-    if not activated or Path(activated).resolve() != expected_venv.resolve() or Path(sys.prefix).resolve() != expected_venv.resolve():
+-        raise RuntimeError(f"Source {WORKSPACE / 'env.sh'} and use its python interpreter before running this test")
+-    if os.environ.get("HIP_VISIBLE_DEVICES") != "0":
+-        raise RuntimeError("Require HIP_VISIBLE_DEVICES=0 exactly; do not expose the iGPU")
+-    headers = str(WORKSPACE / "deps/usr/include/python3.12")
+-    if os.environ.get("ROCM_HOME") != "/usr" or os.environ.get("ROCM_PATH") != "/usr" or headers not in os.environ.get("CPATH", "").split(os.pathsep):
+-        raise RuntimeError(f"Runtime environment is incomplete; source {WORKSPACE / 'env.sh'}")
++    hint = ("Activate the venv this checkout is built for (in the recipe repo: source setup/env.sh) "
++            "and run this file with its python")
++    if not activated:
++        raise RuntimeError(f"No virtual environment is active. {hint}")
++    if Path(sys.prefix).resolve() != Path(activated).resolve():
++        raise RuntimeError(f"Running {sys.executable}, not the python of the active venv {activated}. {hint}")
++    visible = os.environ.get("HIP_VISIBLE_DEVICES", "")
++    if not visible.isdigit():
++        raise RuntimeError("Set HIP_VISIBLE_DEVICES to the single index of the RDNA4 GPU (setup/env.sh uses 0); "
++                           "do not expose an iGPU")
++    if not os.environ.get("ROCM_HOME") or not os.environ.get("ROCM_PATH"):
++        raise RuntimeError(f"ROCM_HOME and ROCM_PATH are unset. {hint}")
++    # Triton compiles a small C helper at runtime and needs Python.h: either the system
++    # python3.12-devel headers or the unpacked copy that the recipe puts on CPATH.
++    include_dirs = [sysconfig.get_paths()["include"]] + [d for d in os.environ.get("CPATH", "").split(os.pathsep) if d]
++    if not any((Path(d) / "Python.h").is_file() for d in include_dirs):
++        raise RuntimeError(f"Python.h not found in {include_dirs}; install python3.12-devel or put its headers on CPATH. {hint}")
+     if not args.state_check_only:
+         for directory in (args.model, args.draft):
+             if not (directory / "config.json").is_file():

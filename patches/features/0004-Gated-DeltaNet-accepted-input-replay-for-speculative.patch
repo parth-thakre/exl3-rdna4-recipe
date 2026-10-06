@@ -1,8 +1,58 @@
+From a75bbc156380acea726511aadd551343e822e228 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 11:55:24 +0530
+Subject: [PATCH 4/6] Gated DeltaNet: accepted-input replay for speculative
+ verify (EXL3_GDN_REPLAY)
+
+Under speculative decoding every GDN layer keeps a recurrent-state and conv
+snapshot per draft token (about 0.15 GB per draft token on a 48-layer model)
+so a rejection can rewind. With EXL3_GDN_REPLAY=1 the verify forward reads the
+committed state without writing it (save_state=false in the conv update and
+the recurrent scan), keeps the small post-projection inputs (conv input,
+post-conv qkv, beta, g), and the rewind replays only the accepted prefix.
+The resulting state is bit-identical to the history path; Mamba2 layers keep
+their history. -1.06 GB VRAM on Qwen3.8-27B with a 7-token DFlash2 draft.
+
+- Graph-captured verify (EXL3_BC_GDN_REPLAY, default 1 under replay):
+  BC_GatedDeltaNetSplit gets a third slot set (replay), whose mixed_qkv /
+  conv_out / beta / g statics are the record. They view per-layer
+  GDNReplayStorage buckets of power-of-two row counts, never reallocated, so
+  captured graphs and cached replay jobs stay valid. evict() copies any record
+  still pending in the storage (another cache, an abandoned verify) into a
+  private eager record before the next verify overwrites it.
+- batched_gdn_replay commits the accepted prefix of every layer in two
+  launches per rewind (recurrent state, conv window), grouped by device and
+  geometry. EXL3_BC_GDN_REPLAY=0 verifies eagerly and replays per layer.
+- Two-phase rewind: every layer's record is validated and planned before
+  anything runs; a commit that raises marks its records failed, so a retry
+  refuses instead of advancing the state twice.
+- Records die with their slot: Cache.release_state / reset and detach
+  discard them (on every TP worker too), as do clear, unstash and free.
+  Checkpointing a slot with an unresolved verify asserts.
+- Generator: a fully accepted row that finished on EOS does not commit (its
+  state is released right after).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                               |  16 +
+ exllamav3/cache/cache.py                      |  22 +-
+ exllamav3/exllamav3_ext/bindings.cpp          |  16 +-
+ exllamav3/exllamav3_ext/gdn.cu                | 356 +++++++++++++---
+ exllamav3/exllamav3_ext/gdn.cuh               |  53 ++-
+ .../libtorch/gated_delta_net.cpp              |  39 +-
+ .../exllamav3_ext/libtorch/gated_delta_net.h  |  25 +-
+ .../libtorch/gated_delta_net_bc.h             |  24 +-
+ exllamav3/generator/generator.py              |   7 +-
+ exllamav3/modules/gated_delta_net.py          | 389 ++++++++++++++++--
+ .../modules/gated_delta_net_fn/conv1d.py      |   3 +-
+ .../gated_delta_net_fn/gated_delta_rule.py    |  14 +-
+ 12 files changed, 838 insertions(+), 126 deletions(-)
+
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 7d6a775..24cd7b2 100644
+index a6ea9bc..974885c 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
-@@ -85,6 +85,22 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
+@@ -145,6 +145,22 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
  the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
  force the torch path, for A/B testing.
  
@@ -76,10 +126,10 @@ index 3589188..2c82243 100644
  
  
 diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
-index b7a8fb5..44fbcde 100644
+index fa90a1b..b6a3755 100644
 --- a/exllamav3/exllamav3_ext/bindings.cpp
 +++ b/exllamav3/exllamav3_ext/bindings.cpp
-@@ -232,10 +232,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+@@ -230,10 +230,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
  
      m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
      m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
@@ -98,7 +148,7 @@ index b7a8fb5..44fbcde 100644
      m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
      m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
          { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
-@@ -252,6 +258,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+@@ -250,6 +256,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
          .def(py::init<uintptr_t, uintptr_t, int64_t>());
      m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
      m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
@@ -1033,10 +1083,10 @@ index 2041610..2e7fdf6 100644
      py::arg("ptrs_trellis"),
      py::arg("ptrs_suh"),
 diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
-index f6e669c..a0f8544 100644
+index 9fb4b52..aec4981 100644
 --- a/exllamav3/generator/generator.py
 +++ b/exllamav3/generator/generator.py
-@@ -1267,9 +1267,12 @@ class Generator:
+@@ -1293,9 +1293,12 @@ class Generator:
                              job.prepare_logit_mask()
                              job.prepare_sampling_past_ids()
  
@@ -1052,10 +1102,10 @@ index f6e669c..a0f8544 100644
                  # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
                  # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
 diff --git a/exllamav3/modules/gated_delta_net.py b/exllamav3/modules/gated_delta_net.py
-index f61698a..e2e5df2 100644
+index b885700..23d8b11 100644
 --- a/exllamav3/modules/gated_delta_net.py
 +++ b/exllamav3/modules/gated_delta_net.py
-@@ -12,14 +12,21 @@ from ..cache import Cache
+@@ -13,14 +13,21 @@ from ..cache import Cache
  from ..util.tensor import g_tensor_cache
  from .multilinear import SlicedMultiLinear
  import os
@@ -1065,7 +1115,7 @@ index f61698a..e2e5df2 100644
  # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
  # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
  # the cooperative GEMM)
- _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "0" if torch.version.hip else "1") != "0"
+ _qkv_slice_enable = QKV_SLICE
 +# Accepted-input replay keeps only the committed state and the small verification inputs.
 +_gdn_replay_enable = os.environ.get("EXL3_GDN_REPLAY", "0") == "1"
  # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
@@ -1077,7 +1127,7 @@ index f61698a..e2e5df2 100644
  # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
  # EXL3_GDN_PROJ_FP32=1 restores fp32
  _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
-@@ -48,10 +55,21 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+@@ -49,10 +56,21 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
      launching them all under one device index dereferences foreign pointers (illegal memory
      access on any multi-GPU split). Only GDNLayerState instances (GDN and Mamba2 alike) are
      batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
@@ -1101,7 +1151,7 @@ index f61698a..e2e5df2 100644
              # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
              # torch.device, so normalize rather than assume a .index attribute
              device_index = torch.device(l.device).index
-@@ -64,15 +82,35 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
+@@ -65,15 +83,35 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
                  state_jobs.append(sj)
          else:
              l.rewind(slot, last_history, num_tokens)
@@ -1139,7 +1189,7 @@ index f61698a..e2e5df2 100644
  
  
  def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
-@@ -81,8 +119,103 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
+@@ -82,8 +120,103 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
      _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
  
  
@@ -1243,7 +1293,7 @@ index f61698a..e2e5df2 100644
      def __init__(
          self,
          cache: Cache,
-@@ -124,6 +257,8 @@ class GDNState:
+@@ -125,6 +258,8 @@ class GDNState:
  
  
      def rewind(self, num_tokens: int):
@@ -1252,7 +1302,7 @@ index f61698a..e2e5df2 100644
          if not self.cache.model.loaded_tp:
              _dispatch_rewind_jobs(_collect_rewind_jobs(
                  self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
-@@ -192,13 +327,21 @@ class GDNLayerState:
+@@ -193,13 +328,21 @@ class GDNLayerState:
          cache_id: int,
      ):
          self.module = module
@@ -1276,7 +1326,7 @@ index f61698a..e2e5df2 100644
              dtype = torch.float,
              device = "meta"
          )
-@@ -225,15 +368,26 @@ class GDNLayerState:
+@@ -226,15 +369,26 @@ class GDNLayerState:
          self.conv_state.zero_()
          self.recurrent_state.zero_()
          self.device = device
@@ -1303,7 +1353,7 @@ index f61698a..e2e5df2 100644
          if self.device is not None:
              self.conv_state[idx].zero_()
              self.recurrent_state[idx].zero_()
-@@ -246,7 +400,134 @@ class GDNLayerState:
+@@ -247,7 +401,134 @@ class GDNLayerState:
          )
  
  
@@ -1438,7 +1488,7 @@ index f61698a..e2e5df2 100644
          assert num_tokens <= last_history
          if num_tokens > 0:
              r_state = self.recurrent_state[slot, 0]
-@@ -299,6 +580,7 @@ class GDNLayerState:
+@@ -300,6 +581,7 @@ class GDNLayerState:
  
  
      def stash(self, slot, position: int = 0):
@@ -1446,7 +1496,7 @@ index f61698a..e2e5df2 100644
          cdim = self.module.conv_kernel_size
          return (
              host_copy(self.recurrent_state[slot, :1]),
-@@ -307,6 +589,7 @@ class GDNLayerState:
+@@ -308,6 +590,7 @@ class GDNLayerState:
  
  
      def unstash(self, slot, stashed, position: int = 0):
@@ -1454,7 +1504,7 @@ index f61698a..e2e5df2 100644
          cdim = self.module.conv_kernel_size
          s, c = stashed
          self.recurrent_state[slot, :1].copy_(s)
-@@ -596,6 +879,8 @@ class GatedDeltaNet(Module):
+@@ -597,6 +880,8 @@ class GatedDeltaNet(Module):
  
          self.bc = None
          self.bc_split = False
@@ -1463,7 +1513,7 @@ index f61698a..e2e5df2 100644
          self.bsz1_pa_args = []
          self.ba_weight_t = None
          self.ba_bias = None
-@@ -837,6 +1122,8 @@ class GatedDeltaNet(Module):
+@@ -838,6 +1123,8 @@ class GatedDeltaNet(Module):
              self.bc = None
              self.bc_split = False
              self.bsz1_pa_args = []
@@ -1472,7 +1522,7 @@ index f61698a..e2e5df2 100644
          self.ba_weight_t = None
          self.ba_bias = None
          self.ba_weight_filled = False
-@@ -898,7 +1185,18 @@ class GatedDeltaNet(Module):
+@@ -899,7 +1186,18 @@ class GatedDeltaNet(Module):
          return mixed_qkv, z, b, a
  
  
@@ -1492,7 +1542,7 @@ index f61698a..e2e5df2 100644
          device = self.device
          f = self.fdim_qkv
          nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
-@@ -908,10 +1206,13 @@ class GatedDeltaNet(Module):
+@@ -909,10 +1207,13 @@ class GatedDeltaNet(Module):
          fa_out          = g_tensor_cache.get(device, (bsz, seqlen, hk), torch.float, "s_kfa")
          fb_out          = g_tensor_cache.get(device, (bsz, seqlen, nv * hk), torch.float, "s_kfb")
          ga_out          = g_tensor_cache.get(device, (bsz, seqlen, hv), torch.float, "s_kga")
@@ -1510,7 +1560,7 @@ index f61698a..e2e5df2 100644
          core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
          core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
          qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
-@@ -919,7 +1220,7 @@ class GatedDeltaNet(Module):
+@@ -920,7 +1221,7 @@ class GatedDeltaNet(Module):
          self.bc.configure_slot_kda(
              bsz, seqlen, history,
              qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
@@ -1519,7 +1569,7 @@ index f61698a..e2e5df2 100644
          )
  
      def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
-@@ -961,20 +1262,23 @@ class GatedDeltaNet(Module):
+@@ -962,20 +1263,23 @@ class GatedDeltaNet(Module):
          return qkv, z
  
  
@@ -1549,7 +1599,7 @@ index f61698a..e2e5df2 100644
          core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
          core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
          qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
-@@ -983,7 +1287,7 @@ class GatedDeltaNet(Module):
+@@ -984,7 +1288,7 @@ class GatedDeltaNet(Module):
          self.bc.configure_slot(
              bsz, seqlen, history,
              qkv, z, ba, beta, g, mixed_qkv, conv_out, core_attn_out, core_attn_out_f,
@@ -1558,7 +1608,7 @@ index f61698a..e2e5df2 100644
          )
  
  
-@@ -1036,6 +1340,10 @@ class GatedDeltaNet(Module):
+@@ -1037,6 +1341,10 @@ class GatedDeltaNet(Module):
              save_state = False
              save_history = False  # no SD without prior state, for simplicity
  
@@ -1569,7 +1619,7 @@ index f61698a..e2e5df2 100644
          # Deferred fill of the merged b/a projection (weights are materialized by now)
          if self.bc_split and not self.ba_weight_filled and self.kda:
              self.dt_bias_bc.copy_(self.dt_bias)
-@@ -1063,18 +1371,29 @@ class GatedDeltaNet(Module):
+@@ -1064,18 +1372,29 @@ class GatedDeltaNet(Module):
          # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
          # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
          # history) shape from the third invocation of that shape on
@@ -1606,7 +1656,7 @@ index f61698a..e2e5df2 100644
              if self.tp_reduce:
                  self.tp_collect(params["backend"], y)
              return to2(y, out_dtype, self.out_dtype)
-@@ -1164,14 +1483,18 @@ class GatedDeltaNet(Module):
+@@ -1165,14 +1484,18 @@ class GatedDeltaNet(Module):
                  self.beta_scale
              )
  
@@ -1629,7 +1679,7 @@ index f61698a..e2e5df2 100644
              params = params,
              token_major = conv_token_major,
          )
-@@ -1184,7 +1507,7 @@ class GatedDeltaNet(Module):
+@@ -1185,7 +1508,7 @@ class GatedDeltaNet(Module):
              recurrent_state = recurrent_state,
              recurrent_slots = recurrent_slots,
              history = save_history,
@@ -1638,7 +1688,7 @@ index f61698a..e2e5df2 100644
              num_k_heads = self.num_k_heads,
              num_v_heads = self.num_v_heads,
              k_dim = self.k_dim,
-@@ -1194,7 +1517,9 @@ class GatedDeltaNet(Module):
+@@ -1195,7 +1518,9 @@ class GatedDeltaNet(Module):
              params = params,
              channelwise_g = self.kda,
          )
@@ -1715,641 +1765,3 @@ index 2dd4345..9b440a1 100644
          )
  
      return core_attn_out
-diff --git a/test_gdn_replay.py b/test_gdn_replay.py
-new file mode 100644
-index 0000000..d81f3df
---- /dev/null
-+++ b/test_gdn_replay.py
-@@ -0,0 +1,632 @@
-+#!/usr/bin/env python3
-+"""GPU-owner A/B test for GDN replay. Do not run alongside another GPU job.
-+
-+Source the workspace env.sh, build/install this checkout, then run this file.
-+The parent imports only the standard library. Each replay mode loads both models
-+in a fresh child, so EXL3_GDN_REPLAY is set before torch/exllamav3 imports.
-+Mode 0 is history slots, mode 1 is replay with BC-graph verification and the batched
-+replay commit (EXL3_BC_GDN_REPLAY=1), and the optional mode 2 (--eager-replay) is
-+replay with eager verification and per-layer replay (EXL3_BC_GDN_REPLAY=0).
-+Mode 1 must launch every GDN layer's captured replay-verify graph repeatedly;
-+--alternating-cache (mode 1) also verifies on two caches with records pending in both,
-+and --graph-reinst N runs every child with EXL3_GRAPH_REINST=N.
-+Defaults match smoke_test.py's loading, warmup and timing conventions, with
-+DFlash2, seven draft tokens, an approximately 400-token prompt and 400 output tokens.
-+Children skip interpreter shutdown to avoid the gfx1201 HSA exit-handler problem.
-+"""
-+
-+import argparse
-+import importlib.machinery
-+import json
-+import math
-+import os
-+from pathlib import Path
-+import subprocess
-+import sys
-+import time
-+import traceback
-+
-+CHECKOUT = Path(__file__).resolve().parent
-+WORKSPACE = CHECKOUT.parent
-+RESULT_PREFIX = "GDN_REPLAY_RESULT "
-+QUESTION = """Write a complete Python implementation of an LRU cache and tests for it.
-+The cache must use a dictionary and a doubly linked list. Do not use OrderedDict
-+or functools.lru_cache. Start with a short explanation of the data structures,
-+then give the implementation, then give pytest tests. Use type hints and clear
-+docstrings. Keep all code in your answer so that it can be copied into two files.
-+
-+The constructor accepts a positive integer capacity. Reject zero and negative
-+capacities with ValueError. Support get, put, delete, and len. A successful get
-+moves the entry to the most recently used end. A missing get returns a caller
-+supplied default without changing the cache. Updating an existing key changes
-+its value and moves it to the most recently used end without growing the cache.
-+Inserting a new key into a full cache evicts the least recently used entry.
-+Deleting an existing key returns True; deleting a missing key returns False.
-+Stored values may be None, so do not confuse a stored None with an absent key.
-+
-+Use sentinel nodes to simplify the linked list operations. Describe the list
-+invariant and the dictionary invariant. Each public operation should take
-+constant time. Avoid recursion and avoid walking the list to find an entry.
-+The implementation does not need thread safety, persistence, or expiration.
-+
-+The tests should cover insertion, retrieval, replacement, eviction order after
-+retrieval, eviction order after replacement, deletion, missing keys, None values,
-+a capacity of one, invalid capacities, and repeated operations on the same key.
-+Include one sequence of operations that alternates deletions and insertions to
-+exercise links at both ends of the list. Finish by explaining why dictionary
-+lookups and pointer updates make the required operations constant time."""
-+DEFAULT_PROMPT = (
-+    f"<|im_start|>user\n{QUESTION}<|im_end|>\n"
-+    "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-+)
-+
-+
-+def parse_args():
-+    parser = argparse.ArgumentParser(description=__doc__)
-+    parser.add_argument("--model", type=Path, default=WORKSPACE / "models/Qwen3.8-27B-EXL3-3.0bpw")
-+    parser.add_argument("--draft", type=Path, default=WORKSPACE / "models/Qwen3.8-27B-DFlash2-EXL3-3.0bpw")
-+    parser.add_argument("--cache", type=int, default=8192)
-+    parser.add_argument("--max-new", "--max_new", dest="max_new", type=int, default=400)
-+    parser.add_argument("--draft-tokens", type=int, default=7)
-+    parser.add_argument("--warmup", type=int, default=16, help="warmup output tokens; 0 disables warmup")
-+    parser.add_argument("--runs", type=int, default=1, help="measured runs per child; compare every token sequence")
-+    parser.add_argument("--order", choices=("0,1", "1,0"), default="0,1", help="child execution order")
-+    parser.add_argument("--eager-replay", action="store_true",
-+                        help="also run mode 2: replay with eager verification (EXL3_BC_GDN_REPLAY=0), last")
-+    parser.add_argument("--alternating-cache", action="store_true",
-+                        help="mode 1: interleave verifies of two extra caches on one graph slot, compare states exactly")
-+    parser.add_argument("--graph-reinst", type=int, help="set EXL3_GRAPH_REINST for every child (e.g. 1000)")
-+    parser.add_argument("--min-graph-launches", type=int, default=10,
-+                        help="mode 1: captured replay-verify graph launches required per GDN layer")
-+    parser.add_argument("--prompt-file", type=Path, help="UTF-8 file containing the complete chat-formatted prompt")
-+    parser.add_argument("--show-text", action="store_true", help="print each measured completion")
-+    parser.add_argument("--json", action="store_true", help="also print the full results, including token IDs, as JSON")
-+    parser.add_argument("--state-check", action="store_true", help="check low-level recurrent/conv replay before model load")
-+    parser.add_argument("--state-check-only", action="store_true", help="run kernel checks without models")
-+    parser.add_argument("--state-channelwise", action="store_true", help="also check channelwise decay; implies --state-check")
-+    parser.add_argument("--state-atol", type=float, default=2e-6)
-+    parser.add_argument("--state-rtol", type=float, default=2e-5)
-+    parser.add_argument("--_child-mode", choices=("0", "1", "2"), help=argparse.SUPPRESS)
-+    args = parser.parse_args()
-+    for name in ("cache", "max_new", "draft_tokens", "runs"):
-+        if getattr(args, name) <= 0:
-+            parser.error(f"--{name.replace('_', '-')} must be positive")
-+    if args.warmup < 0:
-+        parser.error("--warmup must be nonnegative")
-+    if not all(math.isfinite(value) and value >= 0 for value in (args.state_atol, args.state_rtol)):
-+        parser.error("State-check tolerances must be finite and nonnegative")
-+    args.state_check = args.state_check or args.state_check_only or args.state_channelwise
-+    if args.draft_tokens > 7:
-+        parser.error("DFlash2's eight-token block supports at most seven draft tokens")
-+    args.model = args.model.resolve()
-+    args.draft = args.draft.resolve()
-+    if args.prompt_file:
-+        args.prompt_file = args.prompt_file.resolve()
-+    return args
-+
-+
-+def check_environment(args):
-+    expected_venv = WORKSPACE / "exllamav3-rocm/.venv-rocm"
-+    activated = os.environ.get("VIRTUAL_ENV")
-+    if not activated or Path(activated).resolve() != expected_venv.resolve() or Path(sys.prefix).resolve() != expected_venv.resolve():
-+        raise RuntimeError(f"Source {WORKSPACE / 'env.sh'} and use its python interpreter before running this test")
-+    if os.environ.get("HIP_VISIBLE_DEVICES") != "0":
-+        raise RuntimeError("Require HIP_VISIBLE_DEVICES=0 exactly; do not expose the iGPU")
-+    headers = str(WORKSPACE / "deps/usr/include/python3.12")
-+    if os.environ.get("ROCM_HOME") != "/usr" or os.environ.get("ROCM_PATH") != "/usr" or headers not in os.environ.get("CPATH", "").split(os.pathsep):
-+        raise RuntimeError(f"Runtime environment is incomplete; source {WORKSPACE / 'env.sh'}")
-+    if not args.state_check_only:
-+        for directory in (args.model, args.draft):
-+            if not (directory / "config.json").is_file():
-+                raise RuntimeError(f"Model config not found in {directory}")
-+    # ext.py falls back to a JIT build if it cannot find a compiled extension.
-+    # Require this checkout's in-place extension instead of silently using another build.
-+    if not any((CHECKOUT / ("exllamav3_ext" + suffix)).is_file() for suffix in importlib.machinery.EXTENSION_SUFFIXES):
-+        raise RuntimeError(f"No in-place exllamav3_ext in {CHECKOUT}; build this checkout first")
-+
-+
-+def clean_child_exit(code):
-+    # Follow smoke_test.py: flush output, release cached allocations, then bypass
-+    # the HSA interpreter-exit handler. Also use this path after child exceptions.
-+    torch = sys.modules.get("torch")
-+    try:
-+        if torch is not None and torch.cuda.is_initialized():
-+            import gc
-+            torch.cuda.synchronize()
-+            gc.collect()
-+            torch.cuda.empty_cache()
-+            torch.cuda.synchronize()
-+            time.sleep(1.5)
-+    except BaseException:
-+        traceback.print_exc()
-+        code = 1
-+    finally:
-+        sys.stdout.flush()
-+        sys.stderr.flush()
-+        os._exit(code)
-+
-+
-+def check_kernel_states(torch, args):
-+    """Exercise both v-split paths, nonidentity int32 slots and all acceptance lengths."""
-+    from exllamav3.ext import exllamav3_ext as ext
-+
-+    rows, kh, vh, kd, vd, conv_k = 8, 2, 6, 128, 128, 4
-+    features = 2 * kh * kd + vh * vd
-+    checks = []
-+
-+    def compare(name, actual, expected, exact=False):
-+        delta = (actual.float() - expected.float()).abs().max().item()
-+        passed = torch.equal(actual, expected) if exact else torch.allclose(
-+            actual, expected, atol=args.state_atol, rtol=args.state_rtol)
-+        checks.append(dict(name=name, max_abs_delta=delta, allclose=bool(passed), exact=exact))
-+        if not passed:
-+            raise RuntimeError(f"State check failed: {name}, max delta={delta:.9g}, "
-+                               f"atol={args.state_atol}, rtol={args.state_rtol}, exact={exact}")
-+
-+    def recurrent(qkv, g, beta, state, slots, history, save_state):
-+        out = torch.empty((qkv.shape[0], qkv.shape[1], vh, vd), device="cuda:0", dtype=torch.bfloat16)
-+        ext.cuda_recurrent_gated_delta_rule(qkv, g, beta, state, out,
-+                                          kh, vh, kd, vd, slots, history, save_state)
-+        return out
-+
-+    def convolution(x, state, slots, weight, bias, history, save_state=True):
-+        out = torch.empty((x.shape[0], x.shape[2], features), device="cuda:0", dtype=torch.bfloat16)
-+        ext.cuda_causal_conv1d_update(x, state, slots, weight, bias, out, True, history, save_state)
-+        return out
-+
-+    # 33 layer copies: one rewind batches every layer, and bsz=2 (66 jobs) spans two launches
-+    replay_copies = 33
-+
-+    def batched_replay(states, convs, slot_ids, conv_input, conv_out, g, beta, accepted, channelwise):
-+        # Jobs as GDNLayerState.replay_job builds them: slot bases plus per-row record bases
-+        jobs = []
-+        for state, conv in zip(states, convs):
-+            for bi, slot in enumerate(slot_ids):
-+                jobs.append(ext.GDNReplayJob(
-+                    state.data_ptr() + slot * state.stride(0) * state.element_size(),
-+                    conv.data_ptr() + slot * conv.stride(0) * conv.element_size(),
-+                    conv_input[bi].data_ptr(), conv_out[bi].data_ptr(),
-+                    beta[bi].data_ptr(), g[bi].data_ptr()))
-+        ext.batched_gdn_replay(jobs, 0, accepted, rows, kh, vh, kd, vd, features, conv_k,
-+                               convs[0].stride(1), channelwise)
-+
-+    for bsz in (1, 2):
-+        for channelwise in ((False, True) if args.state_channelwise else (False,)):
-+            torch.manual_seed(1729 + bsz + 10 * int(channelwise))
-+            tag = f"bsz={bsz}, decay={'channelwise' if channelwise else 'scalar'}"
-+            start_check = len(checks)
-+            # Slots exercise indexing rather than relying only on the identity mapping.
-+            slots = torch.tensor([1] if bsz == 1 else [2, 0], device="cuda:0", dtype=torch.int32)
-+            slot_ids = [1] if bsz == 1 else [2, 0]
-+            x = torch.randn((bsz, features, rows), device="cuda:0", dtype=torch.bfloat16)
-+            weight = torch.randn((features, conv_k), device="cuda:0", dtype=torch.bfloat16) * 0.1
-+            bias = torch.randn((features,), device="cuda:0", dtype=torch.bfloat16) * 0.1
-+            conv_seed = torch.randn((3, features, conv_k), device="cuda:0", dtype=torch.bfloat16)
-+            conv_history = torch.randn((3, features, conv_k + rows - 1), device="cuda:0", dtype=torch.bfloat16)
-+            conv_history[:, :, :conv_k].copy_(conv_seed)
-+            history_out = convolution(x, conv_history, slots, weight, bias, True)
-+            conv_committed = conv_seed.clone()
-+            private_conv = conv_committed.index_select(0, slots.long())
-+            private_out = convolution(x, private_conv, None, weight, bias, False)
-+            compare(tag + " conv private output", private_out, history_out)
-+            compare(tag + " conv committed untouched", conv_committed, conv_seed, exact=True)
-+            # BC replay verify: slot-indexed conv straight off the committed window, no write-back
-+            readonly_conv = conv_seed.clone()
-+            readonly_conv_out = convolution(x, readonly_conv, slots, weight, bias, False, save_state=False)
-+            compare(tag + " conv read-only output", readonly_conv_out, history_out, exact=True)
-+            compare(tag + " conv read-only untouched", readonly_conv, conv_seed, exact=True)
-+
-+            g_shape = (bsz, rows, vh, kd) if channelwise else (bsz, rows, vh)
-+            g = -torch.rand(g_shape, device="cuda:0", dtype=torch.float32) * 0.5
-+            beta = torch.rand((bsz, rows, vh), device="cuda:0", dtype=torch.bfloat16)
-+            seeded = torch.randn((3, rows, vh, kd, vd), device="cuda:0", dtype=torch.float32) * 0.1
-+            history = seeded.clone()
-+            baseline_out = recurrent(history_out, g, beta, history, slots, True, True)
-+            readonly = seeded.clone()
-+            readonly_out = recurrent(private_out, g, beta, readonly, slots, False, False)
-+            compare(tag + " recurrent read-only output", readonly_out, baseline_out)
-+            compare(tag + " recurrent all planes untouched", readonly, seeded, exact=True)
-+            one_plane = seeded[:, :1].contiguous()
-+            one_plane_seed = one_plane.clone()
-+            one_plane_out = recurrent(private_out, g, beta, one_plane, slots, False, False)
-+            compare(tag + " recurrent one-plane output", one_plane_out, baseline_out)
-+            compare(tag + " recurrent one-plane untouched", one_plane, one_plane_seed, exact=True)
-+
-+            eager_states = []
-+            for accepted in range(rows + 1):
-+                # Normal batched prefix update is the conv reference; replay is a private
-+                # single-slot call, matching the actual accepted-input commit path.
-+                direct_conv = conv_seed.clone()
-+                if accepted:
-+                    convolution(x[:, :, :accepted].contiguous(), direct_conv, slots, weight, bias, False)
-+                for bi, slot in enumerate(slot_ids):
-+                    label = f"{tag}, slot={slot}, L={accepted}"
-+                    replay_state = seeded[slot:slot + 1, :1].clone()
-+                    replay_conv = conv_seed[slot:slot + 1].clone()
-+                    if accepted:
-+                        recurrent(private_out[bi:bi + 1, :accepted].contiguous(),
-+                                  g[bi:bi + 1, :accepted].contiguous(),
-+                                  beta[bi:bi + 1, :accepted].contiguous(),
-+                                  replay_state, None, False, True)
-+                        convolution(x[bi:bi + 1, :, :accepted].contiguous(),
-+                                    replay_conv, None, weight, bias, False)
-+                    expected_state = seeded[slot, 0] if accepted == 0 else history[slot, accepted % rows]
-+                    compare(label + " recurrent committed plane", replay_state[0, 0], expected_state,
-+                            exact=accepted == 0)
-+                    compare(label + " conv replay vs direct", replay_conv[0], direct_conv[slot], exact=True)
-+                    # The history buffer holds concat(seed, inputs)[1:], so the window
-+                    # after L>0 starts at L-1. L=0 must retain the entire seeded window.
-+                    expected_conv = conv_seed[slot] if accepted == 0 else conv_history[slot, :, accepted - 1:accepted - 1 + conv_k]
-+                    compare(label + " conv replay vs history", replay_conv[0], expected_conv, exact=True)
-+                    eager_states.append((slot, replay_state[0, 0], replay_conv[0]))
-+                # Batched replay commit (BC path) must reproduce the per-layer eager replay exactly
-+                batch_states = [seeded[:, :1].clone() for _ in range(replay_copies)]
-+                batch_convs = [conv_seed.clone() for _ in range(replay_copies)]
-+                batched_replay(batch_states, batch_convs, slot_ids, x, private_out, g, beta, accepted, channelwise)
-+                for slot, eager_state, eager_conv in eager_states:
-+                    label = f"{tag}, slot={slot}, L={accepted}"
-+                    compare(label + " batched replay state vs eager", torch.stack([b[slot, 0] for b in batch_states]),
-+                            eager_state.unsqueeze(0).expand(replay_copies, *eager_state.shape), exact=True)
-+                    compare(label + " batched replay conv vs eager", torch.stack([b[slot] for b in batch_convs]),
-+                            eager_conv.unsqueeze(0).expand(replay_copies, *eager_conv.shape), exact=True)
-+                untouched = [s for s in range(3) if s not in slot_ids]
-+                for s_idx in untouched:
-+                    compare(f"{tag}, slot={s_idx}, L={accepted} batched replay other slots untouched",
-+                            torch.stack([b[s_idx] for b in batch_states]),
-+                            seeded[s_idx, :1].unsqueeze(0).expand(replay_copies, 1, vh, kd, vd), exact=True)
-+                eager_states.clear()
-+            torch.cuda.synchronize()
-+            group = checks[start_check:]
-+            worst = max(check["max_abs_delta"] for check in group)
-+            print(f"state-check PASS {tag}: {len(group)} comparisons, max delta={worst:.9g}, "
-+                  f"atol={args.state_atol}, rtol={args.state_rtol}", flush=True)
-+    return checks
-+
-+
-+def cache_bytes(caches):
-+    """Device bytes of the caches' KV and recurrent-state tensors: unique storages, rounded up to
-+    the caching allocator's 512-byte blocks as torch.cuda.memory_allocated() counts them"""
-+    storages = {}
-+    for cache in caches:
-+        tensors = list(cache.get_all_tensors())
-+        for layer in cache.recurrent_layers.values():
-+            tensors += list(layer.get_state_tensors())
-+        for t in tensors:
-+            if t is not None and t.is_cuda:
-+                storage = t.untyped_storage()
-+                storages[storage.data_ptr()] = -(-storage.nbytes() // 512) * 512
-+    return sum(storages.values())
-+
-+
-+def check_alternating_caches(torch, model, caches, rows):
-+    """Verify on cache A, then on cache B through the same captured graph slot while A's records
-+    are still pending (B's verify evicts them to private copies), then rewind both. A and B get
-+    different inputs, so an eviction that aliased the shared storage would hand A B's record.
-+    Every GDN conv window and committed state, and each verify's logits, must equal the same
-+    cache's uninterleaved run."""
-+    from exllamav3.constants import PAGE_SIZE
-+    from exllamav3.modules.gated_delta_net import GatedDeltaNet
-+
-+    if rows < 2:
-+        raise RuntimeError("Alternating caches need a verification block of at least two rows")
-+    # Keep at least one accepted row, and reject some unless the block is only two rows long
-+    rejected = min(3, rows - 1)
-+    prefix_len = 64
-+    assert prefix_len + rows <= PAGE_SIZE, "Alternating caches hold one page per sequence"
-+    vocab = model.config.vocab_size
-+
-+    def inputs(seed):
-+        # Full-length prefix and verification block regardless of prompt length
-+        g = torch.Generator().manual_seed(seed)
-+        ids = torch.randint(0, vocab, (1, prefix_len + rows), generator=g, dtype=torch.long)
-+        return ids[:, :prefix_len], ids[:, prefix_len:]
-+
-+    gdn = [m for m in model if isinstance(m, GatedDeltaNet)]
-+
-+    def forward(cache, state, ids, past_len, history):
-+        params = {"attn_mode": "flash_attn", "cache": cache, "batch_shape": (1, PAGE_SIZE),
-+                  "past_len": past_len, "recurrent_states": [state]}
-+        if history:
-+            params["recurrent_history"] = True
-+        return model.forward(ids, params)
-+
-+    def verify(cache, ids):
-+        prefix, block = ids
-+        state = cache.get_new_state()
-+        forward(cache, state, prefix, 0, False)
-+        return state, forward(cache, state, block, prefix.shape[1], True)
-+
-+    def snapshot(cache, state):
-+        layers = [l for l in cache.recurrent_layers.values() if isinstance(l.module, GatedDeltaNet)]
-+        return [(l.conv_state[state.slot].clone(), l.recurrent_state[state.slot, 0].clone()) for l in layers]
-+
-+    def launches():
-+        return [m.bc.replay_graph_launches for m in gdn]
-+
-+    def evictions():
-+        return sum(m.bc_replay_storage.evictions for m in gdn)
-+
-+    cache_a, cache_b = caches
-+    ids_a, ids_b = inputs(1), inputs(2)
-+    with torch.inference_mode():
-+        # Uninterleaved references, each on its own cache
-+        references = []
-+        for cache, ids in ((cache_a, ids_a), (cache_b, ids_b)):
-+            state, ref_logits = verify(cache, ids)
-+            state.rewind(rejected)
-+            references.append((ref_logits, snapshot(cache, state)))
-+            state.free()
-+
-+        launches0, evictions0 = launches(), evictions()
-+        state_a, logits_a = verify(cache_a, ids_a)
-+        state_b, logits_b = verify(cache_b, ids_b)
-+        evicted = evictions() - evictions0
-+        state_a.rewind(rejected)
-+        state_b.rewind(rejected)
-+        torch.cuda.synchronize()
-+        after = launches()
-+        results = [snapshot(cache_a, state_a), snapshot(cache_b, state_b)]
-+        state_a.free()
-+        state_b.free()
-+
-+    if evicted != len(gdn):
-+        raise RuntimeError(f"Alternating caches: expected {len(gdn)} evictions, got {evicted}")
-+    if min(b - a for a, b in zip(launches0, after)) < 2:
-+        raise RuntimeError("Alternating caches: interleaved verifies did not launch the captured graphs")
-+    (ref_logits_a, ref_a), (ref_logits_b, ref_b) = references
-+    if torch.equal(ref_logits_a, ref_logits_b) or all(
-+            torch.equal(x[1], y[1]) for x, y in zip(ref_a, ref_b)):
-+        raise RuntimeError("Alternating caches: A and B references coincide, so aliasing would go undetected")
-+    for name, logits, ref_logits in (("A", logits_a, ref_logits_a), ("B", logits_b, ref_logits_b)):
-+        if not torch.equal(logits, ref_logits):
-+            raise RuntimeError(f"Alternating caches: cache {name} verify logits differ from its reference")
-+    for name, result, reference in (("A", results[0], ref_a), ("B", results[1], ref_b)):
-+        for index, ((conv, rec), (ref_conv, ref_rec)) in enumerate(zip(result, reference)):
-+            if not torch.equal(conv, ref_conv) or not torch.equal(rec, ref_rec):
-+                raise RuntimeError(f"Alternating caches: cache {name}, GDN layer {index} state differs from its reference")
-+    print(f"alternating-cache PASS: {len(gdn)} layers, {evicted} evictions, {rows}-row verify, "
-+          f"{rejected} rejected; states and logits exact, each against its own reference", flush=True)
-+    return dict(layers=len(gdn), evictions=evicted, rows=rows, rejected=rejected)
-+
-+
-+def run_child(args):
-+    mode = args._child_mode
-+    if os.environ.get("EXL3_GDN_REPLAY") != ("0" if mode == "0" else "1") or \
-+            os.environ.get("EXL3_BC_GDN_REPLAY") != ("0" if mode == "2" else "1"):
-+        raise RuntimeError("Child replay environment does not match its mode")
-+    # These are deliberately child-only imports, after all environment checks.
-+    import torch
-+    import exllamav3
-+    from exllamav3 import Config, Model, Cache, Tokenizer, Generator, Job, ArgmaxSampler
-+
-+    if Path(exllamav3.__file__).resolve().parent != CHECKOUT / "exllamav3":
-+        raise RuntimeError(f"Imported another checkout: {exllamav3.__file__}")
-+    if not torch.version.hip or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-+        raise RuntimeError("Require a ROCm torch build with exactly one visible GPU")
-+    torch.manual_seed(0)
-+    bc_gdn = os.environ.get("EXL3_BC_GDN", "1")
-+    print(f"mode={mode}, GPU={torch.cuda.get_device_name(0)}, HIP={torch.version.hip}, "
-+          f"EXL3_BC_GDN={bc_gdn}, EXL3_BC_GDN_REPLAY={os.environ['EXL3_BC_GDN_REPLAY']}", flush=True)
-+    state_checks = check_kernel_states(torch, args) if args.state_check else []
-+    if args.state_check_only:
-+        return dict(mode=int(mode), bc_gdn=bc_gdn, state_checks=state_checks, state_check_only=True)
-+    # Re-seed after optional kernel checks so enabling them does not alter model runs.
-+    torch.manual_seed(0)
-+    started = time.perf_counter()
-+    draft_config = Config.from_directory(str(args.draft))
-+    draft_model = Model.from_config(draft_config, component="text")
-+    draft_cache = Cache(draft_model, max_num_tokens=args.cache)
-+    draft_model.load(progressbar=True)
-+    config = Config.from_directory(str(args.model))
-+    model = Model.from_config(config)
-+    cache = Cache(model, max_num_tokens=args.cache, max_batch_size=1, max_history=args.draft_tokens)
-+    # One page each; created before load so the loader allocates them. Replay-mode states are small
-+    alt_caches = [Cache(model, max_num_tokens=256, max_batch_size=1, max_history=args.draft_tokens)
-+                  for _ in range(2)] if args.alternating_cache and mode == "1" else None
-+    model.load(progressbar=True)
-+    tokenizer = Tokenizer.from_config(config)
-+    generator = Generator(model=model, cache=cache, tokenizer=tokenizer,
-+                          draft_model=draft_model, draft_cache=draft_cache,
-+                          num_draft_tokens=args.draft_tokens, dynamic_draft_tokens=False)
-+    torch.cuda.synchronize()
-+    # The auxiliary caches must exist before load (the loader allocates them) but are not part of
-+    # the configuration under test: exclude them from the after-load figures, report them apart
-+    aux_cache_bytes = cache_bytes(alt_caches) if alt_caches else 0
-+    allocated = torch.cuda.memory_allocated() - aux_cache_bytes
-+    reserved = torch.cuda.memory_reserved() - aux_cache_bytes
-+    load_seconds = time.perf_counter() - started
-+    print(f"loaded in {load_seconds:.1f}s, VRAM allocated {allocated / 1e9:.2f} GB, "
-+          f"reserved {reserved / 1e9:.2f} GB, draft={generator.num_draft_tokens}"
-+          + (f" (excluding {aux_cache_bytes / 1e6:.1f} MB of auxiliary caches)" if aux_cache_bytes else ""), flush=True)
-+    prompt = args.prompt_file.read_text(encoding="utf-8") if args.prompt_file else DEFAULT_PROMPT
-+    ids = tokenizer.encode(prompt, encode_special_tokens=True)
-+    prompt_tokens = ids.shape[-1]
-+    if prompt_tokens + max(args.max_new, args.warmup) + args.draft_tokens + 1 > args.cache:
-+        raise RuntimeError("Prompt plus output and draft slack exceed --cache")
-+    stop = [tokenizer.single_id("<|im_end|>")]
-+
-+    def generate(max_new):
-+        job = Job(input_ids=ids, max_new_tokens=max_new, stop_conditions=stop, sampler=ArgmaxSampler())
-+        generator.enqueue(job)
-+        chunks, token_ids = [], []
-+        first = None
-+        terminal = None
-+        torch.cuda.synchronize()
-+        start = time.perf_counter()
-+        while generator.num_remaining_jobs():
-+            for event in generator.iterate():
-+                if event.get("stage") != "streaming":
-+                    continue
-+                chunk = event.get("text", "")
-+                if chunk and first is None:
-+                    first = time.perf_counter()
-+                chunks.append(chunk)
-+                tokens = event.get("token_ids")
-+                if tokens is not None:
-+                    token_ids.extend(tokens.flatten().tolist())
-+                if event.get("eos"):
-+                    terminal = event
-+        torch.cuda.synchronize()
-+        end = time.perf_counter()
-+        if terminal is None or not token_ids:
-+            raise RuntimeError("Generation did not return a completion with output tokens")
-+        # Stop tokens are excluded from streamed IDs; include them in correctness checks.
-+        sampled_ids = list(token_ids)
-+        stop_id = terminal.get("eos_triggering_token_id")
-+        if stop_id is not None:
-+            sampled_ids.append(int(stop_id))
-+        decode = (len(token_ids) - 1) / (end - first) if first is not None and len(token_ids) > 1 and end > first else None
-+        return dict(token_ids=sampled_ids, text="".join(chunks), emitted_tokens=len(token_ids),
-+                    eos_reason=terminal.get("eos_reason"), elapsed_seconds=end - start,
-+                    ttft_ms=(first - start) * 1000 if first is not None else None,
-+                    decode_tok_s=decode, total_tok_s=len(token_ids) / (end - start),
-+                    accepted_draft_tokens=terminal.get("accepted_draft_tokens"),
-+                    rejected_draft_tokens=terminal.get("rejected_draft_tokens"),
-+                    cached_tokens=terminal.get("cached_tokens"))
-+
-+    if args.warmup:
-+        generate(args.warmup)  # Same-prompt warmup, as in smoke_test.py; measured prefill may hit cache.
-+    runs = [generate(args.max_new) for _ in range(args.runs)]
-+    # Captured-graph launches of each GDN layer's replay-verify slots (eager first runs, captures
-+    # and eager-path verifies don't count), and the per-layer recording storage behind them
-+    from exllamav3.modules.gated_delta_net import GatedDeltaNet
-+    gdn = [module for module in model if isinstance(module, GatedDeltaNet)]
-+    launches = [module.bc.replay_graph_launches if module.bc_split else 0 for module in gdn]
-+    bc_replay_layers = sum(1 for n in launches if n)
-+    storage = {}
-+    for module in gdn:
-+        for buffers in module.bc_replay_buffers.values():
-+            for t in buffers.tensors:
-+                storage[t.untyped_storage().data_ptr()] = t.untyped_storage().nbytes()
-+    print(f"BC replay-verify graph launches per GDN layer: min {min(launches, default=0)}, "
-+          f"max {max(launches, default=0)}, layers launched {bc_replay_layers}/{len(gdn)}; "
-+          f"replay storage {sum(storage.values()) / 1e6:.1f} MB", flush=True)
-+    if mode == "1" and bc_gdn != "0" and min(launches, default=0) < args.min_graph_launches:
-+        raise RuntimeError(f"Mode 1: some GDN layer launched its captured replay-verify graph fewer "
-+                           f"than {args.min_graph_launches} times")
-+    if mode != "1" and bc_replay_layers:
-+        raise RuntimeError(f"Mode {mode} unexpectedly launched replay-verify graphs")
-+    alternating = None
-+    if alt_caches:
-+        alternating = check_alternating_caches(torch, model, alt_caches, generator.num_draft_tokens + 1)
-+    return dict(mode=int(mode), model=str(args.model), draft=str(args.draft),
-+                bc_gdn=bc_gdn, bc_replay_layers=bc_replay_layers, gdn_layers=len(gdn),
-+                replay_graph_launches_min=min(launches, default=0), alternating_cache=alternating,
-+                replay_storage_bytes=sum(storage.values()), aux_cache_bytes=aux_cache_bytes,
-+                state_checks=state_checks, state_check_only=False,
-+                draft_tokens=generator.num_draft_tokens, prompt_tokens=prompt_tokens,
-+                prompt_ids=ids.flatten().tolist(), warmup_tokens=args.warmup,
-+                load_seconds=load_seconds, memory_allocated_after_load=allocated,
-+                memory_reserved_after_load=reserved, runs=runs)
-+
-+
-+def first_difference(left, right):
-+    for index, (a, b) in enumerate(zip(left, right)):
-+        if a != b:
-+            return f"token {index}: reference ID {a}, observed ID {b}"
-+    if len(left) != len(right):
-+        return f"different lengths: reference {len(left)}, observed {len(right)}"
-+    return None
-+
-+
-+def parent_main(args):
-+    results = {}
-+    modes = args.order.split(",") + (["2"] if args.eager_replay else [])
-+    for mode in modes:
-+        env = os.environ.copy()
-+        env["EXL3_GDN_REPLAY"] = "0" if mode == "0" else "1"
-+        env["EXL3_BC_GDN_REPLAY"] = "0" if mode == "2" else "1"
-+        if args.graph_reinst is not None:
-+            env["EXL3_GRAPH_REINST"] = str(args.graph_reinst)
-+        env["PYTHONUNBUFFERED"] = "1"
-+        # Run from the checkout, not the workspace's installed editable package.
-+        print(f"Starting fresh child for mode {mode}: EXL3_GDN_REPLAY={env['EXL3_GDN_REPLAY']}, "
-+              f"EXL3_BC_GDN_REPLAY={env['EXL3_BC_GDN_REPLAY']}, "
-+              f"EXL3_GRAPH_REINST={env.get('EXL3_GRAPH_REINST', 'default')}", flush=True)
-+        process = subprocess.run([sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--_child-mode", mode],
-+                                 cwd=str(CHECKOUT), env=env, stdout=subprocess.PIPE,
-+                                 stderr=subprocess.STDOUT, text=True)
-+        payloads = []
-+        for line in process.stdout.splitlines():
-+            if line.startswith(RESULT_PREFIX):
-+                payloads.append(line[len(RESULT_PREFIX):])
-+            else:
-+                print(line)
-+        if process.returncode or len(payloads) != 1:
-+            raise RuntimeError(f"Replay={mode} child failed, exit={process.returncode}, result records={len(payloads)}")
-+        results[int(mode)] = json.loads(payloads[0])
-+
-+    if args.state_check_only:
-+        if args.json:
-+            print(json.dumps({"results": results, "state_checks_pass": True}, allow_nan=False))
-+        count = sum(len(result["state_checks"]) for result in results.values())
-+        print(f"PASS: {count} low-level comparisons across {len(results)} fresh children; no models loaded")
-+        return 0
-+    print("\nmode  run  prompt  output  TTFT ms  decode tok/s  total tok/s  allocated GB  cached tok")
-+    for mode in sorted(results):
-+        result = results[mode]
-+        for index, run in enumerate(result["runs"], start=1):
-+            ttft = run["ttft_ms"] if run["ttft_ms"] is not None else math.nan
-+            speed = run["decode_tok_s"] if run["decode_tok_s"] is not None else math.nan
-+            print(f"{mode:4d} {index:4d} {result['prompt_tokens']:7d} {run['emitted_tokens']:7d} "
-+                  f"{ttft:8.1f} {speed:13.1f} {run['total_tok_s']:12.1f} "
-+                  f"{result['memory_allocated_after_load'] / 1e9:13.2f} {str(run['cached_tokens']):>11}")
-+            if args.show_text:
-+                print(f"\nreplay={mode}, run={index}\n{run['text']}\n")
-+    print("Decode timing follows smoke_test.py; same-prompt warmup can reuse prompt cache.")
-+    errors = []
-+    if results[0]["prompt_ids"] != results[1]["prompt_ids"]:
-+        errors.append("Prompt token IDs differ between children")
-+    baseline = results[0]["runs"][0]
-+    for mode in sorted(results):
-+        for index, run in enumerate(results[mode]["runs"], start=1):
-+            difference = first_difference(baseline["token_ids"], run["token_ids"])
-+            if difference:
-+                errors.append(f"mode={mode}, run={index}: {difference}")
-+            if run["eos_reason"] != baseline["eos_reason"]:
-+                errors.append(f"mode={mode}, run={index}: termination reason differs")
-+    if args.json:
-+        print(json.dumps({"results": results, "tokens_match": not errors}, allow_nan=False))
-+    if errors:
-+        print("FAIL: token comparison", file=sys.stderr)
-+        for error in errors:
-+            print(error, file=sys.stderr)
-+        print("Rerun with EXL3_BC_GDN=0 to compare both modes on eager GDN and isolate replay "
-+              "from BC/eager projection rounding. A mismatch is not evidence of a near-tie without logits.",
-+              file=sys.stderr)
-+        return 1
-+    print(f"PASS: all {len(results) * args.runs} greedy completions match, including any stop token")
-+    off = sum(run["total_tok_s"] for run in results[0]["runs"]) / args.runs
-+    for mode in sorted(results)[1:]:
-+        on = sum(run["total_tok_s"] for run in results[mode]["runs"]) / args.runs
-+        delta = results[mode]["memory_allocated_after_load"] - results[0]["memory_allocated_after_load"]
-+        print(f"Mode {mode} total-throughput ratio {on / off:.3f}x vs mode 0; allocated-after-load delta "
-+              f"{delta / 1e6:+.1f} MB; BC replay-verify layers {results[mode]['bc_replay_layers']}/"
-+              f"{results[mode]['gdn_layers']} (min {results[mode]['replay_graph_launches_min']} graph launches), "
-+              f"replay storage {results[mode]['replay_storage_bytes'] / 1e6:.1f} MB")
-+    return 0
-+
-+
-+def main():
-+    args = parse_args()
-+    if args._child_mode is not None:
-+        code = 1
-+        try:
-+            check_environment(args)
-+            result = run_child(args)
-+            print(RESULT_PREFIX + json.dumps(result, allow_nan=False), flush=True)
-+            code = 0
-+        except BaseException:
-+            traceback.print_exc()
-+        finally:
-+            clean_child_exit(code)
-+    try:
-+        check_environment(args)
-+        return parent_main(args)
-+    except (RuntimeError, OSError, ValueError) as error:
-+        print(f"ERROR: {error}", file=sys.stderr)
-+        return 1
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())

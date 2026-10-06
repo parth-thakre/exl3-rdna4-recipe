@@ -2,9 +2,16 @@
 
 The working notes this recipe came out of, lightly edited: machine-specific serving details are removed and paths
 point at this repo's layout. Dates are 2026. Numbers are from one RX 9070 XT (16 GB) on Fedora 44. Names like
-`wt-replay` were local work branches. `patches/exllamav3-rdna4.patch` has the WMMA GEMV, graph re-instantiation, GQA
-decode attention with Q4W, the review fixes and the DeltaNet replay. The 16-row GEMV, adaptive draft length, tree
-fallback and Q4P experiments below are not in this repo.
+`wt-replay` were local work branches. All of this was on exllamav3 f1cf869 and TabbyAPI f07131c (with a since
+superseded TabbyAPI patch); the work has since been ported to exllamav3 0662fac as the commits in `patches/features/`.
+The WMMA GEMV, graph re-instantiation, GQA decode attention with Q4W, the review fixes and the DeltaNet replay are in
+`patches/exllamav3-rdna4.patch`. The 16-row GEMV, adaptive draft length, tree fallback and Q4P experiments below are
+not in this repo.
+
+Some configuration labels in these notes are loose (for example, the "before/after attention patch" rows mix 64k and
+80k servers, and the MTP row mixes 128k, 144k and 160k servers). The tables in the main README were rechecked against
+the raw benchmark logs and give the exact configuration and prompt length of every number; where the two disagree,
+the README is right.
 
 ## Recommended request settings
 
@@ -83,7 +90,7 @@ VRAM accounting (deep-dive): KV is 24,192 B/token incl. scales and the draft cac
     149 tok/s at 8k, 122 at 64k, **97.6 at 120k** (the old 96k default: 136 / 121 / 113 at 90k), 16.13 GB peak.
     Review round 2 (Sol) fixed abandoned-cache eviction, two-phase rewind with failure marking, bounded recording
     storage, and a test that counts real graph launches and checks interleaved caches with distinct inputs (exact).
-    `patches/features/exllamav3-gdn-accepted-input-replay.patch`.
+    `patches/features/0004-Gated-DeltaNet-accepted-input-replay-for-speculative.patch`.
   - First (eager) version: DFlash2 at **128k** (was MTP-only past 96k). 132 tok/s at 8k, 112 at 64k, **96.5 at
     118k** (MTP: 62), recall OK at every depth, 16.07 GB peak, 911 tok/s prefill at 125k.
 - **16-row WMMA GEMV** (`wt-tree`): rows 9-16 pass against reconstruct+hgemm. lm_head at 16 rows: 1.85 ms vs 7.5 ms.
@@ -93,11 +100,11 @@ VRAM accounting (deep-dive): KV is 24,192 B/token incl. scales and the draft cac
   one-pass tree needs tree-masked attention and branched DeltaNet state.
 - Every speculative mode, plain DFlash2 included, splits from non-speculative greedy at the same token (375 of 400).
   That is the multi-row verify's accumulation order, not the new code.
-- Sol review of the RDNA4 patches: `notes/reviews.md`. Fixes (`patches/features/exllamav3-review-fixes.patch`):
+- Sol review of the RDNA4 patches: `notes/reviews.md`. Fixes (now folded into the commits in `patches/features/`):
   WMMA LDS fences (`__syncwarp`), gfx12-only WMMA gating, shared EXL3_DEC_* overrides for eager and graph attention,
   Q4W early exit for idle splits (q_len 1: 369 -> 350 µs/layer at 60k). Greedy output identical, speed unchanged.
 
-## Patches (in `patches/features/`, against upstream f1cf869)
+## Patches (as they were against upstream f1cf869; now ported, see `patches/README.md`)
 
 1. **`exllamav3-gfx12-wmma-multirow-gemv.patch`**: an RDNA4-native GEMV for 2-8 rows (draft-token verification),
    behind `EXL3_GEMV_WMMA=1` (on in `setup/env.sh`). The trellis is decoded once per tile with the tuned RDNA decoder, then
@@ -115,7 +122,8 @@ VRAM accounting (deep-dive): KV is 24,192 B/token incl. scales and the draft cac
    (`EXL3_DEC_*`, set in `setup/env.sh`). At 60k deep, one layer goes 1961 -> 605 µs (q_len 8), 1336 -> 450 (q_len 4) and
    550 -> 336 (q_len 1), with max error 2e-6 (`bench/bench_decode_attn.py`). The C++ graph path recomputed the program count
    with the old rule, which made the GPU fault; `configure_slot` now takes `block_h` from Python.
-4. **`tabbyapi-allow-rdna3-rdna4.patch`**: lets TabbyAPI accept gfx12.
+4. **`tabbyapi-allow-rdna3-rdna4.patch`**: let TabbyAPI f07131c accept gfx12. Not needed from TabbyAPI 2fd6cc7 on, so it
+   isn't in this repo any more.
 
 Build: `setup/build_exllamav3.sh`. When editing a .cu file, delete its generated `.hip` before rebuilding. Missing
 Fedora header packages are unpacked into `deps/` (no sudo).
@@ -130,7 +138,7 @@ counting that aren't in this repo.
 ## Next steps (not started)
 
 **More context in 16 GB.** VRAM in the fast profile: main weights 10.25 GB (lm_head alone 0.95 GB at 6 bpw), DFlash2
-draft 1.67 GB, KV 64k Q4 ~1 GB (16 KB/token), state/scratch/reserve/runtime ~2.4 GB. The embedding table and vision
+draft 1.67 GB, KV 64k Q4 ~1 GB (16 KB/token; superseded, the measured figure is 24,192 B/token, see above), state/scratch/reserve/runtime ~2.4 GB. The embedding table and vision
 tower are already in system RAM. Ideas, best value first:
 1. Re-quantize the DFlash2 draft to ~3 bpw: ~0.6 GB, about +40k context. Needs the bf16 draft (z-lab).
 2. turboderp's `SC_3.00bpw_H4` branch (4-bit head, self-calibrated): ~0.3 GB. 13 GB download, then GPQA/PPL check.

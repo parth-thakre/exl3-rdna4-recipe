@@ -29,6 +29,8 @@ def stream(content, max_tokens, sampling):
                 if t_first is None: t_first = time.time()
                 text += piece
     t_end = time.time()
+    if t_first is None:
+        sys.exit(f"{name}: the server returned no text (max_tokens {max_tokens}); nothing to time")
     n = len(tok.encode(text, add_special_tokens = False).ids)
     return {"ttft_s": round(t_first - t0, 3), "gen_tokens": n,
             "decode_tps": round((n - 1) / (t_end - t_first), 1) if n > 1 else None}, text

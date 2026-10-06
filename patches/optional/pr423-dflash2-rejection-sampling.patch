@@ -1,0 +1,724 @@
+From 8f1e309c583c21e9d8873a44f4331d0fe6c8a786 Mon Sep 17 00:00:00 2001
+From: Rafa <2588276+rafatxf@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 11:57:30 +0530
+Subject: [PATCH] DFlash2: speculative (rejection) sampling for stochastic
+ samplers
+
+Upstream PR turboderp-org/exllamav3#423 by Rafa (@rafatxf), commit eef016b,
+applied unchanged on top of the RDNA4 series (applies cleanly; base 656b3f7).
+
+With temperature > 0 the generator verified DFlash2's greedy selector path by sampling the target and accepting
+matches, so a draft token was accepted with probability p(x). When the single active job's sampler is a stateless
+distribution (temperature / top-k / top-p / min-p), the selector now samples its path from q = softmax(score / T_draft)
+(CUDA: dflash2_selector_walk_sample, Gumbel-max, exports q) and the verifier accepts x with probability
+min(1, p(x) / q(x)), resampling the first rejected position from normalize(max(p - q, 0)) and the bonus token from p
+(Generator._spec_verify, one host sync per block). p is the job sampler's exact distribution (CustomSampler.probs: the
+unfused step stack, with the full-vocabulary sort before a top-k replaced by topk). The output distribution is
+unchanged (Monte Carlo test). T_draft = 0.5 T measured best (EXL3_DFLASH_SPEC_TSCALE).
+
+Match-the-sample verification is kept for greedy jobs, other samplers (penalties, DRY, XTC, logit bias), jobs with
+forced tokens or returned probabilities, drafters without a candidate selector (DFlash v1), and from the point where a
+grammar filter becomes active inside a block (the block was resolved without filter masks). EXL3_DFLASH_SPEC=0
+disables it.
+
+tests/test_dflash_spec_sampling.py: the rejection-sampling verifier reproduces the target distribution (Monte Carlo).
+tests/test_dflash2_walk_sample.py: the sampled selector walk draws from q and exports it.
+
+GDN accepted-input replay (EXL3_GDN_REPLAY) needs no change: the resolved tokens go through the
+same accept/reject loop, so the accepted length still reaches the recurrent state through
+reject_remainder -> rewind(num_rejected), or rewind(0) on full acceptance.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                            |  24 +++++
+ exllamav3/architecture/dflash2.py          |  14 +++
+ exllamav3/exllamav3_ext/bindings.cpp       |   1 +
+ exllamav3/exllamav3_ext/dflash2.cu         |  80 ++++++++++++++-
+ exllamav3/exllamav3_ext/dflash2.cuh        |  14 +++
+ exllamav3/generator/generator.py           | 110 ++++++++++++++++++++-
+ exllamav3/generator/sampler/custom.py      |  80 +++++++++++++--
+ exllamav3/modules/arch_specific/dflash2.py |  54 ++++++++++
+ tests/test_dflash2_walk_sample.py          |  53 ++++++++++
+ tests/test_dflash_spec_sampling.py         |  69 +++++++++++++
+ 10 files changed, 482 insertions(+), 17 deletions(-)
+ create mode 100644 tests/test_dflash2_walk_sample.py
+ create mode 100644 tests/test_dflash_spec_sampling.py
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index 974885c..b227618 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -353,6 +353,30 @@ pipeline everywhere, for A/B testing.
+ Override the path of the on-disk autotune cache for the cooperative GEMM kernels (kernel shape
+ selection results, persisted across runs).
+ 
++## Speculative decoding
++
++### `EXL3_DFLASH_SPEC` (default: `1`)
++
++Speculative (rejection) sampling for DFlash2 drafts, as in the DFlash reference and the Leviathan / Chen et al.
++algorithm: when the single active job samples at temperature > 0 through a stateless sampler (temperature, top-k,
++top-p, min-p; no penalties, DRY, XTC, logit bias, filters, forced tokens or returned probabilities), the drafter's
++candidate selector samples its path from q = softmax(score / T_draft) instead of taking the greedy path, and the
++verifier accepts draft token x with probability min(1, p(x) / q(x)), resampling the first rejected position from
++normalize(max(p - q, 0)). p is the job sampler's exact distribution. The output distribution is unchanged (tested by
++Monte Carlo); acceptance rises wherever several continuations are plausible. Greedy jobs and other samplers keep
++match-the-sample verification. `0` disables it. Read at import.
++
++Qwen3.8-27B 4.0 bpw + DFlash2 4.0 bpw, temperature 1.0 / top-p 0.95 / top-k 20, xhigh reasoning, 16 prompts x 1024
++tokens per task (acceptance length = tokens per verification step): GSM8K 5.25 -> 5.27, MATH-500 4.73 -> 5.08,
++HumanEval 3.53 -> 4.08, MBPP 3.97 -> 4.38, MT-Bench 3.44 -> 3.73 (mean +8%; the drafter card reports 5.46 / 5.28 /
++4.39 / 4.79 / 4.10 on a BF16 target).
++
++### `EXL3_DFLASH_SPEC_TSCALE` (default: `0.5`)
++
++Draft proposal temperature relative to the job's (T_draft = scale x T). Any proposal distribution keeps the output
++exact; a sharper one than the target's accepts more when the drafter is usually right, since a flat q lowers
++sum(min(p, q)). Mean acceptance over the five tasks above: 4.40 at 1.0, 4.46 at 0.7, 4.51 at 0.5, 4.40 at 0.3.
++
+ ## Sampling
+ 
+ ### `EXL3_FUSED_SAMPLER` (default: `1`)
+diff --git a/exllamav3/architecture/dflash2.py b/exllamav3/architecture/dflash2.py
+index ff85e97..d417020 100644
+--- a/exllamav3/architecture/dflash2.py
++++ b/exllamav3/architecture/dflash2.py
+@@ -280,6 +280,20 @@ class DFlash2Model(Model):
+         # The generator stages the block ids in pinned memory: upload without a host sync
+         anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
+         export_conf = params.get("export_draft_conf", False)
++        # Speculative sampling (the generator sets the job sampler's temperature): sampled walk plus its proposal
++        # distribution, verified by rejection sampling in the generator
++        spec_t = params.get("dflash2_temperature", 0.0)
++        if spec_t > 0.0:
++            out, q, cands = self.selector.walk_sample(
++                to_device(state[:, 1:], dev), to_device(logits[:, 1:], dev), anchor, spec_t,
++                vocab_size = target.config.vocab_size,
++                scale = self.config.output_multiplier,
++                softcap = self.config.final_logit_softcapping,
++                generator = params.get("dflash2_generator"),
++            )
++            params["dflash2_q"] = q
++            params["dflash2_cands"] = cands
++            return out
+         # [anchor, path...] and [0, score...] straight from the selector, in the block layout
+         # the generator consumes. The head's padded width, the output multiplier and the
+         # softcap (Gemma-class targets) are handled inside the selector's top-k. The state
+diff --git a/exllamav3/exllamav3_ext/bindings.cpp b/exllamav3/exllamav3_ext/bindings.cpp
+index b6a3755..979702e 100644
+--- a/exllamav3/exllamav3_ext/bindings.cpp
++++ b/exllamav3/exllamav3_ext/bindings.cpp
+@@ -279,6 +279,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+ 
+     m.def("dflash2_dynconv", &dflash2_dynconv, "dflash2_dynconv");
+     m.def("dflash2_selector_walk", &dflash2_selector_walk, "dflash2_selector_walk");
++    m.def("dflash2_selector_walk_sample", &dflash2_selector_walk_sample, "dflash2_selector_walk_sample");
+     m.def("dflash2_topk", &dflash2_topk, "dflash2_topk");
+     m.def("cache_rotate", &cache_rotate, "cache_rotate");
+     m.def("dspark_write_rows", &dspark_write_rows, "dspark_write_rows");
+diff --git a/exllamav3/exllamav3_ext/dflash2.cu b/exllamav3/exllamav3_ext/dflash2.cu
+index 641dcdb..8243991 100644
+--- a/exllamav3/exllamav3_ext/dflash2.cu
++++ b/exllamav3/exllamav3_ext/dflash2.cu
+@@ -175,7 +175,10 @@ void dflash2_selector_walk_kernel
+     float* __restrict__ conf,               // [bsz, rows + 1] or nullptr
+     const int rows,
+     const int k,
+-    const int rank
++    const int rank,
++    const float* __restrict__ gumbel,       // [bsz, rows, k] Gumbel noise, or nullptr for the greedy walk
++    const float inv_temp,                   // sampled walk: 1 / temperature
++    float* __restrict__ q_out               // [bsz, rows, k] sampled walk: softmax(score / T) per row, or nullptr
+ )
+ {
+     extern __shared__ float smem[];
+@@ -218,7 +221,28 @@ void dflash2_selector_walk_kernel
+         }
+         __syncthreads();
+ 
+-        if (t == 0)
++        if (t == 0 && gumbel)
++        {
++            // Sampled walk (speculative sampling): draw from q = softmax(score / T) by Gumbel-max, and export q
++            const float* g_row = gumbel + ((int64_t) b * rows + i) * k;
++            float zmax = -INFINITY;
++            for (int c = 0; c < k; ++c) zmax = fmaxf(zmax, scores[c] * inv_temp);
++            float zsum = 0.0f;
++            for (int c = 0; c < k; ++c) zsum += __expf(scores[c] * inv_temp - zmax);
++            int best = 0;
++            float best_v = -INFINITY;
++            for (int c = 0; c < k; ++c)
++            {
++                const float z = scores[c] * inv_temp - zmax;
++                if (q_out) q_out[((int64_t) b * rows + i) * k + c] = __expf(z) / zsum;
++                const float v = z + g_row[c];
++                if (v > best_v) { best_v = v; best = c; }
++            }
++            s_pred = c_row[best];
++            out[(int64_t) b * (rows + 1) + i + 1] = s_pred;
++            if (conf) conf[(int64_t) b * (rows + 1) + i + 1] = scores[best];
++        }
++        else if (t == 0)
+         {
+             int best = 0;
+             float best_score = scores[0];
+@@ -242,7 +266,7 @@ out:     (bsz, rows + 1) int64 -> [anchor, path...]
+ conf:    (bsz, rows + 1) fp32 -> [0, winning score...] (optional)
+ */
+ 
+-void dflash2_selector_walk
++static void dflash2_selector_walk_impl
+ (
+     const at::Tensor& unary,
+     const at::Tensor& cands,
+@@ -251,7 +275,10 @@ void dflash2_selector_walk
+     const at::Tensor& succ_cb,
+     const at::Tensor& anchor,
+     at::Tensor& out,
+-    const c10::optional<at::Tensor>& conf
++    const c10::optional<at::Tensor>& conf,
++    const float* gumbel_ptr,
++    float inv_temp,
++    float* q_ptr
+ )
+ {
+     const at::cuda::OptionalCUDAGuard device_guard(unary.device());
+@@ -297,7 +324,7 @@ void dflash2_selector_walk
+         ( \
+             (const float*) unary.data_ptr(), (const int64_t*) cands.data_ptr(), (const TG*) gate.data_ptr(), \
+             (const TC*) pred_cb.data_ptr(), (const TC*) succ_cb.data_ptr(), (const int64_t*) anchor.data_ptr(), \
+-            (int64_t*) out.data_ptr(), conf_ptr, rows, k, rank \
++            (int64_t*) out.data_ptr(), conf_ptr, rows, k, rank, gumbel_ptr, inv_temp, q_ptr \
+         );
+     if (gate.dtype() == at::kHalf) { if (pred_cb.dtype() == at::kHalf) { LAUNCH(half, half) } else { LAUNCH(half, __nv_bfloat16) } }
+     else                           { if (pred_cb.dtype() == at::kHalf) { LAUNCH(float, half) } else { LAUNCH(float, __nv_bfloat16) } }
+@@ -305,6 +332,49 @@ void dflash2_selector_walk
+     cuda_check(cudaPeekAtLastError());
+ }
+ 
++void dflash2_selector_walk
++(
++    const at::Tensor& unary,
++    const at::Tensor& cands,
++    const at::Tensor& gate,
++    const at::Tensor& pred_cb,
++    const at::Tensor& succ_cb,
++    const at::Tensor& anchor,
++    at::Tensor& out,
++    const c10::optional<at::Tensor>& conf
++)
++{
++    dflash2_selector_walk_impl(unary, cands, gate, pred_cb, succ_cb, anchor, out, conf, nullptr, 1.0f, nullptr);
++}
++
++/*
++Sampled walk for speculative sampling: as dflash2_selector_walk, but each row draws its token from
++softmax(score / temperature) with the given Gumbel noise and writes that distribution to q.
++gumbel: (bsz, rows, k) fp32; q: (bsz, rows, k) fp32 out
++*/
++void dflash2_selector_walk_sample
++(
++    const at::Tensor& unary,
++    const at::Tensor& cands,
++    const at::Tensor& gate,
++    const at::Tensor& pred_cb,
++    const at::Tensor& succ_cb,
++    const at::Tensor& anchor,
++    at::Tensor& out,
++    const at::Tensor& gumbel,
++    at::Tensor& q,
++    double temperature
++)
++{
++    TORCH_CHECK_DTYPE(gumbel, kFloat);
++    TORCH_CHECK_DTYPE(q, kFloat);
++    TORCH_CHECK(gumbel.is_contiguous() && q.is_contiguous(), "dflash2_selector_walk_sample: gumbel and q must be contiguous");
++    TORCH_CHECK(gumbel.sizes() == unary.sizes() && q.sizes() == unary.sizes(), "dflash2_selector_walk_sample: gumbel and q must be (bsz, rows, k)");
++    TORCH_CHECK(temperature > 0.0, "dflash2_selector_walk_sample: temperature must be positive");
++    dflash2_selector_walk_impl(unary, cands, gate, pred_cb, succ_cb, anchor, out, c10::nullopt,
++                               (const float*) gumbel.data_ptr(), (float) (1.0 / temperature), (float*) q.data_ptr());
++}
++
+ 
+ // Top-k over the draft block's logits for the selector, one launch for all rows (torch.topk
+ // spends ~18 launches on its radix select). Each row is split over blocks of 256 threads x E
+diff --git a/exllamav3/exllamav3_ext/dflash2.cuh b/exllamav3/exllamav3_ext/dflash2.cuh
+index 2263eec..b3e379f 100644
+--- a/exllamav3/exllamav3_ext/dflash2.cuh
++++ b/exllamav3/exllamav3_ext/dflash2.cuh
+@@ -24,6 +24,20 @@ void dflash2_selector_walk
+     const c10::optional<at::Tensor>& conf
+ );
+ 
++void dflash2_selector_walk_sample
++(
++    const at::Tensor& unary,
++    const at::Tensor& cands,
++    const at::Tensor& gate,
++    const at::Tensor& pred_cb,
++    const at::Tensor& succ_cb,
++    const at::Tensor& anchor,
++    at::Tensor& out,
++    const at::Tensor& gumbel,
++    at::Tensor& q,
++    double temperature
++);
++
+ void dflash2_topk
+ (
+     const at::Tensor& logits,
+diff --git a/exllamav3/generator/generator.py b/exllamav3/generator/generator.py
+index aec4981..1105ae8 100644
+--- a/exllamav3/generator/generator.py
++++ b/exllamav3/generator/generator.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++import os
+ import logging
+ import torch
+ from ..model.model import Model
+@@ -23,6 +24,36 @@ import threading
+ from ..tokenizer import MMEmbedding
+ from ..util import profile_opt
+ 
++# Speculative (rejection) sampling for DFlash2 drafts with stochastic samplers; EXL3_DFLASH_SPEC=0 keeps the
++# match-the-sample verification
++_dflash_spec_enabled = os.environ.get("EXL3_DFLASH_SPEC", "1") != "0"
++# Draft proposal temperature relative to the job's: any proposal distribution keeps the output exact, and a sharper
++# one than the target's accepts more when the drafter is usually right (a flat q lowers sum(min(p, q)))
++_dflash_spec_temp_scale = float(os.environ.get("EXL3_DFLASH_SPEC_TSCALE", "0.5"))
++
++
++def _spec_sampling_ok(job) -> bool:
++    return (
++        getattr(job.sampler, "spec_ok", False) and job.new_tokens >= 0 and job.forced_ids is None and
++        not job.return_probs and not job.return_top_tokens and
++        not any(f.is_active for f in job.filters)
++    )
++
++
++def _spec_generator(job, draft_model, device = None):
++    """Per-job torch generator for the draft and verify draws, seeded from the job's RNG."""
++    if device is None:
++        device = draft_model.selector.device
++    gens = job.__dict__.setdefault("_spec_generators", {})
++    key = str(device)
++    g = gens.get(key)
++    if g is None:
++        g = torch.Generator(device = device)
++        g.manual_seed(job.rng.randint(0, (1 << 62) - 1))
++        gens[key] = g
++    return g
++
++
+ class Generator:
+ 
+     def __init__(
+@@ -903,6 +934,20 @@ class Generator:
+         }
+         if self.draft_calibrator is not None:
+             params["export_draft_conf"] = True
++        # Speculative sampling (DFlash2): a single job whose sampler draws from a stateless distribution
++        # (temperature / top-k / top-p / min-p) gets a sampled draft path, verified in iterate_gen by rejection
++        # sampling instead of match-the-sample. Same output distribution, higher acceptance at temperature > 0
++        self._spec = None
++        spec_job = None
++        # DFlash2 only: the sampled walk runs on its candidate selector (DFlash v1 drafters keep match-the-sample)
++        if batch_size == 1 and _dflash_spec_enabled and getattr(self.draft_model, "selector", None) is not None:
++            spec_job = next((j_ for j_ in self.active_jobs if j_.is_prefill_done()), None)
++            if spec_job is not None and _spec_sampling_ok(spec_job):
++                params["dflash2_temperature"] = float(spec_job.sampler.spec_temperature) * _dflash_spec_temp_scale
++                params["dflash2_generator"] = _spec_generator(spec_job, self.draft_model)
++            else:
++                spec_job = None
++
+         out_state = self.draft_model.forward(
+             input_ids = batch_ids,
+             params = params,
+@@ -940,9 +985,48 @@ class Generator:
+             window = w_used
+ 
+         self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
++        if spec_job is not None and "dflash2_q" in params:
++            self._spec = {
++                "job": spec_job,
++                "ids": new_ids[:1, :window],
++                "q": params["dflash2_q"][:1, :window],
++                "cands": params["dflash2_cands"][:1, :window],
++            }
+         return self.draft_ids_pinned[:, :window]
+ 
+ 
++    def _spec_verify(self, job, job_logits: torch.Tensor, spec: dict) -> torch.Tensor:
++        """
++        Rejection sampling over one verified block (Leviathan et al. / Chen et al.): accept draft token x_i with
++        probability min(1, p_i(x_i) / q_i(x_i)); at the first rejection draw from normalize(max(p_i - q_i, 0)),
++        after a fully accepted block draw the bonus token from p_L. Returns the resolved tokens [L + 1] on the CPU:
++        the accepted draft prefix, then the drawn token, then padding (never read).
++        """
++        x = spec["ids"][0].long()
++        L = x.shape[-1]
++        dev = job_logits.device
++        x = x.to(dev)
++        q = spec["q"][0].to(dev).float()
++        c = spec["cands"][0].to(dev).long()
++        P = job.sampler.probs(job_logits[0, :L + 1], self.tokenizer)
++        ar = torch.arange(L, device = dev)
++        p_x = P[ar, x]
++        q_x = (q * (c == x[:, None])).sum(-1)
++        g = _spec_generator(job, None, dev)
++        u = torch.rand((L,), device = dev, generator = g)
++        a = (u * q_x < p_x).int().cumprod(0).sum()
++        q_dense = torch.zeros((L, P.shape[-1]), dtype = P.dtype, device = dev).scatter_(-1, c, q)
++        r = (P[:L] - q_dense).clamp_min_(0.0)
++        tot = r.sum(-1, keepdim = True)
++        r = torch.where(tot > 0, r / tot.clamp_min(1e-30), P[:L])
++        d = torch.cat([r, P[L:L + 1]], dim = 0)
++        gum = -torch.log(-torch.log(torch.rand(d.shape, device = dev, generator = g).clamp_min(1e-20)))
++        fix = torch.argmax(torch.log(d) + gum, dim = -1)
++        seq = torch.cat([x, x[:1]])
++        seq[a] = fix[a]
++        return seq.cpu()
++
++
+     def iterate_ngram_gen(self, results: list):
+ 
+         # Get shape of active batch
+@@ -1209,11 +1293,25 @@ class Generator:
+                 accepted_length = 1
+                 rejected = 0
+ 
++                # Speculative sampling: tokens resolved for the whole block by rejection sampling
++                spec_tokens = None
++                spec = getattr(self, "_spec", None)
++                if draft_tokens is not None and spec is not None and spec["job"] is job:
++                    spec_tokens = self._spec_verify(job, job_logits, spec)
++                    self._spec = None
++
+                 for i in range(batch_logits.shape[1]):
+                     token_logits = job_logits[:, i:i + 1, :]
+-                    next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
+-                        token_logits,
+-                    )
++                    # A forced injection (constrain_output_now, e.g. a reasoning budget running out) that arrived
++                    # after the block was resolved takes over from here: receive_logits emits the forced tokens
++                    if spec_tokens is not None and job.forced_ids is not None:
++                        spec_tokens = None
++                    if spec_tokens is not None:
++                        next_token, next_k_tokens, next_k_probs, next_prob = spec_tokens[i:i + 1].view(1, 1), None, None, None
++                    else:
++                        next_token, next_k_tokens, next_k_probs, next_prob = job.receive_logits(
++                            token_logits,
++                        )
+                     eos, sampled_token, rq = job.receive_sample(
+                         token_logits,
+                         next_token,
+@@ -1268,7 +1366,11 @@ class Generator:
+                     # draft acceptance so state can be stashed at an exact page boundary.
+                     if draft_tokens is not None and i < batch_logits.shape[1] - 1:
+                         cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+-                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
++                        # The speculative block was resolved without filter masks, which is only valid while
++                        # every filter is inactive: once a trigger token (e.g. </think> ahead of a JSON grammar)
++                        # activates one, the rest of the block is dropped and resampled under the mask
++                        spec_cut = spec_tokens is not None and any(f.is_active for f in job.filters)
++                        if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary or spec_cut:
+                             rejected = reject_remainder(job, j, i, batch_states)
+                             break
+ 
+diff --git a/exllamav3/generator/sampler/custom.py b/exllamav3/generator/sampler/custom.py
+index 77c7e40..86595a5 100644
+--- a/exllamav3/generator/sampler/custom.py
++++ b/exllamav3/generator/sampler/custom.py
+@@ -1154,19 +1154,83 @@ class CustomSampler(Sampler):
+             if fused_tail is not None:
+                 head = simplified[:i]
+ 
++        # Unfused step list, also kept when the tail is fused: probs() runs it to get the exact distribution the
++        # final sampling step draws from (speculative sampling needs p(x) for every candidate x)
++        self.plain_steps = []
++        state = SS.INIT
++        for step in simplified:
++            prep_steps = step.prep(state)
++            if prep_steps:
++                for prep_step in prep_steps:
++                    self.plain_steps.append(prep_step())
++            self.plain_steps.append(step)
++        # Speculative (rejection) sampling needs a stateless, past-independent distribution: temperature and the
++        # truncations, ending in a categorical draw
++        # (reqs_past_ids also counts penalty steps that simplified to no-ops, so check the effective steps instead)
++        self.spec_ok = (
++            bool(self.plain_steps) and isinstance(self.plain_steps[-1], SS_Sample) and
++            all(isinstance(s, (SS_Temperature, SS_Normalize, SS_Sort, SS_TopK, SS_TopP, SS_MinP, SS_Sample))
++                for s in self.plain_steps)
++        )
++        temps = [s.temperature for s in self.plain_steps if isinstance(s, SS_Temperature)]
++        self.spec_temperature = temps[0] if temps else 1.0
++
+         if fused_tail is not None:
+             self.steps = head + [fused_tail]
+             self.fused_only = not head
+         else:
+-            self.steps = []
++            self.steps = list(self.plain_steps)
+             self.fused_only = False
+-            state = SS.INIT
+-            for step in simplified:
+-                prep_steps = step.prep(state)
+-                if prep_steps:
+-                    for prep_step in prep_steps:
+-                        self.steps.append(prep_step())
+-                self.steps.append(step)
++
++
++    @torch.inference_mode
++    def probs(self, logits: torch.Tensor, tokenizer: Tokenizer | None = None) -> torch.Tensor:
++        """
++        Normalized distribution (n, vocab) the final categorical step samples from, for logits (n, vocab). Only for
++        spec_ok samplers (no past ids, no masks, no stateful steps)
++        """
++        assert self.spec_ok
++        dim = logits.shape[-1]
++        n = logits.numel() // dim
++        logits = logits.reshape(n, dim).float().clone()
++        if tokenizer is not None and tokenizer.actual_vocab_size < dim:
++            logits[:, tokenizer.actual_vocab_size:] = -float("inf")
++        state = SamplingState(rand_u32 = 0, bsz = n, dim = dim, in_logits = logits, tokenizer = tokenizer)
++        steps = self.plain_steps[:-1]
++        for i, ss in enumerate(steps):
++            # A sort that only feeds a top-k needs the k largest entries, in order: torch.topk instead of sorting
++            # the whole vocabulary (same distribution; entries past k are zeroed by the top-k step anyway)
++            if isinstance(ss, SS_Sort) and i + 1 < len(steps) and isinstance(steps[i + 1], SS_TopK) and                     steps[i + 1].top_k < dim and state.state in (SS.INIT, SS.LOGITS, SS.PROBS, SS.PROBS_N):
++                k = steps[i + 1].top_k
++                match state.state:
++                    case SS.INIT:
++                        state.logits, state.indices = torch.topk(state.in_logits.float(), k, dim = -1)
++                        state.state = SS.LOGITS_S
++                    case SS.LOGITS:
++                        state.logits, state.indices = torch.topk(state.logits, k, dim = -1)
++                        state.state = SS.LOGITS_S
++                    case SS.PROBS:
++                        state.probs, state.indices = torch.topk(state.probs, k, dim = -1)
++                        state.state = SS.PROBS_S
++                    case SS.PROBS_N:
++                        state.probs, state.indices = torch.topk(state.probs, k, dim = -1)
++                        state.state = SS.PROBS_N_S
++                continue
++            ss.run(state)
++        match state.state:
++            case SS.INIT:
++                return torch.softmax(state.in_logits, dim = -1)
++            case SS.LOGITS:
++                return torch.softmax(state.logits, dim = -1)
++            case SS.PROBS | SS.PROBS_N:
++                return state.probs / state.probs.sum(dim = -1, keepdim = True)
++            case SS.LOGITS_S:
++                p = torch.softmax(state.logits, dim = -1)
++                return torch.zeros((n, dim), dtype = p.dtype, device = p.device).scatter_(-1, state.indices, p)
++            case SS.PROBS_S | SS.PROBS_N_S:
++                p = state.probs / state.probs.sum(dim = -1, keepdim = True)
++                return torch.zeros((n, dim), dtype = p.dtype, device = p.device).scatter_(-1, state.indices, p)
++        raise ValueError("Sampling logic error")
+ 
+ 
+     @override
+diff --git a/exllamav3/modules/arch_specific/dflash2.py b/exllamav3/modules/arch_specific/dflash2.py
+index 2a1c641..f55de98 100644
+--- a/exllamav3/modules/arch_specific/dflash2.py
++++ b/exllamav3/modules/arch_specific/dflash2.py
+@@ -377,6 +377,60 @@ class DFlash2Selector(Module):
+         return self._walk_torch(unary.float(), cands.long(), gate.float(), anchor_ids, return_confidence)
+ 
+ 
++    def walk_sample(
++        self,
++        hidden: torch.Tensor,
++        logits: torch.Tensor,
++        anchor_ids: torch.Tensor,
++        temperature: float,
++        vocab_size: int | None = None,
++        scale: float = 1.0,
++        softcap: float = 0.0,
++        generator: torch.Generator | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """Sampled selector walk for speculative sampling (dflash reference CandidateSelector.select at
++        temperature > 0): at each row the next token is drawn from q = softmax(scores / T) over the row's top-k
++        candidates, scores conditioned on the previously drawn token. Returns ids [b, rows + 1] = [anchor, path...],
++        q [b, rows, k] and the candidates [b, rows, k], so the verifier can accept with min(1, p / q)."""
++        vocab_size = vocab_size or logits.shape[-1]
++        gate = self.hidden_proj.forward(hidden.half(), params = {})
++        bsz, rows = logits.shape[:2]
++        if hidden.is_cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
++            unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
++            cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
++            ext.dflash2_topk(logits, vocab_size, scale, softcap, unary, cands)
++        else:
++            lg = logits[..., :vocab_size].float() * scale
++            if softcap > 0.0:
++                lg = torch.tanh(lg / softcap) * softcap
++            unary, cands = torch.topk(lg, self.top_k, dim = -1, sorted = False)
++        u = torch.rand((bsz, rows, self.top_k), device = hidden.device, generator = generator)
++        gumbel = -torch.log(-torch.log(u.clamp_min(1e-20)))
++        if hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16):
++            out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
++            q = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
++            ext.dflash2_selector_walk_sample(
++                unary.float().contiguous(), cands.long().contiguous(), gate.contiguous(),
++                self.pred_codebook, self.succ_codebook, anchor_ids.long().to(hidden.device, non_blocking = anchor_ids.is_pinned()).contiguous(),
++                out, gumbel.contiguous(), q, float(temperature),
++            )
++            return out, q, cands
++        gate = gate.float()
++        pred = anchor_ids.long().to(hidden.device)
++        path = [pred]
++        qs = []
++        for i in range(rows):
++            a_emb = F.embedding(pred, self.pred_codebook).float()
++            b_emb = F.embedding(cands[:, i], self.succ_codebook).float()
++            scores = unary[:, i].float() + torch.einsum("br,bkr->bk", a_emb * gate[:, i], b_emb)
++            logq = torch.log_softmax(scores / temperature, dim = -1)
++            idx = torch.argmax(logq + gumbel[:, i], dim = -1)
++            pred = cands[:, i].gather(-1, idx[:, None])[:, 0]
++            path.append(pred)
++            qs.append(logq.exp())
++        return torch.stack(path, dim = 1), torch.stack(qs, dim = 1), cands
++
++
+     def _walk_torch(self, unary, cands, gate, anchor_ids, return_confidence):
+         pred = anchor_ids
+         path = [pred]
+diff --git a/tests/test_dflash2_walk_sample.py b/tests/test_dflash2_walk_sample.py
+new file mode 100644
+index 0000000..177e8eb
+--- /dev/null
++++ b/tests/test_dflash2_walk_sample.py
+@@ -0,0 +1,53 @@
++"""
++DFlash2 sampled selector walk (speculative sampling): the CUDA kernel (ext.dflash2_selector_walk_sample) must draw
++the same path as the torch formulation for the same Gumbel noise and return the same proposal distribution q.
++
++    python -m pytest tests/test_dflash2_walk_sample.py -v
++"""
++import pytest
++import torch
++
++from exllamav3.modules.arch_specific.dflash2 import DFlash2Selector
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA required", allow_module_level=True)
++
++DEV = "cuda:0"
++
++
++class _Proj:
++    def __init__(self, w):
++        self.w = w
++    def forward(self, x, params = None):
++        return (x.float() @ self.w).half()
++
++
++class _Sel:
++    walk_sample = DFlash2Selector.walk_sample
++    def __init__(self, vocab, hidden, rank, top_k, dtype):
++        g = torch.Generator(device = DEV).manual_seed(3)
++        self.pred_codebook = (torch.randn((vocab, rank), device = DEV, generator = g) * 0.3).to(dtype)
++        self.succ_codebook = (torch.randn((vocab, rank), device = DEV, generator = g) * 0.3).to(dtype)
++        self.hidden_proj = _Proj(torch.randn((hidden, rank), device = DEV, generator = g) * 0.05)
++        self.top_k = top_k
++
++
++@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
++@pytest.mark.parametrize("temperature", [0.6, 1.0, 1.5])
++def test_walk_sample_cuda_matches_torch(dtype, temperature):
++    vocab, hidden, rank, top_k, bsz, rows = 4096, 256, 64, 16, 2, 7
++    sel = _Sel(vocab, hidden, rank, top_k, dtype)
++    g = torch.Generator(device = DEV).manual_seed(11)
++    h = torch.randn((bsz, rows, hidden), device = DEV, generator = g).half()
++    logits = (torch.randn((bsz, rows, vocab), device = DEV, generator = g) * 3.0).half()
++    anchor = torch.randint(0, vocab, (bsz,), device = DEV, generator = g)
++    out_c, q_c, c_c = sel.walk_sample(h, logits, anchor, temperature, generator = torch.Generator(device = DEV).manual_seed(5))
++    # torch path: same noise (same generator seed), force the fallback with a CPU-typed check
++    orig = sel.pred_codebook
++    sel.pred_codebook = orig.float()           # dtype outside (half, bf16) -> torch formulation
++    sel.succ_codebook = sel.succ_codebook.float()
++    out_t, q_t, c_t = sel.walk_sample(h, logits, anchor, temperature, generator = torch.Generator(device = DEV).manual_seed(5))
++    assert torch.equal(c_c, c_t)
++    assert torch.equal(out_c, out_t), (out_c, out_t)
++    assert (q_c - q_t).abs().max().item() < 2e-3
++    assert torch.allclose(q_c.sum(-1), torch.ones_like(q_c.sum(-1)), atol = 1e-4)
+diff --git a/tests/test_dflash_spec_sampling.py b/tests/test_dflash_spec_sampling.py
+new file mode 100644
+index 0000000..0955c81
+--- /dev/null
++++ b/tests/test_dflash_spec_sampling.py
+@@ -0,0 +1,69 @@
++"""
++Speculative (rejection) sampling for DFlash2 drafts (Generator._spec_verify): the emitted tokens must follow the
++target sampler's distribution exactly, whatever the draft distribution q. Monte Carlo on a small vocabulary with the
++real sampler stack (temperature / top-k / top-p): the first emitted token matches p_0, and after an accepted first
++draft token the second matches p_1 (chi-square).
++
++    python -m pytest tests/test_dflash_spec_sampling.py -v
++"""
++import random
++import pytest
++import torch
++
++from exllamav3.generator.generator import Generator
++from exllamav3.generator.sampler.presets import ComboSampler
++
++if not torch.cuda.is_available():
++    pytest.skip("CUDA required", allow_module_level=True)
++
++DEV = "cuda:0"
++
++
++class _Job:
++    def __init__(self, sampler, seed):
++        self.sampler = sampler
++        self.rng = random.Random(seed)
++
++
++class _Gen:
++    tokenizer = None
++    _spec_verify = Generator._spec_verify
++
++
++def _chi2_ok(counts, probs, n):
++    exp = probs * n
++    keep = exp > 5
++    chi2 = (((counts - exp) ** 2) / exp.clamp_min(1e-9))[keep].sum().item()
++    dof = max(int(keep.sum().item()) - 1, 1)
++    # generous bound: mean + 6 sd of chi-square(dof)
++    return chi2 < dof + 6 * (2 * dof) ** 0.5, chi2, dof
++
++
++@pytest.mark.parametrize("sampler_args", [dict(temperature = 1.0, top_k = 6, top_p = 0.95), dict(temperature = 0.7), dict(temperature = 1.3, top_p = 0.8)])
++def test_spec_verify_preserves_distribution(sampler_args):
++    torch.manual_seed(0)
++    V, L, K, N = 12, 3, 4, 40000
++    sampler = ComboSampler(**sampler_args)
++    assert sampler.spec_ok
++    logits = torch.randn((1, L + 1, V), device = DEV) * 1.5
++    P = sampler.probs(logits[0], None)
++    # draft: fixed candidate sets and proposal distributions per position (deliberately unlike P)
++    cands = torch.stack([torch.randperm(V, device = DEV)[:K] for _ in range(L)])[None]
++    q = torch.softmax(torch.randn((1, L, K), device = DEV) * 2.0, dim = -1)
++    job = _Job(sampler, 1)
++    gen = _Gen()
++    first = torch.zeros(V, device = DEV)
++    second = torch.zeros(V, device = DEV)
++    n_second = 0
++    x_all = torch.multinomial(q[0], N, replacement = True).T      # (N, L) candidate indices
++    for t in range(N):
++        ids = cands[0, torch.arange(L, device = DEV), x_all[t]][None]
++        seq = gen._spec_verify(job, logits, {"ids": ids, "q": q, "cands": cands})
++        first[seq[0]] += 1
++        if seq[0] == ids[0, 0].item():      # first draft token accepted: next emitted token ~ p_1
++            second[seq[1]] += 1
++            n_second += 1
++    ok, chi2, dof = _chi2_ok(first, P[0], N)
++    assert ok, f"first token: chi2 {chi2:.1f} dof {dof}"
++    ok, chi2, dof = _chi2_ok(second, P[1], n_second)
++    assert ok, f"second token: chi2 {chi2:.1f} dof {dof} (n {n_second})"

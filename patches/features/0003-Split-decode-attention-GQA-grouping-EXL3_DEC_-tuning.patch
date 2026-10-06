@@ -1,3 +1,86 @@
+From 0603ac1d29ff199fad53d75750556fe374c0016b Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 11:55:03 +0530
+Subject: [PATCH 3/6] Split-decode attention: GQA grouping, EXL3_DEC_* tuning,
+ Q4W kernel
+
+A program of the split-decode kernel takes 16 query rows, so a multi-token
+verify (q_len 8) spreads Qwen's 6-head GQA groups over 3 programs, each
+re-reading and re-dequantizing the same K/V. On gfx1201 at 60k context one
+layer goes 1961 -> 605 us (q_len 8), 1336 -> 450 (q_len 4) and 550 -> 336
+(q_len 1) with the settings below; max error 2e-6.
+
+- EXL3_DEC_GROUP=1: the whole GQA group per program (decode_block_h) and a
+  higher split target (decode_split_target: 8 programs per CU at q_len 1, 4
+  for verify; EXL3_DEC_SPLIT_MULT overrides). EXL3_DEC_BLOCK_H sets the
+  heads per program directly.
+- EXL3_DEC_WARPS / EXL3_DEC_STAGES / EXL3_DEC_BLOCK_N override the launch
+  shape, each on its own, through one resolver (decode_launch_overrides)
+  shared by the eager launch and the BC graph build, so a BC decline keeps the
+  tuning. They layer over upstream's attn_decode_config: explicit arguments,
+  then the env overrides, then the per-backend/arch defaults. With none set,
+  every arch (gfx1100 included) keeps upstream's config.
+- EXL3_DEC_Q4W=1: _paged_attn_decode_split_q4w_kernel for 4-bit K/V caches
+  (head_dim a power of two >= 128). It loads each tile's packed words once and
+  splits the dots into 8 per-nibble partial dots, avoiding the LDS-shuffle
+  unpack: 1.2-1.3x at q_len 4-8. Splits past the live count exit before the
+  query preparation.
+- BC_Attention::configure_slot takes block_h from Python, so the C++ program
+  count matches the BLOCK_H the split kernel was compiled with (recomputing it
+  with the old rule faulted the GPU). 0 keeps the old rule.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                               |  31 +++
+ .../exllamav3_ext/libtorch/attention.cpp      |   4 +-
+ exllamav3/exllamav3_ext/libtorch/attention.h  |   1 +
+ .../exllamav3_ext/libtorch/attention_bc.h     |   1 +
+ exllamav3/modules/attention_fn/bc_attn.py     |  20 +-
+ .../modules/attention_fn/triton_paged.py      | 259 +++++++++++++++++-
+ 6 files changed, 301 insertions(+), 15 deletions(-)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index e203023..a6ea9bc 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -51,6 +51,37 @@ Print one line per attention module/cache-layer pair when the graph-captured dec
+ built or declined (module key, device). Activation check for A/B tests: a benchmark comparing
+ `EXL3_BC_ATTN` settings is only meaningful if the enabled run actually built the path.
+ 
++### `EXL3_DEC_GROUP` (default: `0`)
++
++Split-decode attention, graph-captured and eager: a program normally takes 16 query rows
++(q_len x GQA heads), so a multi-token verify (q_len 8, group of 6) spreads one GQA group over
++several programs, each re-reading and re-dequantizing the same K/V tiles. `1` gives each
++program the whole group (q_len x next_pow2(group) rows, at least 16) and, unless
++`EXL3_DEC_SPLIT_MULT` is set, aims for 8 (single-token) or 4 (multi-token) programs per CU
++instead of 2. Tuned on gfx1201.
++
++### `EXL3_DEC_BLOCK_H` (default: unset)
++
++GQA heads per split-decode program while `EXL3_DEC_GROUP` is off; a power of two.
++
++### `EXL3_DEC_SPLIT_MULT` (default: unset)
++
++Programs per CU (a float) the split-decode split count aims for.
++
++### `EXL3_DEC_WARPS`, `EXL3_DEC_STAGES`, `EXL3_DEC_BLOCK_N` (default: unset)
++
++Override the split-decode kernel's warps, pipeline stages and kv tile (powers of two; stages
++non-negative) over the per-backend / per-architecture defaults (`attn_decode_config` in
++`exllamav3/util/backend.py`). Each applies on its own, in the eager launch and the
++graph-captured build alike; explicit arguments to `paged_attn_triton_decode` still win. A set
++`EXL3_DEC_BLOCK_N` replaces the shared-memory ladder with that one tile.
++
++### `EXL3_DEC_Q4W` (default: `0`)
++
++Word-sliced split-decode kernel for 4-bit K and V caches (head_dim a power of two, at least 128):
++each tile's packed words are loaded once and the dots split into 8 per-nibble partial dots,
++instead of unpacking through an LDS shuffle. 1.2-1.3x the packed kernel on gfx1201 at q_len 4-8.
++
+ ### `EXL3_BC_DSA` (default: `1`)
+ 
+ DeepSeek-V4 counterpart of `EXL3_BC_ATTN`: for decode steps (bsz 1, q_len ≤ 16) the whole DSA
 diff --git a/exllamav3/exllamav3_ext/libtorch/attention.cpp b/exllamav3/exllamav3_ext/libtorch/attention.cpp
 index 5932275..79781af 100644
 --- a/exllamav3/exllamav3_ext/libtorch/attention.cpp
@@ -45,34 +128,35 @@ index 391745c..5b9f8de 100644
      py::arg("yp")
  )
 diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
-index 458ccc9..7dcb160 100644
+index 428e390..d4e8440 100644
 --- a/exllamav3/modules/attention_fn/bc_attn.py
 +++ b/exllamav3/modules/attention_fn/bc_attn.py
-@@ -76,6 +76,8 @@ def _split_launch(device, hd_pad: int) -> tuple[int, int]:
-     """(num_warps, num_stages) for the split-decode kernel: gfx1100 runs the head_dim <= 128 tile faster
-     at 4 warps (still a single stage)"""
-     from .triton_paged import gfx_arch
-+    if (w := os.environ.get("EXL3_DEC_WARPS")):
-+        return int(w), int(os.environ.get("EXL3_DEC_STAGES", _SPLIT_STAGES))
-     if hd_pad <= 128 and gfx_arch(device) == "gfx1100":
-         return 4, 1
-     return _SPLIT_WARPS, _SPLIT_STAGES
-@@ -311,6 +313,9 @@ class BCAttn:
+@@ -299,10 +299,13 @@ class BCAttn:
+         import triton
+         from .triton_paged import (
+             combine_subtiles,
+-            _paged_attn_decode_split_kernel,
              _paged_attn_decode_combine_kernel,
              _paged_kv_update_kernel,
              _normalize_window,
++            decode_launch_overrides,
 +            decode_block_h,
 +            decode_split_target,
 +            decode_split_kernel_for,
          )
  
          dev = self.device
-@@ -319,16 +324,16 @@ class BCAttn:
+@@ -311,16 +314,22 @@ class BCAttn:
          qh, kvh = self.num_q_heads, self.num_kv_heads
          group_size = qh // kvh
  
--        block_n = max(16, 8192 // hd_pad)
-+        block_n = int(os.environ.get("EXL3_DEC_BLOCK_N", max(16, 8192 // hd_pad)))
++        # Per backend / architecture defaults (util/backend.py), each overridable by EXL3_DEC_* (shared with
++        # the eager launch, so a fallback keeps the tuning)
+         block_n, split_warps, split_stages = attn_decode_config(dev, hd_pad)
++        env_warps, env_stages, env_block_n = decode_launch_overrides()
++        block_n = env_block_n or block_n
++        split_warps = split_warps if env_warps is None else env_warps
++        split_stages = split_stages if env_stages is None else env_stages
          block_m = triton.next_power_of_2(q_len)
 -        block_h = max(16 // block_m, 1)
 +        block_h = decode_block_h(block_m, group_size)
@@ -87,17 +171,17 @@ index 458ccc9..7dcb160 100644
          splits_cap = max(1, min(target // programs, 128))
          window_left, window_right = _normalize_window(self.window_size)
  
-@@ -355,7 +360,8 @@ class BCAttn:
+@@ -347,7 +356,8 @@ class BCAttn:
              SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
              BLOCK_M = block_m, BLOCK_H = block_h, BLOCK_ROWS = block_rows, BLOCK_N = block_n,
          )
--        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, *_split_launch(dev, hd_pad),
+-        k_split = _compile_kernel(dev, _paged_attn_decode_split_kernel, sig, consts, split_warps, split_stages,
 +        split_fn = decode_split_kernel_for(self.k_bits if self.quant else 0, self.v_bits if self.quant else 0, hd, hd_pad)
-+        k_split = _compile_kernel(dev, split_fn, sig, consts, *_split_launch(dev, hd_pad),
++        k_split = _compile_kernel(dev, split_fn, sig, consts, split_warps, split_stages,
                                    pointer_range_32 = self._pointer_range_32())
  
          sig_c = {
-@@ -432,7 +438,7 @@ class BCAttn:
+@@ -424,7 +434,7 @@ class BCAttn:
              q, kv, o, partial_o, partial_ml,
              gate_a, gate_b,
              k_split, k_combine, k_update,
@@ -107,10 +191,10 @@ index 458ccc9..7dcb160 100644
          )
  
 diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
-index 26e24b4..4b2b027 100644
+index 25d548e..332b41a 100644
 --- a/exllamav3/modules/attention_fn/triton_paged.py
 +++ b/exllamav3/modules/attention_fn/triton_paged.py
-@@ -1056,6 +1056,197 @@ def _paged_attn_decode_split_kernel(
+@@ -1043,6 +1043,200 @@ def _paged_attn_decode_split_kernel(
              tl.store(partial_ml + ml_base + rows * 2 + 1, l)
  
  
@@ -148,6 +232,9 @@ index 26e24b4..4b2b027 100644
 +):
 +    pid = tl.program_id(0)
 +    split = tl.program_id(1)
++    # BC launches the grid at the split cap; splits past the live count skip the query prep entirely
++    if split >= num_splits:
++        return
 +    WPH: tl.constexpr = head_dim // 8           # 4-bit words per head per token
 +    G: tl.constexpr = head_dim // 32
 +    GPT: tl.constexpr = n_kv_heads * head_dim // 32
@@ -308,10 +395,34 @@ index 26e24b4..4b2b027 100644
  @triton.jit
  def _paged_attn_decode_combine_kernel(
      partial_o,
-@@ -1162,6 +1353,26 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+@@ -1149,6 +1343,50 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
  
  _decode_sm_count = {}
  
++def _env_pow2(name: str) -> int | None:
++    """A power-of-two launch override from the environment, None when unset"""
++    if not (v := os.environ.get(name)):
++        return None
++    n = int(v)
++    if n <= 0 or n & (n - 1):
++        raise ValueError(f"{name}={v}: must be a positive power of two")
++    return n
++
++def decode_launch_overrides(num_warps: int | None = None, num_stages: int | None = None,
++                            block_n: int | None = None) -> tuple[int | None, int | None, int | None]:
++    """Fills each of (num_warps, num_stages, block_n) left as None from EXL3_DEC_WARPS / EXL3_DEC_STAGES /
++    EXL3_DEC_BLOCK_N (still None when unset). Both the eager split-decode launch and the BC graph build resolve
++    through here, so a fallback keeps the tuning. An env value is only read (and validated) when it applies."""
++    if num_warps is None:
++        num_warps = _env_pow2("EXL3_DEC_WARPS")
++    if num_stages is None and (v := os.environ.get("EXL3_DEC_STAGES")):
++        num_stages = int(v)
++        if num_stages < 0:
++            raise ValueError(f"EXL3_DEC_STAGES={v}: must be non-negative")
++    if block_n is None:
++        block_n = _env_pow2("EXL3_DEC_BLOCK_N")
++    return num_warps, num_stages, block_n
++
 +def decode_block_h(block_m: int, group_size: int) -> int:
 +    """GQA sibling heads per split-decode program. The default packs 16 rows (block_m * block_h); with a multi-token
 +    query (speculative verify) that splits a GQA group across programs, each re-reading and re-dequantizing the same
@@ -319,8 +430,8 @@ index 26e24b4..4b2b027 100644
 +    if os.environ.get("EXL3_DEC_GROUP", "0") != "0":
 +        # at least 16 rows: the WMMA tl.dot needs a 16-row tile
 +        return max(triton.next_power_of_2(group_size), 16 // block_m, 1)
-+    if (v := os.environ.get("EXL3_DEC_BLOCK_H")):
-+        return int(v)
++    if (v := _env_pow2("EXL3_DEC_BLOCK_H")):
++        return v
 +    return max(16 // block_m, 1)
 +
 +def decode_split_target(sm_count: int, block_m: int) -> int:
@@ -335,7 +446,33 @@ index 26e24b4..4b2b027 100644
  def paged_attn_triton_decode(
      q: torch.Tensor,
      k: torch.Tensor | None,
-@@ -1248,7 +1459,7 @@ def paged_attn_triton_decode(
+@@ -1169,8 +1407,8 @@ def paged_attn_triton_decode(
+     qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
+     pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
+     n_kv_heads_override: int | None = None,
+-    num_warps: int | None = None,
+-    num_stages: int | None = None,
++    num_warps: int | None = None,       # None: EXL3_DEC_WARPS, else the backend default
++    num_stages: int | None = None,      # None: EXL3_DEC_STAGES, else the backend default
+ ) -> torch.Tensor:
+     """Flash-decoding paged attention for short queries: the kv sequence is split across
+     programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
+@@ -1230,18 +1468,20 @@ def paged_attn_triton_decode(
+         k_scales, v_scales, qck, qcv = q, q, 0, 0
+         h32 = q
+ 
+-    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile. Tile and
+-    # launch shape per backend / architecture (util/backend.py) unless the caller sets them
++    # Tile and launch shape: explicit arguments win over the EXL3_DEC_* overrides, which win over the
++    # per backend / architecture defaults (util/backend.py)
++    num_warps, num_stages, block_n = decode_launch_overrides(num_warps, num_stages, block_n)
+     cfg_block_n, cfg_warps, cfg_stages = attn_decode_config(q.device, hd_pad)
+     if num_warps is None:
+         num_warps = cfg_warps
+     if num_stages is None:
+         num_stages = cfg_stages
++    # K + V tiles in smem across num_stages; on small-smem devices the ladder halves the kv tile
+     candidates = halving_ladder(cfg_block_n) if block_n is None else [block_n]
  
      group_size = n_q_heads // n_kv_heads
      block_m = triton.next_power_of_2(q_len)
@@ -344,7 +481,7 @@ index 26e24b4..4b2b027 100644
      block_rows = block_m * block_h
      h_blocks = triton.cdiv(group_size, block_h)
      num_pages_per_seq = block_table.shape[1]
-@@ -1264,7 +1475,7 @@ def paged_attn_triton_decode(
+@@ -1257,7 +1497,7 @@ def paged_attn_triton_decode(
      dev = q.device.index
      if dev not in _decode_sm_count:
          _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -353,7 +490,7 @@ index 26e24b4..4b2b027 100644
  
      def prepare(block_n):
          """Split count, partial buffers and the split kernel's argument list for one kv tile."""
-@@ -1289,12 +1500,13 @@ def paged_attn_triton_decode(
+@@ -1282,12 +1522,13 @@ def paged_attn_triton_decode(
          )
          return args, splits, partial_o, partial_ml
  
@@ -361,7 +498,7 @@ index 26e24b4..4b2b027 100644
      with torch.cuda.device(q.device):
          pick_key = (head_dim, hd_pad, qck, qcv, q_len, block_h, bool(causal), window_left >= 0,
 -                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0])
-+                    window_right >= 0, has_sinks, num_warps, num_stages, candidates[0], split_kernel.__name__)
++                    window_right >= 0, has_sinks, num_warps, num_stages, tuple(candidates), split_kernel.__name__)
          block_n = pick_config(
              q.device, "paged_attn_decode", pick_key, candidates,
 -            lambda bn: shared_bytes(_paged_attn_decode_split_kernel, prepare(bn)[0],
@@ -369,7 +506,7 @@ index 26e24b4..4b2b027 100644
                                      num_warps = num_warps, num_stages = num_stages))
          args, num_splits, partial_o, partial_ml = prepare(block_n)
  
-@@ -1302,7 +1514,7 @@ def paged_attn_triton_decode(
+@@ -1295,7 +1536,7 @@ def paged_attn_triton_decode(
              _paged_kv_update(k, v, k_cache, v_cache, block_table, cache_seqlens, num_pages_per_seq, bsz, kv_append_len,
                               n_kv_heads, page_size, head_dim)
  

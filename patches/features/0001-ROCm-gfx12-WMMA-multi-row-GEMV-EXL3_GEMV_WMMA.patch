@@ -1,41 +1,75 @@
+From d023c38d78442029f1b440d9d7be4db353eb9b50 Mon Sep 17 00:00:00 2001
+From: local <local@localhost>
+Date: Tue, 6 Oct 2026 11:55:03 +0530
+Subject: [PATCH 1/6] ROCm: gfx12 WMMA multi-row GEMV (EXL3_GEMV_WMMA)
+
+The fdot2 multi-row cores spend one dot2 per row per weight pair, so an
+8-row call (a DFlash2 verify) costs 1.4-1.9x a 1-row call while reading the
+same trellis. The new kernel decodes each 16x16 tile once with the RDNA tiles
+decoder, stages it through a per-wave LDS slot and runs one
+v_wmma_f32_16x16x16_f16 over all rows (layout probed on gfx1201). An 8-row
+verify drops to about 1.16x a 1-row decode (was about 1.55x).
+
+- Opt-in with EXL3_GEMV_WMMA=1 (read per call); EXL3_GEMV_WMMA_U picks the
+  k-tile batch (1, 2, 4).
+- Integer bitrates, m 2-8, single-matrix GEMV and the unweighted single-token
+  multi-matrix GEMV. Weighted (MoE) and multi-token mgemv keep fdot2.
+- Gated per device at runtime: only gfx1200/gfx1201 with wave32 take it (the
+  body traps elsewhere), so gfx11 and other targets are unaffected by the flag.
+- LDS exchanges are fenced with __syncwarp (fence + wave barrier); the bare
+  wave_barrier builtin does not order LDS accesses.
+- Rows past size_m read row 0 and land only in output rows the epilogue never
+  stores, so the kernel never reads past A (the fdot2 cores' equivalent fix
+  is upstream's cc50bbb).
+
+fp32 accumulation order differs from the fdot2 chain, so results match the
+m == 1 path to rounding, not bit for bit.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ doc/env_vars.md                               |  14 +
+ .../rocm/quant/exl3_gemv_multirow_rdna.cu     | 360 ++++++++++++++++++
+ 2 files changed, 374 insertions(+)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index e02c346..47e8f7d 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -234,6 +234,20 @@ the path wherever its hard constraints allow (testing).
+ Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
+ forces shuffle extraction, `1` forces shared-memory staging. Testing only.
+ 
++### `EXL3_GEMV_WMMA` (ROCm gfx1200 / gfx1201; default: `0`)
++
++Multi-row EXL3 GEMV (2-8 rows, e.g. a speculative verify) on the gfx12 WMMA units: each 16x16
++trellis tile is decoded once and one `v_wmma_f32_16x16x16_f16` takes all rows, instead of one
++fdot2 chain per row. Covers integer bitrates in the single-matrix GEMV and the unweighted
++single-token multi-matrix GEMV; everything else keeps the fdot2 kernels. Devices other than
++gfx1200 / gfx1201 (gfx11 included) also keep them whatever the setting: eligibility is checked per
++device at runtime. Results match the fdot2 path to fp32 rounding, not bit for bit. Read on every
++call, unlike most C++-side variables, so tests can toggle it.
++
++### `EXL3_GEMV_WMMA_U` (default: `4`)
++
++k-tiles decoded per WMMA batch in the `EXL3_GEMV_WMMA` kernel: `1`, `2` or `4`.
++
+ ### `EXL3_INT8_GEMV` (default: `2`)
+ 
+ Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
 diff --git a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
-index 719a347..b5ca716 100644
+index 38bbe48..009b253 100644
 --- a/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
 +++ b/exllamav3/exllamav3_ext/rocm/quant/exl3_gemv_multirow_rdna.cu
-@@ -186,7 +186,8 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
-     const int lane,
-     const int kb_begin,
-     const int kb_end,
--    float* out
-+    float* out,
-+    const int rows_valid = M
- )
+@@ -65,6 +65,8 @@
+ 
+ #include <cstdlib>
+ #include <mutex>
++#include <atomic>
++#include <cstring>
+ 
+ int exl3_gemv_max_m()
  {
-     constexpr int tile_elements = Exl3Width<bits>::tile_u16;   // 16 * bits (integer K)
-@@ -207,7 +208,9 @@ __device__ __forceinline__ void exl3_gemv_dot_tile_direct_mr
-         #pragma unroll
-         for (int r = 0; r < M; ++r)
-         {
--            const half2* a2 = (const half2*) (A + r * lda + k_tile * 16);
-+            // Rows >= rows_valid are never stored; load the last valid row rather than read past the end of A
-+            const int rr = r < rows_valid ? r : rows_valid - 1;
-+            const half2* a2 = (const half2*) (A + rr * lda + k_tile * 16);
-             half2 a01 = a2[r0 >> 1];
-             half2 a89 = a2[(r0 >> 1) + 4];
-             accA[r] = __builtin_amdgcn_fdot2(a01, frag0[0], accA[r], false);
-@@ -544,8 +547,9 @@ __device__ __forceinline__ void exl3_gemv_mr_body
-         core, tpb, A, lda, B, size_k, n_tiles_j, tile_n, warp_id, lane, sh_red, acc,
-         [&](int tn, int k0, int k1, float* o)
-         {
--            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o);
--        }
-+            exl3_gemv_dot_tile_direct_mr<bits, cb, M>(A, lda, B, n_tiles_j, tn, lane, k0, k1, o, rows_valid);
-+        },
-+        rows_valid
-     );
-     if (warp_id != 0) return;
-     if constexpr (M == 1)
-@@ -597,6 +601,283 @@ void exl3_gemv_mr_dot_single
+@@ -605,6 +607,298 @@ void exl3_gemv_mr_dot_single
      );
  }
  
@@ -89,7 +123,7 @@ index 719a347..b5ca716 100644
 +        a.u[1] = make_uint2(lo.y, hi.y);
 +    }
 +
-+    __builtin_amdgcn_wave_barrier();
++    __syncwarp();   // wave-scope LDS fence + barrier (the bare barrier does not order LDS)
 +    union { uint2 u[2]; exl3_h8 v; } b;
 +    b.u[0] = *((const uint2*) (sb + b_off));
 +    b.u[1] = *((const uint2*) (sb + b_off + 8));
@@ -189,7 +223,7 @@ index 719a347..b5ca716 100644
 +            w.h2[0] = f0[0]; w.h2[1] = f0[1]; w.h2[2] = f1[0]; w.h2[3] = f1[1];
 +            *((uint4*) (sb + u * 256 + lane * 8)) = w.u4;
 +        }
-+        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
 +        #pragma unroll
 +        for (int u = 0; u < U; ++u)
 +        {
@@ -198,7 +232,7 @@ index 719a347..b5ca716 100644
 +            b.u2[1] = *((const uint2*) (sb + u * 256 + b_off + 8));
 +            cu[u] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av[u].v, b.v, cu[u]);
 +        }
-+        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
 +        b_c += (size_t) U * b_stride;
 +    }
 +    for (; kt < kend; ++kt)
@@ -209,7 +243,7 @@ index 719a347..b5ca716 100644
 +        FragB f0, f1;
 +        exl3_dq_tile_decode<bits, cb>(raw, lp, f0, f1);
 +        exl3_gemv_wmma_tile(sb, f0, f1, a_row + kt * 16, row_ok, lane, b_off, cu[0]);
-+        __builtin_amdgcn_wave_barrier();
++        __syncwarp();
 +        b_c += b_stride;
 +    }
 +    exl3_f8 c = cu[0];
@@ -302,10 +336,25 @@ index 719a347..b5ca716 100644
 +    );
 +}
 +
-+static inline bool exl3_gemv_wmma_enabled()
++// EXL3_GEMV_WMMA=1 opts in, but only gfx1200/gfx1201 have the kernel body (other device variants
++// trap), so eligibility is checked per device once and cached; elsewhere the fdot2 path runs
++static inline bool exl3_gemv_wmma_enabled(int device)
 +{
-+    const char* env = std::getenv("EXL3_GEMV_WMMA");
-+    return env && atoi(env) != 0;
++    const char* env = std::getenv("EXL3_GEMV_WMMA");   // read per call: tests toggle it at runtime
++    static std::atomic<int8_t> eligible[64] = {};       // 0 unknown, 1 yes, -1 no
++    if (!env || atoi(env) == 0 || device < 0 || device >= 64) return false;
++    int8_t e = eligible[device].load(std::memory_order_relaxed);
++    if (!e)
++    {
++        hipDeviceProp_t props{};
++        bool ok = hipGetDeviceProperties(&props, device) == hipSuccess && props.warpSize == 32 &&
++                  (std::strncmp(props.gcnArchName, "gfx1200", 7) == 0 ||
++                   std::strncmp(props.gcnArchName, "gfx1201", 7) == 0) &&
++                  (props.gcnArchName[7] == '\0' || props.gcnArchName[7] == ':');
++        e = ok ? 1 : -1;
++        eligible[device].store(e, std::memory_order_relaxed);
++    }
++    return e > 0;
 +}
 +
 +// k-tiles decoded per WMMA batch: 1, 2 or 4 (default)
@@ -319,7 +368,7 @@ index 719a347..b5ca716 100644
  template <int bits, bool c_fp32, int cb, int WARPS_PER_BLOCK, int M>
  static __global__
  __launch_bounds__(WARPS_PER_BLOCK * 32)
-@@ -742,6 +1023,40 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
+@@ -750,6 +1044,40 @@ static inline int exl3_gemv_mr_warps(int size_k, int n_tiles, int bszm)
          case EXL3_HALF_BITS(3): LAUNCH_MR_CB(EXL3_HALF_BITS(3), 2, kernel_name, __VA_ARGS__); break; \
      }
  
@@ -360,12 +409,12 @@ index 719a347..b5ca716 100644
  bool exl3_gemv_multirow_try_launch
  (
      const half* A_ptr,
-@@ -791,6 +1106,19 @@ bool exl3_gemv_multirow_try_launch
+@@ -799,6 +1127,19 @@ bool exl3_gemv_multirow_try_launch
          }
      }
  
 +    // 2w. gfx12 WMMA GEMV (see exl3_gemv_wmma_dot_single), integer bitrates
-+    if (exl3_gemv_wmma_enabled() && K >= 1 && K <= 8 && size_m >= 2)
++    if (exl3_gemv_wmma_enabled(device) && K >= 1 && K <= 8 && size_m >= 2)
 +    {
 +        const int n_tiles = size_n / 16;
 +        const int warps = exl3_gemv_mr_warps(size_k, n_tiles, 1);
@@ -380,12 +429,12 @@ index 719a347..b5ca716 100644
      // 2. GEMV, M rows per warp, fused output epilogue
      {
          const int n_tiles = size_n / 16;
-@@ -880,6 +1208,20 @@ bool exl3_mgemv_multirow_try_launch
+@@ -888,6 +1229,20 @@ bool exl3_mgemv_multirow_try_launch
          }
      }
  
 +    // 2w. gfx12 WMMA GEMV, unweighted single-token calls at integer bitrates
-+    if (exl3_gemv_wmma_enabled() && !weighted && num_tokens == 1 && K >= 1 && K <= 8 && size_m >= 2)
++    if (exl3_gemv_wmma_enabled(device) && !weighted && num_tokens == 1 && K >= 1 && K <= 8 && size_m >= 2)
 +    {
 +        const int n_tiles = size_n / 16;
 +        const int warps = exl3_gemv_mr_warps(size_k, n_tiles, bszm);
@@ -401,7 +450,7 @@ index 719a347..b5ca716 100644
      // 2. GEMV
      {
          const int n_tiles = size_n / 16;
-@@ -901,6 +1243,11 @@ bool exl3_mgemv_multirow_try_launch
+@@ -909,6 +1264,11 @@ bool exl3_mgemv_multirow_try_launch
      return true;
  }
  

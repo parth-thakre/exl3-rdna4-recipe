@@ -75,7 +75,7 @@ def run_one(idx):
             time.sleep(10)
     else:
         print(f"[{idx}] giving up; rerun to retry it", flush = True)
-        return
+        return False
     msg = r["choices"][0]["message"]
     content = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
@@ -93,8 +93,12 @@ def run_one(idx):
         recs = load_results()
         acc = sum(x["correct"] for x in recs) / len(recs)
         print(f"[{len(recs)}/{len(rows)}] q{idx} gold {gold} pred {pred} {'✓' if pred == gold else '✗'} {dt:.0f}s  running acc {acc:.1%}", flush = True)
+    return True
 
-# Several questions in flight at once; the server batches them (TabbyAPI --max-batch-size)
-workers = int(os.environ.get("GPQA_WORKERS", "1"))   # batching was slower on this card (bench/run_gpqa_all.sh)
+# GPQA_WORKERS > 1 keeps several questions in flight; the server needs max_batch_size to match.
+# Our results were all run one question at a time.
+workers = int(os.environ.get("GPQA_WORKERS", "1"))
 with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-    list(pool.map(run_one, [i for i in range(len(rows)) if i not in done]))
+    ok = list(pool.map(run_one, [i for i in range(len(rows)) if i not in done]))
+if not all(ok):
+    sys.exit(f"{ok.count(False)} question(s) failed after 3 attempts; rerun to retry them")
