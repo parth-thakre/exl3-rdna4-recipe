@@ -1,20 +1,21 @@
-From 604bc894d3357bba8063e766a23ee2ffc49ebb4f Mon Sep 17 00:00:00 2001
+From 18299d26216f0d6d13083cdd7193fd9a088fbee8 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 15:30:10 +0530
-Subject: [PATCH 18/18] Tests: generic paths and wording in docstrings and
- comments
+Subject: [PATCH 18/18] Tests: generic paths and wording in docstrings,
+ comments and one message
 
-Docstring/comment-only: replace local checkout names and workspace paths
-with generic ones (/path/to/exllamav3-baseline, /path/to/exllamav3-rdna4,
-source setup/env.sh from the recipe) and drop internal jargon. No code
-lines change (checked: identical ASTs apart from docstrings).
+Replace local checkout names and workspace paths with generic ones
+(/path/to/exllamav3-baseline, /path/to/exllamav3-rdna4, source setup/env.sh
+from the recipe) and drop internal jargon. Docstrings and comments only,
+plus the text of test_greedy_equal.py's "set PYTHONPATH" failure message;
+no logic changes.
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
  test_gdn_replay.py   |  4 ++--
  test_gemv32.py       |  7 ++++---
- test_greedy_equal.py | 16 ++++++++--------
- 3 files changed, 14 insertions(+), 13 deletions(-)
+ test_greedy_equal.py | 18 +++++++++---------
+ 3 files changed, 15 insertions(+), 14 deletions(-)
 
 diff --git a/test_gdn_replay.py b/test_gdn_replay.py
 index 638e50c..ed6d6c9 100644
@@ -53,7 +54,7 @@ index 9966452..f0449d0 100644
  Checks, per projection (attention, GDN, MLP, lm_head; --draft adds the DFlash2 fc and an MLP):
    1. accuracy: rows 2..32 (or --rows), fp16 and fp32 output, U = 1/2/4, against reconstruct_hgemm; the
 diff --git a/test_greedy_equal.py b/test_greedy_equal.py
-index 22d33a6..d9e8f54 100644
+index 22d33a6..42cd747 100644
 --- a/test_greedy_equal.py
 +++ b/test_greedy_equal.py
 @@ -1,4 +1,4 @@
@@ -88,6 +89,15 @@ index 22d33a6..d9e8f54 100644
  # PYTHONPATH names this same checkout, its own (later) entry stays
  _HERE = os.path.dirname(os.path.abspath(__file__))
  if sys.path and os.path.abspath(sys.path[0] or os.curdir) == _HERE:
+@@ -34,7 +34,7 @@ def check_import_tree(exllamav3):
+     """Fail unless exllamav3 came from the first PYTHONPATH entry (the checkout under test)."""
+     pp = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
+     if not pp:
+-        sys.exit("FAIL: set PYTHONPATH to the checkout under test (e.g. $W/wt-dev or $W/wt-batch)")
++        sys.exit("FAIL: set PYTHONPATH to the checkout under test (e.g. /path/to/exllamav3-rdna4)")
+     tree = os.path.realpath(pp[0])
+     loaded = os.path.realpath(exllamav3.__file__)
+     if not loaded.startswith(tree + os.sep):
 @@ -110,7 +110,7 @@ def main():
  
      prompts = PROMPTS

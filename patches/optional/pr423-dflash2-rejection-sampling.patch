@@ -1,4 +1,4 @@
-From 61bfbf3d5753e11355306a6a8cd5bce67b762e8f Mon Sep 17 00:00:00 2001
+From 9acf2bd17b969ee4c3c20f99ff388041ad2a9a14 Mon Sep 17 00:00:00 2001
 From: Rafa <2588276+rafatxf@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 11:57:30 +0530
 Subject: [PATCH] DFlash2: speculative (rejection) sampling for stochastic

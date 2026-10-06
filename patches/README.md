@@ -32,7 +32,7 @@ that for the combined patch.
      short drafts.
    - `0011`, `0017`: `test_gemv32.py` and `test_greedy_equal.py`.
    - `0013`: docs.
-7. `0018`: docstring and comment wording in the tests (no code change).
+7. `0018`: generic wording in the tests' docstrings, comments and one failure message (no logic change).
 
 The commit messages and the intermediate diffs in `features/` are our work history as it happened, so they mention
 local work branches and checkout names (`wt-tree`, `wt-dev`, `$W/...`); `0018` replaces the ones that ended up in the
