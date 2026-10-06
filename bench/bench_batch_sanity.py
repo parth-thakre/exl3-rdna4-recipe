@@ -4,10 +4,15 @@
 Batched and bs1 outputs are not expected to be bit-identical (the split-decode attention splits differently
 at another batch size), so this reports each job's common-prefix length with its bs1 reference and fails only
 on the two failure shapes that matter:
-  - garbage:    common prefix < --min-prefix tokens AND (non-ASCII share > --max-nonascii OR one token
-                repeated more than --max-run times in a row), or an empty output
-  - cross-talk: job i's text lacks its own prompt's topic but carries another batched prompt's topic
-                (rows of the batch mixed up)
+  - garbage:    non-ASCII share > --max-nonascii or one token repeated more than --max-run times in a row,
+                checked on the whole output when its common prefix is short (< --min-prefix tokens) and on the
+                part after the divergence point in every case (unless the bs1 reference has the same property
+                there), or an empty output
+  - cross-talk: job i's text lacks its own prompt's topic but carries another batched prompt's topic that its
+                own bs1 reference doesn't (rows of the batch mixed up). CamelCase identifiers (toRoman) are split
+                before matching.
+It also fails if the generator reports an error, if any job (reference or batched) ends without an end-of-stream
+result, or if fewer jobs than requested were ever decoding at the same time (no real batching happened).
 "follows" (job i's output matches job j's bs1 output for longer than its own) is reported for information
 only. The prompts share boilerplate ("Write a Python ... with tests. Code only."), so two jobs can open with the
 same tokens and a short follow is not evidence of cross-talk on its own; it is added to the verdict only when the
@@ -37,6 +42,17 @@ PROMPTS = [
     ("Write a Python Levenshtein edit-distance function with tests. Code only.", r"levenshtein|edit.?distance"),
     ("Write a Python script that converts a CSV file to JSON lines, with tests. Code only.", r"(?<![a-z])csv"),
 ]
+
+
+def topic_text(text):
+    """Lowercased text with CamelCase split (toRoman -> to roman, LRUCache -> lru cache), for the topic patterns"""
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+    return text.lower()
+
+
+def has_topic(j, text):
+    return re.search(PROMPTS[j][1], topic_text(text)) is not None
 
 
 def common_prefix(a, b):
@@ -99,67 +115,56 @@ def main():
                           encode_special_tokens = True)
 
     def run(indices):
-        """Run the given prompts concurrently; returns {index: token ids}, wall seconds"""
+        """Run the given prompts concurrently. Returns ({index: token ids}, wall seconds, the most jobs that were
+        decoding at the same time). Raises on a generator error or a job without an end-of-stream result."""
         out = {i: [] for i in indices}
         for i in indices:
             gen.enqueue(Job(input_ids = ids(PROMPTS[i][0]), max_new_tokens = args.tokens,
                             sampler = ArgmaxSampler(), identifier = i))
+        decoding, finished, overlap = set(), {}, 0
         t0 = time.time()
         while gen.num_remaining_jobs():
             for r in gen.iterate():
-                if r.get("stage") == "streaming" and r.get("token_ids") is not None:
-                    out[r["identifier"]] += r["token_ids"].view(-1).tolist()
+                stage, i = r.get("stage"), r.get("identifier")
+                if stage == "error":
+                    raise RuntimeError(f"generator error in job {i}: {r.get('error')!r}")
+                if stage != "streaming":
+                    continue
+                if r.get("token_ids") is not None:
+                    out[i] += r["token_ids"].view(-1).tolist()
+                if r.get("eos"):
+                    finished[i] = r.get("eos_reason")
+                    decoding.discard(i)
+                elif i not in finished:
+                    decoding.add(i)
+            overlap = max(overlap, len(decoding))
         torch.cuda.synchronize()
-        return out, time.time() - t0
+        wall = time.time() - t0
+        missing = [i for i in indices if i not in finished]
+        if missing:
+            raise RuntimeError(f"jobs {missing} ended without an end-of-stream result")
+        empty = [i for i in indices if not out[i]]
+        if empty:
+            raise RuntimeError(f"jobs {empty} produced no tokens")
+        return out, wall, overlap
 
     def text_of(t):
         return tok.decode(torch.tensor(t, dtype = torch.long)) if t else ""
 
-    with torch.inference_mode():
-        run([0])   # warmup: autotune, graph capture
-        ref, ref_wall = {}, 0.0
-        for i in range(max_bsz):
-            o, w = run([i])
-            ref.update(o)
-            ref_wall += w
-        print(f"bs1 references: {max_bsz} prompts, {sum(len(v) for v in ref.values())} tokens, "
-              f"{sum(len(v) for v in ref.values()) / ref_wall:.1f} tok/s sequential")
+    def garbage(t):
+        """(is garbage, non-ASCII share, longest repeat run) for a list of token ids"""
+        text = text_of(t)
+        na = sum(1 for c in text if ord(c) > 127) / max(1, len(text))
+        rl = max_run(t)
+        return (na > args.max_nonascii or rl > args.max_run), na, rl
 
-        failures, report = [], []
-        for n in args.bsz:
-            idx = list(range(n))
-            out, wall = run(idx)
-            total = sum(len(out[i]) for i in idx)
-            print(f"\nbs {n}: {total} tokens in {wall:.1f}s = {total / wall:.1f} tok/s combined")
-            print(f"  {'job':>3s} {'tokens':>11s} {'prefix':>6s} {'nonascii':>8s} {'run':>4s} {'own':>4s} {'follows':>7s}  verdict  topic")
-            for i in idx:
-                o, r = out[i], ref[i]
-                text = text_of(o)
-                low = text.lower()
-                pre = common_prefix(o, r)
-                nonascii = sum(1 for c in text if ord(c) > 127) / max(1, len(text))
-                run_len = max_run(o)
-                own = re.search(PROMPTS[i][1], low) is not None
-                others = [j for j in idx if j != i and re.search(PROMPTS[j][1], low)]
-                # Informational: this job follows another job's bs1 output for longer than its own. Shared prompt
-                # boilerplate makes short follows harmless, so it only counts together with a failed topic check
-                follows = [j for j in idx if j != i and common_prefix(o, ref[j]) > max(pre, args.min_prefix)]
-                verdict = []
-                if not o:
-                    verdict.append("EMPTY")
-                if pre < args.min_prefix and (nonascii > args.max_nonascii or run_len > args.max_run):
-                    verdict.append("GARBAGE")
-                if not own and others:
-                    verdict.append(f"CROSS-TALK(topics {others}, follows {follows})")
-                v = ", ".join(verdict) or "ok"
-                if verdict:
-                    failures.append((n, i, v))
-                print(f"  {i:3d} {len(o):4d}/{len(r):<4d}  {pre:6d} {nonascii:8.3f} {run_len:4d} {str(own):>4s} "
-                      f"{','.join(map(str, follows)) or '-':>7s}  "
-                      f"{v:7s}  {PROMPTS[i][0][:60]}")
-                report.append({"bsz": n, "job": i, "prefix": pre, "tokens": len(o), "ref_tokens": len(r),
-                               "nonascii": nonascii, "max_run": run_len, "own_topic": own, "other_topics": others,
-                               "follows": follows, "verdict": v, "text": text, "ref_text": text_of(r)})
+    failures, report, ref = [], [], {}
+    try:
+        _main_loop(run, garbage, text_of, ref, failures, report, args, max_bsz)
+    except RuntimeError as e:
+        print(f"\nFAIL: {e}")
+        sys.stdout.flush()
+        os._exit(2)
 
     if args.out:
         json.dump(report, open(args.out, "w"), indent = 1)
@@ -170,6 +175,59 @@ def main():
         print(f"\nPASS: every batched job coherent and on its own prompt (prefix and follows columns are informational)")
     sys.stdout.flush()
     os._exit(1 if failures else 0)
+
+
+def _main_loop(run, garbage, text_of, ref, failures, report, args, max_bsz):
+    import torch
+    with torch.inference_mode():
+        run([0])   # warmup: autotune, graph capture
+        ref_wall = 0.0
+        for i in range(max_bsz):
+            o, w, _ = run([i])   # raises unless the reference run completes
+            ref.update(o)
+            ref_wall += w
+        print(f"bs1 references: {max_bsz} prompts, {sum(len(v) for v in ref.values())} tokens, "
+              f"{sum(len(v) for v in ref.values()) / ref_wall:.1f} tok/s sequential")
+
+        for n in args.bsz:
+            idx = list(range(n))
+            out, wall, overlap = run(idx)
+            total = sum(len(out[i]) for i in idx)
+            print(f"\nbs {n}: {total} tokens in {wall:.1f}s = {total / wall:.1f} tok/s combined; "
+                  f"at most {overlap} decoding at once")
+            if overlap < n:
+                failures.append((n, -1, f"NO-OVERLAP(only {overlap} of {n} jobs were ever decoding together)"))
+            print(f"  {'job':>3s} {'tokens':>11s} {'prefix':>6s} {'nonascii':>8s} {'run':>4s} {'own':>4s} {'follows':>7s}  verdict  topic")
+            for i in idx:
+                o, r = out[i], ref[i]
+                text, ref_text = text_of(o), text_of(r)
+                pre = common_prefix(o, r)
+                bad_full, nonascii, run_len = garbage(o)
+                # The divergent part: garbage there counts even after a long common prefix, unless the bs1
+                # reference shows the same thing from that point
+                bad_tail = len(o) > pre and garbage(o[pre:])[0] and not garbage(r[pre:])[0]
+                own = has_topic(i, text)
+                # Topics the job's own bs1 reference already mentions aren't evidence of cross-talk
+                others = [j for j in idx if j != i and has_topic(j, text) and not has_topic(j, ref_text)]
+                # Informational: this job follows another job's bs1 output for longer than its own. Shared prompt
+                # boilerplate makes short follows harmless, so it only counts together with a failed topic check
+                follows = [j for j in idx if j != i and common_prefix(o, ref[j]) > max(pre, args.min_prefix)]
+                verdict = []
+                if not o:
+                    verdict.append("EMPTY")
+                if (pre < args.min_prefix and bad_full) or bad_tail:
+                    verdict.append("GARBAGE" if not bad_tail else f"GARBAGE(after token {pre})")
+                if not own and others:
+                    verdict.append(f"CROSS-TALK(topics {others}, follows {follows})")
+                v = ", ".join(verdict) or "ok"
+                if verdict:
+                    failures.append((n, i, v))
+                print(f"  {i:3d} {len(o):4d}/{len(r):<4d}  {pre:6d} {nonascii:8.3f} {run_len:4d} {str(own):>4s} "
+                      f"{','.join(map(str, follows)) or '-':>7s}  "
+                      f"{v:7s}  {PROMPTS[i][0][:60]}")
+                report.append({"bsz": n, "job": i, "prefix": pre, "tokens": len(o), "ref_tokens": len(r),
+                               "nonascii": nonascii, "max_run": run_len, "own_topic": own, "other_topics": others,
+                               "follows": follows, "verdict": v, "text": text, "ref_text": ref_text})
 
 
 if __name__ == "__main__":

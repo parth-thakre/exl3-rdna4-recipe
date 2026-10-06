@@ -19,7 +19,7 @@ tested on one machine:
 
 - **WMMA GEMV for draft verification (gfx12):** checking 8 drafted tokens costs about 1.16x one normal decode step
   (was 1.55x), so speculative decoding pays off.
-- **Batching up to 32 rows:** several chats decode together at ~300 tok/s combined instead of ~70.
+- **Batching up to 32 rows:** 4 chats at once decode at about 240-280 tok/s combined, where they managed ~60 before.
 - **Attention tuned for Qwen's grouped heads, plus a 4-bit cache kernel:** faster decode at long context.
 - **DeltaNet replay:** about 1 GB less VRAM, which is what makes 128k fit next to the draft model.
 - **HIP graph re-instantiation:** fixes a crash after about an hour of serving, so HIP graphs can stay on.
@@ -35,7 +35,7 @@ Typical ranges on an RX 9070 XT; they depend on the content.
 | One chat, code | ~130 tok/s at short context, falling to ~100 at 120k |
 | One chat, prose or conversation (sampled, temperature ~0.8) | ~55-65 tok/s (the draft is accepted less often on prose) |
 | With images | roughly 10-25% slower than the same chat as text |
-| Several chats at once (measured with 4), code | ~300 tok/s combined, ~60-90 each; prose is lower |
+| Several chats at once, code | 3 at once about 195-200 tok/s combined; 4 at once about 240-280 (60-90 each); prose is lower |
 
 Prompt processing runs at about 1,300 tok/s for short prompts and 900 at 128k, so a full 128k prompt takes about
 2.5 minutes before the first token.
@@ -82,8 +82,9 @@ curl -s http://127.0.0.1:8096/v1/chat/completions -H "Authorization: Bearer $KEY
 ```
 
 Settings live in `tabbyAPI/config.yml` (copied from `serve/config.example.yml`). Up to 3 chats run at once
-(`max_batch_size: 3`); 4 also works, with less memory headroom. The server only listens on 127.0.0.1; to use it from other
-devices over Tailscale, set `network.host` to the machine's Tailscale IP. `serve/open-webui.md` sets up a chat UI.
+(`max_batch_size: 3`); 4 also works, with less memory headroom. All chats share one 128k-token cache pool; it's not
+128k each. The server only listens on 127.0.0.1; to use it from other devices over Tailscale, set `network.host` to
+the machine's Tailscale IP. `serve/open-webui.md` sets up a chat UI.
 
 Two other profiles use the model's built-in MTP head instead of the draft model: `serve/run_tabby_long.sh` (128k, no
 draft model needed) and `serve/run_tabby_xl.sh` (160k, needs the whole GPU). Both are slower than the default.
