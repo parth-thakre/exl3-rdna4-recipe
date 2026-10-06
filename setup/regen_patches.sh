@@ -74,44 +74,78 @@ case $mode in
         echo "wrote $out ($(grep -c '^From [0-9a-f]\{40\} ' "$out") commit(s), $(grep -c '^diff --git' "$out") file diffs)"
         ;;
     features)
-        # DIR must be a real directory (or not exist yet). It is never replaced or re-created: only its top-level
-        # regular *.patch files are swapped, so other entries, permissions and ownership are left alone.
-        if [ -L "$features_dir" ] || { [ -e "$features_dir" ] && [ ! -d "$features_dir" ]; }; then
+        # DIR must be a real directory (or not exist yet); it is never replaced. The only entries ever touched are
+        # top-level regular files named like git format-patch output (NNNN-name.patch, plain characters). Anything
+        # else named *.patch is ambiguous, so the run refuses before changing anything; other entries are never read.
+        d=$features_dir
+        while [ "${#d}" -gt 1 ] && [ "${d%/}" != "$d" ]; do d=${d%/}; done
+        if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then
             echo "$features_dir exists and is not a plain directory; refusing to touch it" >&2; exit 1
         fi
-        mkdir -p "$features_dir"
-        dest=$(cd "$features_dir" && pwd -P)
-        # Staging lives inside DIR (same filesystem, so every move below is a rename); its names aren't *.patch
-        tmp=$(mktemp -d "$dest/.regen-new.XXXXXX")
-        old=$(mktemp -d "$dest/.regen-old.XXXXXX")
-        git -C "$repo" format-patch -q --no-signature -o "$tmp" "$base..$branch" -- . "${excludes[@]}"
-        mapfile -t new_names < <(find "$tmp" -mindepth 1 -maxdepth 1 -type f -name '*.patch' -printf '%f\n' | sort)
-        [ ${#new_names[@]} -gt 0 ] || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
-        mapfile -t old_names < <(find "$dest" -mindepth 1 -maxdepth 1 -type f -name '*.patch' -printf '%f\n' | sort)
-        # Rollback puts the old set back and removes whatever part of the new set got in. It runs on any failure
-        # and on interruption until the swap has finished; afterwards cleanup only removes the empty staging dirs.
-        moved_old=() moved_new=() swapped=
+        mkdir -p "$d"
+        dest=$(cd "$d" && pwd -P)
+        patch_re='^[0-9]{4}-[A-Za-z0-9._-]+\.patch$'
+        # Staging lives inside DIR (same filesystem, so every move is a rename); cleanup is armed before anything
+        # is created. The manifests are written before the first move, so rollback works from them and from what
+        # is actually on disk, whatever point an interruption lands on.
+        tmp= old= moving= swapped=
         rollback() {
             local n
-            for n in "${moved_new[@]}"; do rm -f "$dest/$n"; done
-            for n in "${moved_old[@]}"; do mv -T "$old/$n" "$dest/$n" || echo "could not restore $n; it is in $old" >&2; done
+            [ -n "$moving" ] || return 0   # nothing in DIR has been touched yet
+            while IFS= read -r n; do
+                grep -qxF -- "$n" "$old/.manifest-old" || rm -f -- "$dest/$n"
+            done < "$old/.manifest-new"
+            while IFS= read -r n; do
+                if [ -e "$old/$n" ]; then mv -T -- "$old/$n" "$dest/$n" || echo "could not restore $n; it is in $old" >&2; fi
+            done < "$old/.manifest-old"
+            return 0
         }
         cleanup() {
-            [ -n "$swapped" ] || rollback
-            rm -rf "$tmp"
-            # After a swap $old holds the replaced patches, which are no longer wanted; after a rollback it is empty
-            # unless a restore failed, and then it is kept so nothing is lost
-            if [ -n "$swapped" ]; then rm -rf "$old"; else rmdir "$old" 2>/dev/null || true; fi
+            # Runs from the EXIT trap: keep the script's exit status, and never stop halfway (no errexit in here)
+            local rc=$?
+            set +e
+            if [ -n "$old" ]; then
+                [ -n "$swapped" ] || rollback
+                if [ -n "$swapped" ]; then rm -rf -- "$old"
+                else rm -f -- "$old"/.manifest-new "$old"/.manifest-old "$old"/.list.*; rmdir -- "$old" 2>/dev/null; fi
+            fi
+            [ -z "$tmp" ] || rm -rf -- "$tmp"
+            exit "$rc"
         }
         trap cleanup EXIT
         trap 'exit 130' INT TERM
-        for n in "${old_names[@]}"; do mv -T "$dest/$n" "$old/$n" || exit 1; moved_old+=("$n"); done
-        for n in "${new_names[@]}"; do
-            [ ! -e "$dest/$n" ] && [ ! -L "$dest/$n" ] || { echo "$features_dir/$n is in the way (not a regular patch file)" >&2; exit 1; }
-            mv -T "$tmp/$n" "$dest/$n" || exit 1; moved_new+=("$n")
-        done
+        tmp=$(mktemp -d "$dest/.regen-new.XXXXXX")
+        old=$(mktemp -d "$dest/.regen-old.XXXXXX")
+        git -C "$repo" format-patch -q --no-signature -o "$tmp" "$base..$branch" -- . "${excludes[@]}"
+        # list_patches DIR OUT: every top-level *.patch entry, checked; fails if listing fails or any name is unsafe
+        list_patches() {
+            local raw; raw=$(mktemp "$old/.list.XXXXXX")
+            find "$1" -mindepth 1 -maxdepth 1 -name '*.patch' -print0 > "$raw" || { echo "cannot list $1" >&2; return 1; }
+            : > "$2"
+            local p n
+            while IFS= read -r -d '' p; do
+                n=${p##*/}
+                if [[ ! $n =~ $patch_re ]] || [ -L "$p" ] || [ ! -f "$p" ]; then
+                    printf '%q is not a plain git patch file; refusing\n' "$p" >&2; return 1
+                fi
+                printf '%s\n' "$n" >> "$2"
+            done < "$raw"
+            rm -f -- "$raw"
+            sort -o "$2" "$2"
+        }
+        list_patches "$tmp" "$old/.manifest-new"
+        [ -s "$old/.manifest-new" ] || { echo "no commits in $base..$branch; leaving $features_dir alone" >&2; exit 1; }
+        list_patches "$dest" "$old/.manifest-old"
+        while IFS= read -r n; do
+            if [ -e "$dest/$n" ] || [ -L "$dest/$n" ]; then
+                grep -qxF -- "$n" "$old/.manifest-old" || { echo "$features_dir/$n is in the way; refusing" >&2; exit 1; }
+            fi
+        done < "$old/.manifest-new"
+        moving=1
+        while IFS= read -r n; do mv -T -- "$dest/$n" "$old/$n"; done < "$old/.manifest-old"
+        while IFS= read -r n; do mv -T -- "$tmp/$n" "$dest/$n"; done < "$old/.manifest-new"
         swapped=1
-        echo "wrote ${#new_names[@]} patches to $features_dir (replaced ${#old_names[@]}):"
-        printf '  %s\n' "${new_names[@]}"
+        echo "wrote $(wc -l < "$old/.manifest-new") patches to $features_dir (replaced $(wc -l < "$old/.manifest-old")):"
+        sed 's/^/  /' "$old/.manifest-new"
         ;;
 esac
