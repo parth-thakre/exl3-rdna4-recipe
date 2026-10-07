@@ -259,22 +259,17 @@ rows a short draft doesn't use. Effect, through the API: 4 requests at once go f
 (see Batching above).
 `EXL3_DRAFT_ROW_BUDGET` is included but off by default because it was slower.
 
-**Optional, not recommended yet: PR #423, DFlash2 rejection sampling** (by Rafa,
-[@rafatxf](https://github.com/rafatxf); off by default, `WITH_PR423=1 setup/build_exllamav3.sh` opts in). This is an
-open upstream PR. For sampled requests, the draft path is sampled from the drafter's own distribution and accepted with
-probability min(1, p/q), instead of only accepting draft tokens that match a sample from the target. Greedy decoding
-doesn't use it. Our review of the PR's code (as rebased before the batching series) found these problems:
+**Optional: PR #423, DFlash2 rejection sampling** (by Rafa, [@rafatxf](https://github.com/rafatxf); off by default,
+`WITH_PR423=1 setup/build_exllamav3.sh` opts in). This is an open upstream PR. For sampled requests, the draft path is
+sampled from the drafter's own distribution and accepted with probability min(1, p/q), instead of only accepting draft
+tokens that match a sample from the target. Greedy decoding doesn't use it. Our review found four problems (token masks
+skipped, a top-k tie mismatch, calibration silently off, extra syncs); Rafa fixed all four in a second commit, which
+the patch includes.
 
-- A sampled request's speculative verify skips job-level token masks (`min_new_tokens`, banned-string continuations),
-  so a stop token can end generation before `min_new_tokens`.
-- `probs()` keeps exactly k tokens at a top-k tie, while the fused sampler keeps all tied tokens, so the two
-  distributions can differ.
-- The sampled DFlash2 path doesn't export `draft_conf`, which silently turns off confidence calibration.
-- Extra device-to-host syncs.
-
-On the GPU that earlier rebase sped up sampled prose from 59.3 to 62.6 tok/s with greedy output unchanged. We don't
-recommend it until these are fixed upstream. The current patch is rebased onto the batching series with one
-adaptation, compiled but not yet reviewed or run on the GPU. Details in `patches/README.md`.
+On the GPU, both commits on the batching series, `EXL3_DFLASH_SPEC=1` vs `0` on the same build: the PR's GPU tests pass;
+six sampled prose requests capped at 500 tokens went from 52.6 to 53.2 tok/s end to end (acceptance 20.3% -> 21.5%), one
+run each, so not an established speedup; `min_tokens = 64` holds; greedy output identical. Details in
+`patches/README.md`.
 
 **Draft requantization** (not a patch). The bf16 DFlash2 draft converted to EXL3 3.0 bpw (`setup/requant_draft.sh`)
 is 0.89 GB instead of 1.4 GB for the 5.0 bpw quant, at the same speed (154.3 vs 153.8 tok/s in the generator). The

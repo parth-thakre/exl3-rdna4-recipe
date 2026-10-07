@@ -10,7 +10,7 @@ EXLLAMAV3_COMMIT=${EXLLAMAV3_COMMIT:-0662fac591992c6d5f11d041b1cf2136d62e536d}
 EXLLAMAV3_PATCH=${EXLLAMAV3_PATCH:-patches/exllamav3-rdna4.patch}   # paths are relative to the repo root
 
 # Optional: upstream PR #423 (DFlash2 rejection sampling, by @rafatxf), applied after the main patch.
-# Off by default and not recommended yet: it has known bugs (patches/README.md). WITH_PR423=1 opts in.
+# Off by default (patches/README.md). WITH_PR423=1 opts in.
 WITH_PR423=${WITH_PR423:-0}
 PR423_PATCH=${PR423_PATCH:-patches/optional/pr423-dflash2-rejection-sampling.patch}
 

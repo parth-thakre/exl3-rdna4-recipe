@@ -5,7 +5,7 @@ All against ExLlamaV3 `dev` at 0662fac. TabbyAPI needs no patch at 2fd6cc7, whic
 | File | Applied by `setup/build_exllamav3.sh` | What |
 |---|---|---|
 | `exllamav3-rdna4.patch` | always | Everything of ours: `git diff 0662fac rdna4-dev-batch`. |
-| `optional/pr423-dflash2-rejection-sampling.patch` | only with `WITH_PR423=1` (off by default) | Open upstream PR #423 by Rafa (@rafatxf), applied after ours. Has known bugs; not recommended yet. |
+| `optional/pr423-dflash2-rejection-sampling.patch` | only with `WITH_PR423=1` (off by default) | Open upstream PR #423 by Rafa (@rafatxf), with its review fixes, applied after ours. |
 | `features/*.patch` | no | Our work split into its 18 commits, for reading and review. |
 
 `rdna4-dev-batch` and `rdna4-dev-pr423` are our local work branches; they aren't published, and these patch files are
@@ -40,39 +40,42 @@ test files' docstrings. They don't affect the combined patch.
 
 The fixes from the code reviews (`notes/reviews.md`) are folded into these commits.
 
-## PR #423 (optional, off by default, not recommended yet)
+## PR #423 (optional, off by default)
 
 [turboderp-org/exllamav3#423](https://github.com/turboderp-org/exllamav3/pull/423) by Rafa
 ([@rafatxf](https://github.com/rafatxf)) adds speculative (rejection) sampling to DFlash2 for stochastic samplers.
 Without it, a sampled request verifies DFlash2's greedy draft path by sampling the target and accepting matches. With
 it, the draft path is sampled and accepted with probability min(1, p/q), which keeps the target's output distribution.
 Greedy requests and other samplers take the old path, and `EXL3_DFLASH_SPEC=0` turns it off at runtime. The patch is
-the PR's commit (eef016b upstream) rebased onto `rdna4-dev-batch`, with Rafa as its author. The PR was still open (not
-merged) on 2026-10-06. The README's numbers were measured without it.
+the PR's two commits (eef016b and ffd18f5 upstream) rebased onto `rdna4-dev-batch`, with Rafa as their author. The PR
+was still open (not merged) on 2026-10-07. The README's numbers were measured without it.
 
-Rebasing it onto the batching series took one change to the PR's code. In `DFlash2Model.sample_from_state`, the
-batching series already slices the state and logits to the path rows (and prunes them to `dflash2_rows` for short
-drafts), so the PR's sampled branch now passes those (`path_state`, `logits`) to `walk_sample` instead of slicing
-`state[:, 1:]` / `logits[:, 1:]` a second time. Two textual conflicts were resolved by keeping both sides: the docs
-(our row-budget entry and the PR's two entries, under the one `## Speculative decoding` heading) and the generator's
-draft parameters (our `dflash2_rows`, then the PR's sampling setup). The PR's other changed lines are identical to the
-original commit. The commit message records the change.
+Rebasing the first commit onto the batching series took one change to the PR's code. In
+`DFlash2Model.sample_from_state`, the batching series already slices the state and logits to the path rows (and prunes
+them to `dflash2_rows` for short drafts), so the PR's sampled branch now passes those (`path_state`, `logits`) to
+`walk_sample` instead of slicing `state[:, 1:]` / `logits[:, 1:]` a second time. Two textual conflicts were resolved by
+keeping both sides: the docs (our row-budget entry and the PR's two entries, under the one `## Speculative decoding`
+heading) and the generator's draft parameters (our `dflash2_rows`, then the PR's sampling setup). The PR's other
+changed lines are identical to the original commit. The commit message records the change. The second commit applied
+unchanged.
 
-Our review of the PR's code (before this rebase) found these problems:
+Our review of the first commit found four problems, and Rafa fixed all of them in the second (details in the PR thread
+and `notes/reviews.md`):
 
-
-- A sampled request's speculative verify skips job-level token masks (`min_new_tokens`, banned-string continuations),
-  so a stop token can end generation before `min_new_tokens`.
-- `probs()` keeps exactly k tokens at a top-k tie, while the fused sampler keeps all tied tokens, so the two
-  distributions can differ.
-- The sampled DFlash2 path doesn't export `draft_conf`, which silently turns off confidence calibration.
+- A sampled request's speculative verify skipped job-level token masks (`min_new_tokens`, banned-string
+  continuations), so a stop token could end generation before `min_new_tokens`.
+- `probs()` kept exactly k tokens at a top-k tie, while the fused sampler keeps all tied tokens.
+- The sampled DFlash2 path didn't export `draft_conf`, which silently turned off confidence calibration. It now doesn't
+  sample speculatively when the calibrator is on.
 - Extra device-to-host syncs.
 
-On the GPU, that earlier rebase sped up sampled prose from 59.3 to 62.6 tok/s (draft acceptance 24% -> 26%) with greedy
-output unchanged. The rebase onto the batching series compiles; it hasn't been reviewed or run on the GPU yet.
+On the GPU (2026-10-07, both commits on the batching series, the same build with `EXL3_DFLASH_SPEC=1` vs `0`): the PR's
+GPU tests pass (22); six sampled prose requests capped at 500 tokens (temperature 0.8, top-p 0.95, top-k 20) went from
+52.6 to 53.2 tok/s end to end, with draft acceptance 20.3% -> 21.5%; `min_tokens = 64` is honored; greedy output is
+identical. Each prompt ran once per mode, so that small difference isn't an established speedup. On the pre-batching
+rebase, measured as decode speed in the server log rather than end to end, it was 59.3 -> 62.6 tok/s. It stays off by
+default: it changes how sampled requests are verified and gains little on this setup.
 
-We don't recommend applying it until these are fixed upstream. The patch stays here, credited to its author, so it's
-easy to try and to refresh: when the PR is updated, rebase it onto `rdna4-dev-batch` and regenerate (see below).
 `WITH_PR423=1 setup/build_exllamav3.sh` applies it; switching an existing build on or off needs `RESET=1`.
 
 ## Regenerating

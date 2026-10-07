@@ -9,7 +9,7 @@
 #   BRANCH=WORKTREE diffs BASE against the working tree (plain mode only).
 #
 # What we ran for the current files, with WORK = an exllamav3 checkout that has branches rdna4-dev-batch (our work)
-# and rdna4-dev-pr423 (the PR #423 commit rebased on rdna4-dev-batch):
+# and rdna4-dev-pr423 (the PR #423 commits rebased on rdna4-dev-batch):
 #   setup/regen_patches.sh --repo "$WORK" 0662fac rdna4-dev-batch
 #   setup/regen_patches.sh --features patches/features --repo "$WORK" 0662fac rdna4-dev-batch
 #   setup/regen_patches.sh --format-patch --repo "$WORK" \

@@ -15,7 +15,8 @@ Where the findings ended up:
   recording storage uses bounded power-of-two row buckets, the test counts real captured-graph launches, and
   `batched_gdn_replay` checks head counts before using them.
 - Batching series: fixed in the series itself (two rounds); the open items are test-only.
-- PR #423 (upstream, not ours): not clean, so it ships as an optional patch that is off by default.
+- PR #423 (upstream, not ours): the four findings below were fixed upstream (ffd18f5); it ships as an optional
+  patch, off by default.
 
 ## Review of d6a4353 (RDNA4 patches), 2026-10-06
 
@@ -66,8 +67,8 @@ combined for 4 concurrent requests over a common window. Generator-only (no API)
 
 ## Review of upstream PR #423 (DFlash2 rejection sampling), 2026-10-06
 
-Reviewed as rebased onto our RDNA4 series (before the batching series). Not clean, so we don't use it and the recipe
-ships it off by default.
+Reviewed as rebased onto our RDNA4 series (before the batching series). At that point it wasn't clean, so we didn't use
+it and the recipe shipped it off by default.
 - P1: speculative verify bypasses job-level token masks (`min_new_tokens`, banned-string retries), so a stop token can
   end generation early (generator.py:1011).
 - P2: `probs()` truncates top-k by exact count at ties; the fused sampler keeps every tied token (custom.py:1203).
@@ -78,5 +79,10 @@ ships it off by default.
 Correct: the accept/residual/bonus math, the GDN replay accounting, the RNG handling; greedy decoding unaffected. GPU,
 on that pre-batching rebase: sampled prose 59.3 -> 62.6 tok/s, acceptance 24% -> 26%; greedy output identical.
 
-The patch has since been rebased onto the batching series with one adaptation (see `patches/README.md`). That rebase
-has been compiled but not yet reviewed or run on the GPU.
+The patch has since been rebased onto the batching series with one adaptation (see `patches/README.md`).
+
+Follow-up, 2026-10-07: Rafa fixed all four in ffd18f5, which applied unchanged on top. A job now stays on
+match-the-sample verification while `min_new_tokens` or a banned-string checkpoint is active; `probs()` follows the
+fused sampler's logit-threshold cutoffs, ties included; no speculative sampling with `dynamic_draft`; the accepted
+length stays on the device. On the GPU: the PR's tests pass, `min_tokens = 64` holds, greedy output is unchanged,
+sampled prose 52.6 -> 53.2 tok/s (one run per mode, not an established speedup).
