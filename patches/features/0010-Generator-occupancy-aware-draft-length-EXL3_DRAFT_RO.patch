@@ -1,7 +1,7 @@
 From 89580dec2e9dc4928cab9cee066f43b4e6071945 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:25:05 +0530
-Subject: [PATCH 10/18] Generator: occupancy-aware draft length
+Subject: [PATCH 10/19] Generator: occupancy-aware draft length
  (EXL3_DRAFT_ROW_BUDGET)
 
 A batched verify forward is (active sequences) x (draft + 1) rows. Past the

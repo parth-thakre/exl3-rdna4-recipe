@@ -1,7 +1,7 @@
 From 60ac77bc2a2c6c0503cfb40fb07334a58614de96 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:43:13 +0530
-Subject: [PATCH 13/18] doc: EXL3_BC_MLP_MAX_ROWS and EXL3_DRAFT_ROW_BUDGET
+Subject: [PATCH 13/19] doc: EXL3_BC_MLP_MAX_ROWS and EXL3_DRAFT_ROW_BUDGET
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---

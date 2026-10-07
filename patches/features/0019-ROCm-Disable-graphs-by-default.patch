@@ -1,0 +1,103 @@
+From 01092229a7b1dc810e22b93fec2c7345e825180a Mon Sep 17 00:00:00 2001
+From: turboderp <11859846+turboderp@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:40:07 +0200
+Subject: [PATCH 19/19] ROCm: Disable graphs by default.
+
+---
+ doc/env_vars.md                               | 12 +++++++++++
+ exllamav3/exllamav3_ext/graph.cu              | 21 ++++++++++++++++++-
+ .../exllamav3_ext/libtorch/attention.cpp      |  5 +++--
+ .../exllamav3_ext/libtorch/mla_attention.cpp  |  5 +++--
+ 4 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/doc/env_vars.md b/doc/env_vars.md
+index d3f3a29..d14f7ed 100644
+--- a/doc/env_vars.md
++++ b/doc/env_vars.md
+@@ -21,6 +21,18 @@ A few defaults differ between the CUDA and ROCm builds. They are collected in
+ 
+ ## Attention
+ 
++### `EXL3_GRAPHS` (default: `1` on CUDA, `0` on ROCm)
++
++Whether the decode paths capture their kernel sequences into device graphs and replay them. With
++`0` every graphed site (attention, MLA, GDN, the MLP and block-sparse decode kernels) runs the same
++C++ launch sequence eagerly on each call, kernels and order unchanged, so the switch changes only
++host submission. On CUDA replay is a few percent faster at decode. On ROCm the HIP runtime launches a
++graph node no faster than a plain kernel, the measured difference is within noise, and every
++instantiated graph exec reserves a 2 MB device-side kernel-argument pool that grows with each
++parameter update until the exec is destroyed (an open HIP runtime issue); a speculative-decoding
++server holds hundreds of execs, so disabling graphs there also frees over a gigabyte of VRAM.
++Set `EXL3_GRAPHS=1` on ROCm to test the graph path.
++
+ ### `EXL3_BC_ATTN` (default: `1`)
+ 
+ Graph-captured C++ decode attention. For decode steps (bsz ≤ 8, q_len ≤ 16) the whole attention
+diff --git a/exllamav3/exllamav3_ext/graph.cu b/exllamav3/exllamav3_ext/graph.cu
+index fb26172..f414b53 100644
+--- a/exllamav3/exllamav3_ext/graph.cu
++++ b/exllamav3/exllamav3_ext/graph.cu
+@@ -11,11 +11,30 @@
+ 
+ //#define GRAPHDEBUG 1
+ 
++// EXL3_GRAPHS=0 disables graph capture everywhere: every graphed site then runs its C++ launch sequence
++// eagerly on each call (the same kernels in the same order, as on the uncaptured first run). Default off
++// on ROCm: the HIP runtime launches a graph node no faster than a plain kernel, so replay only saves the
++// per-kernel host submission, which is within noise of the per-graph submission; meanwhile every
++// instantiated exec holds a 2 MB device kernarg pool that grows with each parameter update until the
++// exec is destroyed. On CUDA the graphs are kept, where they are measurably faster
++static bool graphs_disabled()
++{
++    static const bool v = [] {
++        const char* e = getenv("EXL3_GRAPHS");
++#if defined(USE_ROCM)
++        return !(e && *e == '1');
++#else
++        return e && *e == '0';
++#endif
++    }();
++    return v;
++}
++
+ Graph::Graph()
+ {
+     ready = false;
+     ready_to_record = false;
+-    disabled = false;
++    disabled = graphs_disabled();
+     graph = NULL;
+     graph_exec = NULL;
+     need_cublas = false;
+diff --git a/exllamav3/exllamav3_ext/libtorch/attention.cpp b/exllamav3/exllamav3_ext/libtorch/attention.cpp
+index 79781af..f0b9377 100644
+--- a/exllamav3/exllamav3_ext/libtorch/attention.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/attention.cpp
+@@ -873,8 +873,9 @@ void BC_Attention::run
+     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
+ 
+     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
+-    // captured, then launched below like every later run, with only the I/O pointers patched
+-    if (s.runs == 0)
++    // captured, then launched below like every later run, with only the I/O pointers patched.
++    // A disabled graph runs the same C++ path eagerly every time
++    if (s.runs == 0 || s.graph->disabled)
+     {
+         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+         s.runs = 1;
+diff --git a/exllamav3/exllamav3_ext/libtorch/mla_attention.cpp b/exllamav3/exllamav3_ext/libtorch/mla_attention.cpp
+index 9763570..a897c89 100644
+--- a/exllamav3/exllamav3_ext/libtorch/mla_attention.cpp
++++ b/exllamav3/exllamav3_ext/libtorch/mla_attention.cpp
+@@ -845,8 +845,9 @@ void BC_MLAttention::run
+     TORCH_CHECK(!index_kpool || bsz == 1, "BC_MLAttention: kpool indexer requires bsz 1");
+ 
+     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
+-    // captured, then launched below like every later run, with only the I/O pointers patched
+-    if (s.runs == 0)
++    // captured, then launched below like every later run, with only the I/O pointers patched.
++    // A disabled graph runs the same C++ path eagerly every time
++    if (s.runs == 0 || s.graph->disabled)
+     {
+         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, regime, t_total, ext_indices, nullptr);
+         s.runs = 1;

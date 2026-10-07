@@ -1,7 +1,7 @@
 From 11bce813bac191bc33dcdc23ace9c7b55b45d390 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:26:49 +0530
-Subject: [PATCH 17/18] Tests: import the PYTHONPATH checkout; stricter compare
+Subject: [PATCH 17/19] Tests: import the PYTHONPATH checkout; stricter compare
  and MLP replay checks
 
 - test_greedy_equal.py: Python put the script's own checkout (wt-batch)

@@ -134,7 +134,7 @@ below.
 |---|---|
 | DFlash2 5.0 bpw draft, WMMA off / on | 127.1 / 145.1 |
 | MTP head, WMMA off / on | 82.4 / 90.2 |
-| DFlash2 5.0 bpw draft with WMMA, `EXL3_BC_GDN` (graph-captured DeltaNet decode) off / on | 145.4 / 153.7 |
+| DFlash2 5.0 bpw draft with WMMA, `EXL3_BC_GDN` (C++ DeltaNet decode, then graph-captured) off / on | 145.4 / 153.7 |
 | DFlash2 draft 5.0 / 3.0 bpw | 153.8 / 154.3 |
 | No draft, 3.0 bpw | 38.1-38.4 |
 | Replay off / on (`test_gdn_replay.py`: 379-token prompt, 400 greedy tokens, 3.0 bpw draft) | 89.3 / 92.4 |
@@ -216,11 +216,37 @@ verify now costs ~1.16x a 1-row decode. In the generator alone, DFlash2 went fro
 82.4 to 90.2; through the API, 136.8 to 145.4. Against the old kernel on the full model: top-1 agreement 100%,
 KL ~3e-5. WMMA only runs on gfx1200/gfx1201.
 
-**HIP graph re-instantiation** (`EXL3_GRAPH_REINST`, default 100k). `hipGraphExecKernelNodeSetParams` exhausts a fixed
-kernel-argument pool in this HIP runtime and segfaults after ~1.6M updates, which is about an hour of serving
-(`kernels/graph_setparams_repro.hip` reproduces it). `Graph::launch` now re-instantiates the graph every 100k updates,
-so graph capture can stay on without the crash: in the generator, the graph-captured DeltaNet decode (`EXL3_BC_GDN`)
-is 153.7 tok/s vs 145.4 without it. Output is byte-identical even when re-instantiating every 1,000 updates.
+**HIP graphs off** (upstream 96838c9, backported; `EXL3_GRAPHS=1` turns them back on). ExLlamaV3 captures each decode
+kernel sequence into a HIP graph and patches its arguments before every replay. In this HIP runtime,
+`hipGraphExecKernelNodeSetParams` writes the new arguments into fresh kernel-argument space that isn't reclaimed until
+the graph exec is destroyed (ROCm/rocm-systems#10713; `kernels/graph_setparams_repro.hip` reproduces it), so a server
+eventually segfaults inside it. Our first fix re-instantiated each graph every `EXL3_GRAPH_REINST` updates. With the
+patch's default of 100k the live server still crashed after 16-23 min of sustained 3-request load, and at 10k after
+~5.5h of 2-3 request load; 1000 then saw no crash in ~11 h of intermittent, lighter use (with restarts in between),
+which isn't a sustained-load soak. turboderp then found that each exec also reserves at least 2 MB of kernel-argument
+memory up front (about 1.2 GB over the hundreds of execs a speculative-decoding server holds, by his measurement), and
+that a graph launch on ROCm is no faster than launching its kernels one by one, so upstream turned graphs off on ROCm.
+With them off, every graphed site still runs the same C++ kernel sequence, launched directly, and the re-instantiation
+code is never reached.
+
+Same build, 128k / batch-3 server config, greedy 400-token code requests, 2026-10-07 (`wt-batch` vs the same plus
+96838c9; one warm-up, then 3 single and 2 three-at-once runs per build, about 20 s of requests each). Decode tok/s per
+request from the server log:
+
+| | Graphs on (`EXL3_GRAPH_REINST=1000`) | Graphs off |
+|---|---|---|
+| 1 request (3 runs) | 133.6, 137.2, 136.7 | 136.6, 137.2, 136.9 |
+| 3 at once (2 runs) | 97.6, 92.1, 69.5 / 97.5, 95.3, 70.5 | 98.2, 93.6, 70.4 / 98.1, 93.5, 70.4 |
+| Greedy final answers (last run of each) | | identical to graphs on (1 request: 1 answer; 3 at once: 2 answers, the third spent all 400 tokens thinking in both) |
+| VRAM in use after these runs (`rocm-smi`) | 16.06 GB | 15.98 GB |
+
+Only the final answers were saved, not the reasoning, so this compares answers rather than every token; the kernels and
+their order are the same either way. The VRAM difference is small here, probably because so short a run creates few
+graph execs and updates (we didn't count them); the leak's growth takes hours. The older "graphs on" gains in these
+notes (the `EXL3_BC_GDN` off / on row above, 145.4 vs 153.7, and the eager vs graph DeltaNet replay) switched between
+the C++ path and the Python-orchestrated one, which `EXL3_BC_*=0` selects, so they changed both the path and graph use
+at once and don't isolate a graph gain. The C++ path still runs with graphs off, and this newer comparison shows no
+measurable graph benefit.
 
 **Decode attention for GQA** (`EXL3_DEC_GROUP=1`, `EXL3_DEC_Q4W=1`, `EXL3_DEC_*` tuning). The split-decode attention
 gave each program 16 query rows, so an 8-token verify split Qwen's 6-head GQA groups across 3 programs, each re-reading
@@ -335,7 +361,7 @@ projections at ~25%. A token takes ~1,250-1,450 kernel launches.
 setup/     versions.sh (pinned commits and patch files), lib.sh, fetch_deps.sh, make_venv.sh, requirements*.txt,
            build_exllamav3.sh, install_tabby.sh, download_models.sh, requant_draft.sh, env.sh, regen_patches.sh
 serve/     run_tabby.sh, run_tabby_long.sh, run_tabby_xl.sh, stop_tabby.sh, config.example.yml, open-webui.md
-patches/   exllamav3-rdna4.patch, features/ (the same as 18 commits), optional/ (PR #423)
+patches/   exllamav3-rdna4.patch, features/ (the same as 19 commits), optional/ (PR #423)
 bench/     speed, context, batching, GPQA and kernel tests (bench/README.md)
 kernels/   standalone HIP experiments: WMMA layout probe, HIP graph repro, hand-written attention
 notes/     measurements.md (this file), research-log.md (the working notes), reviews.md (the code reviews)

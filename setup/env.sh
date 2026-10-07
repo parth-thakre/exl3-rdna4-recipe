@@ -25,12 +25,14 @@ export CPATH="$DEPS_DIR/usr/include:$DEPS_DIR/usr/include/python3.12${CPATH:+:$C
 # Expandable segments cut allocator fragmentation, which otherwise can OOM a long prefill after concurrent use
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
-# HIP graphs stay on. Each node update leaks ~4 KB of device memory until the graph is re-instantiated
-# (ROCm/rocm-systems#10713), so Graph::launch re-instantiates every EXL3_GRAPH_REINST node updates. The patch's
-# built-in default of 100k is too high with several requests at once: the server segfaulted inside
-# hipGraphExecKernelNodeSetParams after 16-23 min of sustained 3-request load; at 10k the same load ran 78 min
-# without a crash, at no measurable speed cost.
-export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-10000}
+# HIP graphs are off: upstream 96838c9 (included in the patch) makes that the ROCm default. On this card replaying a
+# graph is no faster than launching its kernels one by one (same tok/s at 1 and 3 requests, same greedy answers), and
+# every graph exec holds kernel-argument memory that grows with each update until the server crashes
+# (ROCm/rocm-systems#10713). EXL3_GRAPHS=1 turns them back on. Then Graph::launch re-instantiates every
+# EXL3_GRAPH_REINST node updates to dodge the crash: the patch's 100k and then 10k both still crashed under sustained
+# 2-3 request load (after 16-23 min and ~5.5 h); 1000 then saw no crash in ~11 h of intermittent, lighter use (with
+# restarts in between).
+export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-1000}
 
 # gfx12 WMMA multi-row GEMV for draft verification.
 export EXL3_GEMV_WMMA=1

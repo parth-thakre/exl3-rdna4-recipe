@@ -117,6 +117,8 @@ VRAM accounting (deep-dive): KV is 24,192 B/token incl. scales and the draft cac
    kernel-argument pool and segfaults after ~1.6M updates, about 1 h of serving (standalone repro:
    `kernels/graph_setparams_repro.hip`). `Graph::launch` now re-instantiates every 100k updates (`EXL3_GRAPH_REINST`), so HIP
    graphs can stay on (+6%) without the crash. Output is byte-identical even when it re-instantiates every 1,000 updates.
+   Later (2026-10-08) graphs went off entirely, following upstream; the +6% was the C++ path vs the Python one, and the C++
+   path still runs without graphs (`notes/measurements.md`).
 3. **`exllamav3-rdna4-decode-attention-gqa.patch`**: the split-decode attention gave each program 16 query rows, so a
    multi-token verify (q_len 8) split Qwen's 6-head GQA groups over 3 programs, each re-reading and re-dequantizing the
    same Q4 K/V. `EXL3_DEC_GROUP=1` takes the whole group per program, with tuned warps/stages/tile/split counts

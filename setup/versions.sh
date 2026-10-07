@@ -3,7 +3,7 @@
 # environment, e.g. EXLLAMAV3_GIT_URL=/path/to/local/mirror setup/build_exllamav3.sh
 # (TABBY_URL, without GIT, is the running server's address in the bench scripts; it isn't used here.)
 
-# ExLlamaV3, dev branch. Our patch is `git diff <commit> rdna4-dev-batch` (our local work branch); see
+# ExLlamaV3, dev branch. Our patch is `git diff <commit> rdna4-dev-batch-nographs` (our local work branch); see
 # patches/README.md for how to regenerate it.
 EXLLAMAV3_GIT_URL=${EXLLAMAV3_GIT_URL:-https://github.com/turboderp-org/exllamav3}
 EXLLAMAV3_COMMIT=${EXLLAMAV3_COMMIT:-0662fac591992c6d5f11d041b1cf2136d62e536d}

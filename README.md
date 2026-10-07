@@ -26,17 +26,18 @@ tested on one machine:
 | GPU | AMD RX 9070 XT, 16 GB (gfx1201) |
 | OS | Fedora 44, kernel 7.2 |
 | ROCm | system ROCm 7.1.1 (Fedora packages) to build; PyTorch 2.13.0 + ROCm 7.2 wheels to run |
-| Upstream | ExLlamaV3 `dev` 0662fac, TabbyAPI `main` 2fd6cc7 |
+| Upstream | ExLlamaV3 `dev` 0662fac (plus upstream's later 96838c9, graphs off on ROCm), TabbyAPI `main` 2fd6cc7 |
 
 ## What we added on top of upstream
 
 - **WMMA GEMV for draft verification (gfx12):** checking 8 drafted tokens costs about 1.16x one normal decode step
   (was 1.55x), so speculative decoding pays off.
-- **Batched verification up to 32 rows:** the WMMA GEMV and a graph-captured MLP keep 16- and 32-row verify batches
+- **Batched verification up to 32 rows:** the WMMA GEMV and a fused C++ MLP path keep 16- and 32-row verify batches
   on the fast path.
 - **Attention tuned for Qwen's grouped heads, plus a 4-bit cache kernel:** faster decode at long context.
 - **DeltaNet replay:** about 1 GB less VRAM, which is what makes 128k fit next to the draft model.
-- **HIP graph re-instantiation:** fixes a crash after about an hour of serving, so HIP graphs can stay on.
+- **HIP graphs off** (upstream's new ROCm default, backported): same speed, and no more crash after hours of serving
+  from a HIP memory leak.
 - **3.0 bpw DFlash2 draft (requant script):** 0.5 GB smaller than the 5.0 bpw quant, same speed.
 - **Setup scripts:** pinned versions, missing headers fetched without sudo, one command each to build and serve.
 
@@ -109,4 +110,6 @@ the benchmark scripts in [bench/README.md](bench/README.md), and the code review
 - The Qwen team, for Qwen3.8-27B.
 
 Our scripts, configs and docs are MIT (`LICENSE`). The patches modify ExLlamaV3 and are under its MIT license. Models
-keep their own licences. Every change here was written by Claude Opus 5.5 and reviewed by GPT-6.1 Sol.
+keep their own licences. Every change here was written by Claude Opus 5.5 and reviewed by GPT-6.1 Sol, except two
+upstream pieces kept unchanged under their authors: turboderp's graphs-off commit (96838c9) and the optional PR #423
+patch by Rafa.

@@ -1,7 +1,7 @@
 From a784aacb6bf7c073408a01a67ad6f54f6f174f7c Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:25:08 +0530
-Subject: [PATCH 14/18] GatedMLP: key BC graphs by output dtype as well as row
+Subject: [PATCH 14/19] GatedMLP: key BC graphs by output dtype as well as row
  count
 
 BC_GatedMLP kept one captured graph per row count. The down projection's

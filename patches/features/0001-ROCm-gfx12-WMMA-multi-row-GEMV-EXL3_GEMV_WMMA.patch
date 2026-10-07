@@ -1,7 +1,7 @@
 From d023c38d78442029f1b440d9d7be4db353eb9b50 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:03 +0530
-Subject: [PATCH 01/18] ROCm: gfx12 WMMA multi-row GEMV (EXL3_GEMV_WMMA)
+Subject: [PATCH 01/19] ROCm: gfx12 WMMA multi-row GEMV (EXL3_GEMV_WMMA)
 
 The fdot2 multi-row cores spend one dot2 per row per weight pair, so an
 8-row call (a DFlash2 verify) costs 1.4-1.9x a 1-row call while reading the

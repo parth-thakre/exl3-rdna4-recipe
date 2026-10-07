@@ -4,20 +4,19 @@ All against ExLlamaV3 `dev` at 0662fac. TabbyAPI needs no patch at 2fd6cc7, whic
 
 | File | Applied by `setup/build_exllamav3.sh` | What |
 |---|---|---|
-| `exllamav3-rdna4.patch` | always | Everything of ours: `git diff 0662fac rdna4-dev-batch`. |
+| `exllamav3-rdna4.patch` | always | Everything of ours, plus one upstream backport: `git diff 0662fac rdna4-dev-batch-nographs`. |
 | `optional/pr423-dflash2-rejection-sampling.patch` | only with `WITH_PR423=1` (off by default) | Open upstream PR #423 by Rafa (@rafatxf), with its review fixes, applied after ours. |
-| `features/*.patch` | no | Our work split into its 18 commits, for reading and review. |
+| `features/*.patch` | no | The same as its 19 commits, for reading and review. |
 
-`rdna4-dev-batch` and `rdna4-dev-pr423` are our local work branches; they aren't published, and these patch files are
-their published form. The combined patch is the one that's guaranteed: it's what we compile and validate, and it touches only source,
-docs and three tests (`test_gdn_replay.py`, `test_gemv32.py`, `test_greedy_equal.py`). The files in `features/` are
-the commits of the `rdna4-dev-batch` branch as
-`git format-patch` output. Applied in order with `git apply` on 0662fac they give the same tree, but we only check
-that for the combined patch.
+`rdna4-dev-batch-nographs` and `rdna4-dev-pr423` are our local work branches; they aren't published, and these patch
+files are their published form. The combined patch is the one that's guaranteed: it's what we compile and validate, and
+it touches only source, docs and three tests (`test_gdn_replay.py`, `test_gemv32.py`, `test_greedy_equal.py`). The files
+in `features/` are the commits of the `rdna4-dev-batch-nographs` branch as `git format-patch` output. Applied in order
+with `git am` on 0662fac they give the same tree as the combined patch (checked 2026-10-08).
 
 1. `0001-ROCm-gfx12-WMMA-multi-row-GEMV-EXL3_GEMV_WMMA.patch`: gfx12 WMMA GEMV for 2-8 rows (draft verification).
 2. `0002-ROCm-periodically-re-instantiate-HIP-graphs-...patch`: re-instantiate HIP graphs every 100k node updates
-   (`EXL3_GRAPH_REINST`).
+   (`EXL3_GRAPH_REINST`; `setup/env.sh` sets 1000). Since `0019` it only matters with `EXL3_GRAPHS=1`.
 3. `0003-Split-decode-attention-GQA-grouping-...patch`: whole-GQA-group split-decode attention, `EXL3_DEC_*` tuning and
    the Q4W kernel.
 4. `0004-Gated-DeltaNet-accepted-input-replay-...patch`: DeltaNet accepted-input replay (`EXL3_GDN_REPLAY=1`).
@@ -33,6 +32,10 @@ that for the combined patch.
    - `0011`, `0017`: `test_gemv32.py` and `test_greedy_equal.py`.
    - `0013`: docs.
 7. `0018`: generic wording in the tests' docstrings, comments and one failure message (no logic change).
+8. `0019`: upstream commit 96838c9 by turboderp (2026-10-07), cherry-picked unchanged: HIP graphs off by default on
+   ROCm, `EXL3_GRAPHS=1` to turn them on. Every graphed site, ours included (MLP, DeltaNet replay, attention), then
+   launches its C++ kernel sequence directly: the same kernels in the same order. On this card: same decode speed at 1
+   and 3 requests and the same greedy answers (`notes/measurements.md`).
 
 The commit messages and the intermediate diffs in `features/` are our work history as it happened, so they mention
 local work branches and checkout names (`wt-tree`, `wt-dev`, `$W/...`); `0018` replaces the ones that ended up in the
@@ -46,9 +49,9 @@ The fixes from the code reviews (`notes/reviews.md`) are folded into these commi
 ([@rafatxf](https://github.com/rafatxf)) adds speculative (rejection) sampling to DFlash2 for stochastic samplers.
 Without it, a sampled request verifies DFlash2's greedy draft path by sampling the target and accepting matches. With
 it, the draft path is sampled and accepted with probability min(1, p/q), which keeps the target's output distribution.
-Greedy requests and other samplers take the old path, and `EXL3_DFLASH_SPEC=0` turns it off at runtime. The patch is
-the PR's two commits (eef016b and ffd18f5 upstream) rebased onto `rdna4-dev-batch`, with Rafa as their author. The PR
-was still open (not merged) on 2026-10-07. The README's numbers were measured without it.
+Greedy requests and other samplers take the old path, and `EXL3_DFLASH_SPEC=0` turns it off at runtime. The patch is the
+PR's two commits (eef016b and ffd18f5 upstream) rebased onto `rdna4-dev-batch-nographs`, with Rafa as their author. The
+PR was still open (not merged) on 2026-10-07. The README's numbers were measured without it.
 
 Rebasing the first commit onto the batching series took one change to the PR's code. In
 `DFlash2Model.sample_from_state`, the batching series already slices the state and logits to the path rows (and prunes

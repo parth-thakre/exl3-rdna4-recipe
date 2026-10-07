@@ -1,7 +1,7 @@
 From 3e9842ed956df59453dfe83c3d88c309adf8784a Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:24 +0530
-Subject: [PATCH 05/18] Add test_gdn_replay.py: GDN replay kernel checks and
+Subject: [PATCH 05/19] Add test_gdn_replay.py: GDN replay kernel checks and
  history/replay A/B
 
 Standalone GPU-owner script (not collected by pytest; resolves the models

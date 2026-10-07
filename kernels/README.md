@@ -18,7 +18,8 @@ each slot holds. The WMMA multi-row GEMV patch is built on the layout it confirm
 Reproduces the HIP graph kernel-argument exhaustion: it updates one kernel node's argument N times, alternating between
 two pointers the way exllamav3's `Graph::launch` does every token. On our ROCm, `hipGraphExecKernelNodeSetParams`
 runs out of a fixed kernel-argument pool and segfaults after ~1.6M updates (about 1 h of serving). Re-instantiating
-the graph periodically avoids it, which is what the graph re-instantiate patch does.
+the graph periodically avoids it, which is what the graph re-instantiate patch does. Graphs are now off by default on
+ROCm (upstream 96838c9, in the patch), so this only matters with `EXL3_GRAPHS=1`.
 
 ```
 ./graph_setparams_repro [updates] [reinstantiate_every (0 = never)]

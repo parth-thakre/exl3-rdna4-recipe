@@ -1,7 +1,7 @@
 From 367232705c052ad09c94086fafbffcf5ceee8db1 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:16:27 +0530
-Subject: [PATCH 07/18] ROCm: gfx12 WMMA multi-row GEMV up to 16 rows
+Subject: [PATCH 07/19] ROCm: gfx12 WMMA multi-row GEMV up to 16 rows
 
 A batched speculative verify (bsz 2 x 8 rows) is 16 rows per linear, past the
 multi-row GEMV's 8-row limit, so every linear in the verify and in the

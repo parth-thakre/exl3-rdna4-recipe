@@ -8,12 +8,12 @@
 #   setup/regen_patches.sh --features DIR [--repo DIR] BASE BRANCH      one numbered file per commit into DIR
 #   BRANCH=WORKTREE diffs BASE against the working tree (plain mode only).
 #
-# What we ran for the current files, with WORK = an exllamav3 checkout that has branches rdna4-dev-batch (our work)
-# and rdna4-dev-pr423 (the PR #423 commits rebased on rdna4-dev-batch):
-#   setup/regen_patches.sh --repo "$WORK" 0662fac rdna4-dev-batch
-#   setup/regen_patches.sh --features patches/features --repo "$WORK" 0662fac rdna4-dev-batch
+# What we ran for the current files, with WORK = an exllamav3 checkout that has branches rdna4-dev-batch-nographs (our work)
+# and rdna4-dev-pr423 (the PR #423 commits rebased on it):
+#   setup/regen_patches.sh --repo "$WORK" 0662fac rdna4-dev-batch-nographs
+#   setup/regen_patches.sh --features patches/features --repo "$WORK" 0662fac rdna4-dev-batch-nographs
 #   setup/regen_patches.sh --format-patch --repo "$WORK" \
-#       --out patches/optional/pr423-dflash2-rejection-sampling.patch rdna4-dev-batch rdna4-dev-pr423
+#       --out patches/optional/pr423-dflash2-rejection-sampling.patch rdna4-dev-batch-nographs rdna4-dev-pr423
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 source "$ROOT/setup/versions.sh"

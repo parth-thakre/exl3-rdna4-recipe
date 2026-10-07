@@ -1,7 +1,7 @@
 From 35047cbc8887b4fd8ed688371245e22368a5947b Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:25:08 +0530
-Subject: [PATCH 15/18] MLP: route adapters and per-projection controls around
+Subject: [PATCH 15/19] MLP: route adapters and per-projection controls around
  the fused paths
 
 The graphed BC paths (BC_GatedMLP at 1-32 rows, BC_MLP at bsz 1) and the

@@ -1,10 +1,11 @@
 # Code reviews of the patches
 
-Every change in this repo (the exllamav3 patches, the scripts and the docs) was written by Claude Opus 5.5 and
-reviewed by GPT-6.1 Sol (at high effort), round by round, until the reviewer had no open findings on the production
-path. The reviews were static reads plus CPU-side checks; GPU validation was run separately on the test machine and
-is noted where relevant. Commit hashes below (d6a4353, 70ba2c2, and the branch names) are local work commits, not
-upstream ones; file:line references point into those trees.
+Every change in this repo (the exllamav3 patches, the scripts and the docs) was written by Claude Opus 5.5 and reviewed
+by GPT-6.1 Sol (at high effort), round by round, until the reviewer had no open findings on the production path. The
+reviews were static reads plus CPU-side checks; GPU validation was run separately on the test machine and is noted where
+relevant. Commit hashes below (d6a4353, 70ba2c2, and the branch names) are local work commits, not upstream ones;
+file:line references point into those trees. The exceptions are upstream commits kept unchanged under their authors:
+turboderp's 96838c9 and Rafa's PR #423.
 
 Where the findings ended up:
 
