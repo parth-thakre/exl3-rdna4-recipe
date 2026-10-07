@@ -163,8 +163,18 @@ First 50 questions of GPQA Diamond, thinking on, 30k token cap, temperature 1.0,
 | **3.0 bpw, `medium` + anti-spiral prompt** | **86.0%** | 0 |
 | 2.5 bpw, `medium` + anti-spiral prompt | 68.0% | 0 |
 
-For reference, published results on all 198 questions (ISTA): BF16 89.9%, UD-IQ3_S 89.9%, UD-Q2_K_XL 86.9%. Fifty
-questions is a small sample, so read our 86% as "in the same range", not as a ranking.
+All 198 questions, 3.0 bpw, `medium` + anti-spiral, same sampling, through the server with 3 requests at a time
+(batching build):
+
+| Run | Correct | Hit the token cap |
+|---|---|---|
+| Pass 1 | 80.3% (159/198) | 1 |
+| Pass 2 | 81.8% (162/198) | 1 |
+
+So about 81% on the full set; the first 50 questions happen to be easier than average. Published results on all
+198 questions (ISTA, settings not identical to ours): BF16 89.9%, UD-IQ3_S 89.9%, UD-Q2_K_XL 86.9%. Our setup scores
+below those. Part of that may be the `medium` reasoning effort, which we chose to stop thinking spirals; we haven't
+run the full set at `xhigh` to separate that from the quantization.
 
 ### 3.0 vs 2.5 bpw
 

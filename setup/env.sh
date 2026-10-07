@@ -28,7 +28,8 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 # HIP graphs stay on. Each node update leaks ~4 KB of device memory until the graph is re-instantiated
 # (ROCm/rocm-systems#10713), so Graph::launch re-instantiates every EXL3_GRAPH_REINST node updates. The patch's
 # built-in default of 100k is too high with several requests at once: the server segfaulted inside
-# hipGraphExecKernelNodeSetParams after 16-23 min of sustained 3-request load. 10k costs no measurable speed.
+# hipGraphExecKernelNodeSetParams after 16-23 min of sustained 3-request load; at 10k the same load ran 78 min
+# without a crash, at no measurable speed cost.
 export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-10000}
 
 # gfx12 WMMA multi-row GEMV for draft verification.
