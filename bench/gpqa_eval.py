@@ -47,7 +47,7 @@ SYSTEM = {"antispiral": (
 
 def ask(prompt):
     messages = ([{"role": "system", "content": SYSTEM}] if SYSTEM else []) + [{"role": "user", "content": prompt}]
-    body = {"model": "x", "messages": messages, "max_tokens": 30000,
+    body = {"model": "x", "messages": messages, "max_tokens": int(os.environ.get("GPQA_MAX_TOKENS", "30000")),
             "temperature": 1.0, "top_p": 0.95, "top_k": 20,
             "enable_thinking": True, "chat_template_kwargs": {"enable_thinking": True}}
     if EFFORT:
@@ -96,9 +96,17 @@ def run_one(idx):
     return True
 
 # GPQA_WORKERS > 1 keeps several questions in flight; the server needs max_batch_size to match.
-# Our results were all run one question at a time.
+# The 50-question results ran one at a time, the 198-question passes three and the xhigh rerun two.
 workers = int(os.environ.get("GPQA_WORKERS", "1"))
+# GPQA_IDS=1,12,... asks only those questions (same idx, so the same shuffled choices as the full run).
+# Set but empty is an error rather than "all questions", so a failed ID selection can't start a full run.
+if "GPQA_IDS" in os.environ:
+    ids = sorted({int(x) for x in os.environ["GPQA_IDS"].split(",") if x.strip()})
+    if not ids or any(not 0 <= i < len(rows) for i in ids):
+        sys.exit(f"GPQA_IDS must list question numbers below GPQA_LIMIT ({len(rows)})")
+else:
+    ids = range(len(rows))
 with concurrent.futures.ThreadPoolExecutor(workers) as pool:
-    ok = list(pool.map(run_one, [i for i in range(len(rows)) if i not in done]))
+    ok = list(pool.map(run_one, [i for i in ids if i not in done]))
 if not all(ok):
     sys.exit(f"{ok.count(False)} question(s) failed after 3 attempts; rerun to retry them")

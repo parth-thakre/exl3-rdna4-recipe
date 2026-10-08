@@ -27,4 +27,7 @@ starts on boot in our setup; use a systemd user unit or `podman generate systemd
 
 For hard reasoning questions, set `reasoning_effort` to `medium` and use the anti-spiral system prompt from
 `notes/measurements.md` (per chat, or in the model's advanced parameters). On GPQA it removed every thinking spiral that hit the token
-cap and was faster at equal or better accuracy. We haven't made it the default in our own Open WebUI yet.
+cap and was faster at equal or better accuracy. For the hardest questions, `xhigh` with the same prompt and a
+large `max_tokens` gets more right (28 vs 9-12 of the 48 GPQA Diamond questions `medium` missed) but thinks about 5x
+longer. We haven't made
+either the default in our own Open WebUI yet.

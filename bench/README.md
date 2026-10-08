@@ -15,7 +15,7 @@ model's tokenizer (`models/Qwen3.8-27B-EXL3-3.0bpw/tokenizer.json`, or `MODEL_DI
 | `context_bench.py LABEL 8 32 60 ...` | Decode speed and recall by depth: a fresh filler document per depth with a code buried mid-way, then ~450 tokens of Python. This is the decode-by-depth table. |
 | `ctx_probe.sh LABEL CTX_K [args]` | Restarts TabbyAPI with a context size and extra args, then runs `context_bench.py` near the top. Reports VRAM via `amd-smi`. Stops this repo's TabbyAPI first (`serve/stop_tabby.sh`), gives up after `START_TIMEOUT` seconds, and stops the server it started if anything fails. |
 | `needle_test.py [N]` | Quick long-context recall check: a code buried in N filler sections (default 1400). |
-| `gpqa_eval.py NAME [URL] [KEY]` | GPQA Diamond, first 50 questions (`GPQA_LIMIT`), thinking on, 30k token cap, temperature 1.0. Resumable. `GPQA_EFFORT=medium GPQA_SYSTEM=antispiral` gives the recommended settings. |
+| `gpqa_eval.py NAME [URL] [KEY]` | GPQA Diamond, first 50 questions (`GPQA_LIMIT`), thinking on, 30k token cap (`GPQA_MAX_TOKENS`), temperature 1.0. Resumable. `GPQA_EFFORT=medium GPQA_SYSTEM=antispiral` gives the recommended settings. `GPQA_IDS=1,12,...` asks only those questions, with the same shuffled choices as a full run; `GPQA_WORKERS=N` keeps N in flight. |
 | `run_gpqa_all.sh` | Starts a server per model (3.0 bpw, then 2.5 bpw if present), checks it serves that model, runs `gpqa_eval.py`, stops it. Refuses to start if something already answers on `TABBY_URL`. |
 | `gpqa_resume.sh` | Restarts `run_gpqa_all.sh` after a crash or reboot. |
 | `overthink_test.py VARIANT` | The 11 GPQA questions that spiralled, under one effort/system-prompt variant. This is how the anti-spiral prompt was picked. |
@@ -28,6 +28,18 @@ Accept the terms at https://huggingface.co/datasets/Idavidrein/gpqa, log in with
 ```bash
 hf download Idavidrein/gpqa gpqa_diamond.csv --repo-type dataset --local-dir gpqa
 ```
+
+The `xhigh` rerun in `notes/measurements.md` asked the questions that either 198-question `medium` pass got wrong:
+
+```bash
+IDS=$(python3 -c 'import json, sys
+wrong = {r["idx"] for f in sys.argv[1:] for r in map(json.loads, open(f)) if not r["correct"]}
+print(",".join(map(str, sorted(wrong))))' gpqa/results_PASS1.jsonl gpqa/results_PASS2.jsonl) &&
+GPQA_LIMIT=198 GPQA_IDS=$IDS GPQA_EFFORT=xhigh GPQA_SYSTEM=antispiral GPQA_MAX_TOKENS=60000 GPQA_WORKERS=2 \
+    python bench/gpqa_eval.py xhigh-retry
+```
+
+If the selection fails, the `&&` stops there; an empty `GPQA_IDS` is refused rather than running all 198.
 
 ## Direct model and kernel tests (GPU, no server)
 

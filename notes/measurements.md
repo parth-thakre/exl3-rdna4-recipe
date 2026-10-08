@@ -35,9 +35,13 @@ The default effort (`xhigh`) tells the model to "consider plausible alternatives
 it hit the 30k token cap on 7 of 45 questions. With `medium` and this prompt it hit the cap on none and scored higher.
 On the first 45 questions, which both runs answered, it took 4.6x less total time.
 
+When accuracy matters more than time, use `xhigh` with the same prompt and a large `max_tokens` (60k). On the 48 GPQA
+Diamond questions `medium` got wrong at least once, it got 28 right, where the two `medium` passes got 9 and 12. It
+thinks about 5x longer on those questions (see "Accuracy: GPQA Diamond" below).
+
 ## Results
 
-All numbers are from the one RX 9070 XT, measured on 5-6 October 2026 with the scripts in `bench/`. The batching
+All numbers are from the one RX 9070 XT, measured on 5-7 October 2026 with the scripts in `bench/`. The batching
 section and rows marked "new base" are on exllamav3 0662fac + our patches and TabbyAPI 2fd6cc7; the rest are on the
 old base (exllamav3 f1cf869 + the single-request patches, TabbyAPI f07131c). Context sizes like "80k" mean the server's `max_seq_len`/`cache_size` (80k = 81,920
 tokens).
@@ -172,9 +176,27 @@ All 198 questions, 3.0 bpw, `medium` + anti-spiral, same sampling, through the s
 | Pass 2 | 81.8% (162/198) | 1 |
 
 So about 81% on the full set; the first 50 questions happen to be easier than average. Published results on all
-198 questions (ISTA, settings not identical to ours): BF16 89.9%, UD-IQ3_S 89.9%, UD-Q2_K_XL 86.9%. Our setup scores
-below those. Part of that may be the `medium` reasoning effort, which we chose to stop thinking spirals; we haven't
-run the full set at `xhigh` to separate that from the quantization.
+198 questions (ISTA, settings not identical to ours): BF16 89.9%, UD-IQ3_S 89.9%, UD-Q2_K_XL 86.9%.
+
+To see how much of that gap is the `medium` effort, we asked the 48 questions that either pass got wrong again, at
+`xhigh` with the same anti-spiral prompt and sampling, a 60k token cap and two requests at a time (2026-10-07, same server;
+`GPQA_IDS`, `GPQA_EFFORT=xhigh`, `GPQA_MAX_TOKENS=60000`, `GPQA_WORKERS=2`):
+
+| On those 48 questions | Correct | Hit the token cap | Median reasoning | Median time |
+|---|---|---|---|---|
+| `medium`, pass 1 | 9 | 1 | 19k characters | 105 s |
+| `medium`, pass 2 | 12 | 1 | 17k characters | 105 s |
+| **`xhigh`** | **28** | 8 | 98k characters | 529 s |
+
+`xhigh` got 12 of the 27 questions that `medium` missed in both passes, and 16 of the 21 it missed in one. If
+`xhigh` also got right the 150 questions both `medium` passes did, the full set would be 178/198 (89.9%). That's an
+upper estimate, not a measured `xhigh` score: those 150 weren't asked at `xhigh`, and questions picked because
+`medium` missed them flatter the gain (on a third pass `medium` would get some of them right by chance). The rerun
+also changed the token cap (60k vs 30k), and we haven't run the unquantized model, so this doesn't show how much of
+the gap to the published scores is the reasoning effort and how much the quantization. It does show that `medium`
+leaves accuracy on the table. The cost is time: about 5x as much reasoning per hard question, and 8 of the 48 still
+ran into the 60k cap. (The times are wall clock with other requests in flight, three for `medium` and two for
+`xhigh`.)
 
 ### 3.0 vs 2.5 bpw
 
