@@ -18,7 +18,7 @@ logging:
 
 model:
   model_dir: ../models
-  model_name: Qwen3.8-27B-EXL3-3.0bpw
+  model_name: Qwen3.8-27B-EXL3-SC3.0bpw-H4
   backend: exllamav3
   max_seq_len: 131072
   cache_size: 131072

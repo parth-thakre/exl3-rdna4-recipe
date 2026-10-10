@@ -41,8 +41,10 @@ thinks about 5x longer on those questions (see "Accuracy: GPQA Diamond" below).
 
 ## Results
 
-All numbers are from the one RX 9070 XT, measured on 5-7 October 2026 with the scripts in `bench/`. The batching
-section and rows marked "new base" are on exllamav3 0662fac + our patches and TabbyAPI 2fd6cc7; the rest are on the
+All numbers are from the one RX 9070 XT, measured on 5-10 October 2026 with the scripts in `bench/`. The main model
+is turboderp's plain 3.0 bpw quant except in "Self-calibrated 3.0 bpw" below and the rows marked SC H4 (the current
+default, about 3% slower on greedy code; that section). The batching section, the self-calibrated comparison and rows
+marked "new base" are on exllamav3 0662fac + our patches and TabbyAPI 2fd6cc7; the rest are on the
 old base (exllamav3 f1cf869 + the single-request patches, TabbyAPI f07131c). Context sizes like "80k" mean the server's `max_seq_len`/`cache_size` (80k = 81,920
 tokens).
 
@@ -174,6 +176,7 @@ All 198 questions, 3.0 bpw, `medium` + anti-spiral, same sampling, through the s
 |---|---|---|
 | Pass 1 | 80.3% (159/198) | 1 |
 | Pass 2 | 81.8% (162/198) | 1 |
+| SC H4 quant (2026-10-09, see below) | 80.8% (160/198) | 4 |
 
 So about 81% on the full set; the first 50 questions happen to be easier than average. Published results on all
 198 questions (ISTA, settings not identical to ours): BF16 89.9%, UD-IQ3_S 89.9%, UD-Q2_K_XL 86.9%.
@@ -198,6 +201,34 @@ leaves accuracy on the table. The cost is time: about 5x as much reasoning per h
 ran into the 60k cap. (The times are wall clock with other requests in flight, three for `medium` and two for
 `xhigh`.)
 
+### Self-calibrated 3.0 bpw (the default since 2026-10-09)
+
+turboderp's `SC_3.00bpw_H4` branch is a 3.0 bpw quant calibrated on the model's own output, with a 4-bit instead of a
+6-bit lm_head. Against the plain 3.00bpw quant, same server and settings:
+
+| | Plain 3.00bpw | SC_3.00bpw_H4 |
+|---|---|---|
+| Weights on disk | 13.8 GB | 13.4 GB |
+| VRAM after load (128k, 3 slots, `amd-smi`) | 15,395 MB | 15,151 MB |
+| Perplexity (below) | 7.063 | 7.049 |
+| KL divergence from BF16 (turboderp's model card) | 0.033 | 0.026 |
+| GPQA Diamond, 198 q, `medium` + anti-spiral, 3 at a time | 159 / 162 (two passes) | 160 |
+| Hit the 30k token cap | 1 / 1 | 4 |
+| Code, 600 greedy tokens (`bench_api.py`, two runs) | 151.7 / 150.5 tok/s | 147.0 / 145.8 tok/s |
+| Prose, 600 sampled tokens (two runs) | 63.6 / 62.6 tok/s | 69.5 / 63.1 tok/s |
+| Decode at 8k / 64k / 120k (`context_bench.py`, one run each) | 138.0 / 118.4 / 107.5 | 128.2 / 127.7 / 109.0 |
+| Prefill at 8k / 30k (first of the two runs) | 1,234 / 1,253 tok/s | 1,242 / 1,265 tok/s |
+
+Greedy code is about 3% slower with the SC quant (146.4 vs 151.1 tok/s, both runs lower). Prose and the
+`context_bench.py` depths are too noisy here to call either way: prose is sampled, and single runs at one depth have
+differed by 10-25 tok/s (at 64k on one build, 102.0 to 127.4 tok/s across three runs). Repeated runs on 2026-10-10,
+SC quant on this build: 144.6 tok/s code and 60.3 prose (averages of 6). On GPQA the two scores are within sampling
+noise of each other: against pass 1, 11 questions were right only with the SC quant and 10 only with the plain one
+(against pass 2, 11 and 13), so neither has a shown advantage. It hit the token cap 4 times to 1; with numbers that
+small that may be chance. We took the closer distribution (perplexity, and turboderp's KL divergence on his own eval
+set) and 244 MB less VRAM over the 3% on code, so the SC quant is the default now
+(`setup/download_models.sh 3.0bpw-plain` still fetches the plain one).
+
 ### 3.0 vs 2.5 bpw
 
 | | 3.0 bpw | 2.5 bpw |
@@ -215,6 +246,7 @@ wikitext-2 raw, llama.cpp's method (512-token chunks, the second half of each sc
 
 | Model | PPL |
 |---|---|
+| EXL3 3.0 bpw, SC_3.00bpw_H4 | 7.049 |
 | EXL3 3.0 bpw | 7.063 |
 | EXL3 2.5 bpw | 7.248 |
 | GGUF UD-Q3_K_XL (llama.cpp) | 7.068 |

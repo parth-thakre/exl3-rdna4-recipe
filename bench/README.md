@@ -7,7 +7,7 @@ Run everything from the repo root with the venv active (`source setup/env.sh`). 
 These talk to TabbyAPI over its OpenAI-compatible API. They default to `http://127.0.0.1:8096/v1` and the first
 `api_key` in `tabbyAPI/api_tokens.yml`; set `TABBY_URL` and `TABBY_API_KEY` (or `TABBY_TREE` for another TabbyAPI
 checkout) to point elsewhere. Every script exits nonzero if a request fails or returns no text. They count tokens with the
-model's tokenizer (`models/Qwen3.8-27B-EXL3-3.0bpw/tokenizer.json`, or `MODEL_DIR`).
+model's tokenizer (`models/Qwen3.8-27B-EXL3-SC3.0bpw-H4/tokenizer.json`, or `MODEL_DIR`).
 
 | Script | What it does |
 |---|---|
@@ -16,7 +16,7 @@ model's tokenizer (`models/Qwen3.8-27B-EXL3-3.0bpw/tokenizer.json`, or `MODEL_DI
 | `ctx_probe.sh LABEL CTX_K [args]` | Restarts TabbyAPI with a context size and extra args, then runs `context_bench.py` near the top. Reports VRAM via `amd-smi`. Stops this repo's TabbyAPI first (`serve/stop_tabby.sh`), gives up after `START_TIMEOUT` seconds, and stops the server it started if anything fails. |
 | `needle_test.py [N]` | Quick long-context recall check: a code buried in N filler sections (default 1400). |
 | `gpqa_eval.py NAME [URL] [KEY]` | GPQA Diamond, first 50 questions (`GPQA_LIMIT`), thinking on, 30k token cap (`GPQA_MAX_TOKENS`), temperature 1.0. Resumable. `GPQA_EFFORT=medium GPQA_SYSTEM=antispiral` gives the recommended settings. `GPQA_IDS=1,12,...` asks only those questions, with the same shuffled choices as a full run; `GPQA_WORKERS=N` keeps N in flight. |
-| `run_gpqa_all.sh` | Starts a server per model (3.0 bpw, then 2.5 bpw if present), checks it serves that model, runs `gpqa_eval.py`, stops it. Refuses to start if something already answers on `TABBY_URL`. |
+| `run_gpqa_all.sh` | Starts a server per model (SC 3.0 bpw H4, then the plain 3.0 bpw and 2.5 bpw if present), checks it serves that model, runs `gpqa_eval.py`, stops it. Refuses to start if something already answers on `TABBY_URL`. |
 | `gpqa_resume.sh` | Restarts `run_gpqa_all.sh` after a crash or reboot. |
 | `overthink_test.py VARIANT` | The 11 GPQA questions that spiralled, under one effort/system-prompt variant. This is how the anti-spiral prompt was picked. |
 
@@ -56,12 +56,18 @@ two copies in 16 GB.
 | `bench_batch_sanity.py [--bsz 2 4] [--out FILE]` | Diagnostic report: runs N different prompts at once and, per job, shows the common prefix with the same prompt run alone, whether it is identical, its non-ASCII share and longest repeated-token run. Fails only on generator errors, unfinished or empty jobs, or if the N jobs never actually decoded together. `--out` writes everything as JSON, also on failure. Speeds it prints are generator-only (no API). |
 | `vram_breakdown.py` | Allocated VRAM per component (draft, main weights, KV) and the biggest tensors. |
 
+The GPU tests that ship inside the exllamav3 patch (`test_gdn_replay.py`, `test_gemv32.py`, `test_greedy_equal.py`)
+default to `models/Qwen3.8-27B-EXL3-3.0bpw`, the plain quant they were written against; pass
+`--model ../models/Qwen3.8-27B-EXL3-SC3.0bpw-H4` (from the `exllamav3/` checkout, as below) to run them on the current
+default.
+
 The DeltaNet replay A/B test (`test_gdn_replay.py`) ships inside the exllamav3 patch. It loads the main model and the
 3.0 bpw draft from `models/` and compares greedy output with replay off and on; `--state-check-only` runs just the
 kernel-level state comparisons without loading models:
 
 ```bash
-source setup/env.sh && cd exllamav3 && python test_gdn_replay.py --state-check --state-channelwise
+source setup/env.sh && cd exllamav3 && python test_gdn_replay.py --state-check --state-channelwise \
+    --model ../models/Qwen3.8-27B-EXL3-SC3.0bpw-H4
 ```
 
 It checks that a venv is active and is the one running it, that `HIP_VISIBLE_DEVICES` names a single GPU, and that

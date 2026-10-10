@@ -4,14 +4,14 @@ Environment overrides:
   TABBY_URL      the running server's OpenAI-compatible base URL (default http://127.0.0.1:8096/v1)
   TABBY_API_KEY  API key (default: the first api_key in $TABBY_DIR/api_tokens.yml)
   TABBY_TREE     TabbyAPI checkout (default: tabbyAPI/ in the repo root; TABBY_DIR works too)
-  MODEL_DIR      main model directory (default models/Qwen3.8-27B-EXL3-3.0bpw)
+  MODEL_DIR      main model directory (default models/Qwen3.8-27B-EXL3-SC3.0bpw-H4)
 """
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = os.environ.get("TABBY_URL", "http://127.0.0.1:8096/v1").rstrip("/")
 TABBY_DIR = os.environ.get("TABBY_TREE") or os.environ.get("TABBY_DIR") or os.path.join(ROOT, "tabbyAPI")
-MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(ROOT, "models", "Qwen3.8-27B-EXL3-3.0bpw"))
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(ROOT, "models", "Qwen3.8-27B-EXL3-SC3.0bpw-H4"))
 TOKENIZER = os.path.join(MODEL_DIR, "tokenizer.json")
 LOGS = os.path.join(ROOT, "logs")
 GPQA_DIR = os.path.join(ROOT, "gpqa")

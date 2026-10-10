@@ -1,8 +1,10 @@
 #!/bin/bash
 # Download the models into models/. Uses the `hf` CLI from huggingface_hub (in the venv).
 #
-#   setup/download_models.sh            main model (3.0 bpw, ~13.8 GB) + the bf16 DFlash2 draft (3.8 GB) to requantize
+#   setup/download_models.sh            main model (3.0 bpw self-calibrated, ~13.4 GB) + the bf16 DFlash2 draft (3.8 GB)
+#                                       to requantize
 #   setup/download_models.sh main       main model only
+#   setup/download_models.sh 3.0bpw-plain  turboderp's plain 3.0 bpw quant, the default until 2026-10-09 (13.8 GB)
 #   setup/download_models.sh draft-bf16 bf16 DFlash2 draft only (then run setup/requant_draft.sh)
 #   setup/download_models.sh draft-mia  ready-made 5.0 bpw DFlash2 draft by Mia-AiLab (1.5 GB, no requant needed,
 #                                       but it leaves less room for context)
@@ -15,7 +17,12 @@ command -v hf >/dev/null || { echo "hf CLI not found; run setup/make_venv.sh fir
 cd "$ROOT"
 
 main() {
-    # Branch 3.00bpw of turboderp's repo (commit 6fe61ad620abfe97c5b49f9722c2bceeea4ccc28 when tested)
+    # Branch SC_3.00bpw_H4 of turboderp's repo: self-calibrated 3.0 bpw with a 4-bit head (pinned to the tested commit)
+    hf download turboderp/Qwen3.8-27B-exl3 --revision 86b95530f9d365d90dd24d01a997a8de0cdf6c55 \
+        --local-dir models/Qwen3.8-27B-EXL3-SC3.0bpw-H4
+}
+main_plain() {
+    # Branch 3.00bpw (commit 6fe61ad620abfe97c5b49f9722c2bceeea4ccc28 when tested)
     hf download turboderp/Qwen3.8-27B-exl3 --revision 3.00bpw --local-dir models/Qwen3.8-27B-EXL3-3.0bpw
 }
 draft_bf16() {
@@ -35,8 +42,9 @@ case ${1:-default} in
     default)    main; draft_bf16
                 echo "next: setup/requant_draft.sh (needs the patched exllamav3 build and the GPU, a few minutes)" ;;
     main)       main ;;
+    3.0bpw-plain) main_plain ;;
     draft-bf16) draft_bf16 ;;
     draft-mia)  draft_mia ;;
     2.5bpw)     main_25 ;;
-    *) echo "usage: $0 [main|draft-bf16|draft-mia|2.5bpw]" >&2; exit 2 ;;
+    *) echo "usage: $0 [main|3.0bpw-plain|draft-bf16|draft-mia|2.5bpw]" >&2; exit 2 ;;
 esac

@@ -144,7 +144,9 @@ counting that aren't in this repo.
 draft 1.67 GB, KV 64k Q4 ~1 GB (16 KB/token; superseded, the measured figure is 24,192 B/token, see above), state/scratch/reserve/runtime ~2.4 GB. The embedding table and vision
 tower are already in system RAM. Ideas, best value first:
 1. Re-quantize the DFlash2 draft to ~3 bpw: ~0.6 GB, about +40k context. Needs the bf16 draft (z-lab).
-2. turboderp's `SC_3.00bpw_H4` branch (4-bit head, self-calibrated): ~0.3 GB. 13 GB download, then GPQA/PPL check.
+2. Done 2026-10-09: turboderp's `SC_3.00bpw_H4` branch (4-bit head, self-calibrated) is the default now. It saved
+   244 MB, with a GPQA score within noise, slightly lower perplexity and about 3% slower greedy code
+   (`notes/measurements.md`).
 3. Q3 KV cache: KV memory -25%. Check with `bench/needle_test.py`.
 4. Smaller `chunk_size` / `autosplit_reserve` after measuring the real prefill peak: ~0.2-0.4 GB.
 Together roughly 64k -> 140-160k context at full DFlash2 speed (estimate).
@@ -158,3 +160,27 @@ Together roughly 64k -> 140-160k context at full DFlash2 speed (estimate).
 
 **Other open items.** Autostart on boot for TabbyAPI and Open WebUI; `medium` + anti-spiral as the Open WebUI
 default; a second GPQA pass with a 64k cap; a KLD head-to-head vs UD-Q3_K_XL.
+
+## Upstream dev of 2026-10-10 (tested, not adopted yet)
+
+Our patch set rebased onto ExLlamaV3 `dev` 77ddae2, which now has upstream's own versions of two of our changes:
+DeltaNet layers re-advance from staged inputs instead of keeping per-draft-token state history (3a8e2fb, the job our
+replay patch did), and the split-decode attention packs (query, head) rows densely so a verify step reads K/V once per
+32 rows (dd39a01). We kept the WMMA GEMV and batching series (cherry-picked cleanly) and dropped our replay and the
+opt-in `EXL3_DRAFT_ROW_BUDGET` (it conflicted with upstream's new hybrid draft mode and was slower anyway).
+
+- Upstream's attention layout alone is slow on gfx1201 at long context: decode 78.7 tok/s at 64k and 74.2 at 120k,
+  against 127.7 and 109.0 on our build. With our `EXL3_DEC_*` tuning and Q4W kernel ported onto the dense layout
+  (whole kv head per program up to 128 rows, the higher split target), one layer at 60k context takes 499 us for an
+  8-token verify and 361 us for one token, against 1,553 and 557 for upstream's default and 503 / 360 on our build.
+- Through the API, both builds on the SC H4 quant and the same config, two interleaved rounds, rebased vs ours: code
+  144.9 vs 144.6 tok/s (averages of 6), prose 59.7 vs 60.3, 120k 102.5 vs 101.2 (two runs each), 3 at once
+  (generator) 234 vs 237, perplexity 7.0487 vs 7.0488, VRAM after the 120k run 16,095 / 16,010 MB vs 16,173 /
+  16,008. 64k is inconclusive: 102.0 / 127.4 (and 110.1 in an earlier run) vs 118.5 / 128.0. The greedy outputs
+  diverged on 3 of 4 prompts, each time where the top two logits were 0.094, 0.094 and 0.172 apart.
+- Upstream's fde1b37 passes `staging_pages` to `paged_attn_triton_decode`, which doesn't take it, so the eager Q4-cache
+  decode raises TypeError (with `EXL3_BC_ATTN=0`, or whenever the graph-captured path declines). Found in review by
+  GPT-6.1 Sol; fixed in our tree.
+
+Short-context speed and quality come out even and 64k is unsettled, so the recipe stays on 0662fac until the rebased
+build has had a long soak under load and more 64k runs.

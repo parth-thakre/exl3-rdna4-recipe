@@ -1,7 +1,7 @@
 # Qwen3.8-27B on a 16 GB RX 9070 XT: ExLlamaV3 + TabbyAPI
 
-Run Qwen3.8-27B (EXL3, 3.0 bpw) on an AMD RX 9070 XT or RX 9070 under Linux as a local OpenAI-compatible server for
-coding agents and chat. It uses upstream [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and
+Run Qwen3.8-27B (EXL3, 3.0 bpw: turboderp's self-calibrated `SC_3.00bpw_H4` quant) on an AMD RX 9070 XT or RX 9070
+under Linux as a local OpenAI-compatible server for coding agents and chat. It uses upstream [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and
 [TabbyAPI](https://github.com/theroyallab/tabbyAPI) with our RDNA4 patches on top, and a DFlash2 draft model for
 speculative decoding.
 
@@ -60,7 +60,7 @@ setup/fetch_deps.sh          # missing -devel headers into deps/ (no sudo; or dn
 setup/make_venv.sh           # .venv/ with PyTorch 2.13 for ROCm 7.2 and the tested package versions
 setup/build_exllamav3.sh     # clone ExLlamaV3 at the pinned commit, apply our patch, compile for gfx1201
 setup/install_tabby.sh       # clone TabbyAPI at the pinned commit, write tabbyAPI/config.yml
-setup/download_models.sh     # Qwen3.8-27B EXL3 3.0 bpw (13.8 GB) + the DFlash2 draft source (3.8 GB)
+setup/download_models.sh     # Qwen3.8-27B EXL3 3.0 bpw SC H4 (13.4 GB) + the DFlash2 draft source (3.8 GB)
 setup/requant_draft.sh       # turn the draft into a 3.0 bpw EXL3 model (uses the GPU, a few minutes)
 ```
 
