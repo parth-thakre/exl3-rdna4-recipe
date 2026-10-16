@@ -42,8 +42,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/recipe /opt/recipe
 WORKDIR /opt/recipe
-# Any uid can run it (the plugin may not run it as root): logs/ and Triton's kernel cache must be writable
-RUN mkdir -p logs && chmod 1777 logs
+# Any uid can run it (the plugin may not run it as root): the log directories and Triton's kernel cache must be
+# writable. TabbyAPI writes logs/{time}.log relative to its own working directory (tabbyAPI/), not /opt/recipe/logs,
+# so that directory has to exist too - the API server exits at startup without it.
+RUN mkdir -p logs tabbyAPI/logs && chmod 1777 logs tabbyAPI/logs
 ENV TRITON_CACHE_DIR=/tmp/triton HOME=/tmp
 # Models: /models, read-only is fine (container/README.md)
 ENV EXL3_MODELS=/models
