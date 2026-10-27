@@ -1,4 +1,4 @@
-From 54d0cd1344cfc758642c40e3556f3f9c9f0fc3c2 Mon Sep 17 00:00:00 2001
+From cfc4951a185548bdab5f811b2a0743c003ed5a5a Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:18:11 +0530
 Subject: [PATCH 03/15] ROCm: gfx12 WMMA GEMV to 32 rows with two M tiles
@@ -31,10 +31,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  4 files changed, 127 insertions(+), 37 deletions(-)
 
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 5a74b692..13b8458e 100644
+index a946d2ca..0270fff3 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
-@@ -269,20 +269,21 @@ forces shuffle extraction, `1` forces shared-memory staging. Testing only.
+@@ -276,20 +276,21 @@ forces shuffle extraction, `1` forces shared-memory staging. Testing only.
  
  ### `EXL3_GEMV_WMMA` (ROCm gfx1200 / gfx1201; default: `0`)
  

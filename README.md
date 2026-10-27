@@ -33,7 +33,7 @@ tested on one machine:
 | GPU | AMD RX 9070 XT, 16 GB (gfx1201) |
 | OS | Fedora 44, kernel 7.2 (install also tested in Ubuntu 24.04 and Arch containers, see Requirements) |
 | ROCm | system ROCm 7.1.1 (Fedora packages) to build; PyTorch 2.13.0 + ROCm 7.2 wheels to run |
-| Upstream | ExLlamaV3 `dev` 0f685aa (v1.6.1 plus two days of commits), TabbyAPI `main` a3fed43 |
+| Upstream | ExLlamaV3 v1.6.5 (cdc785d), TabbyAPI `main` a3fed43 |
 
 ## What we added on top of upstream
 

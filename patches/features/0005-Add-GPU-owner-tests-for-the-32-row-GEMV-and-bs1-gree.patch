@@ -1,4 +1,4 @@
-From 479e14dcc955b21b86513b39de04a2e5bd367736 Mon Sep 17 00:00:00 2001
+From f23f8e8b3e1300104238888cdaaf2dcb37278879 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:29:30 +0530
 Subject: [PATCH 05/15] Add GPU-owner tests for the 32-row GEMV and bs1 greedy
