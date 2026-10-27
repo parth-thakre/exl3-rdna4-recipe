@@ -1,4 +1,4 @@
-From d07a1c370f012574a13c5420d0c5995b37d6f28f Mon Sep 17 00:00:00 2001
+From bdf62698eb511ebb2963412ea3f7a7af47568532 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:25:05 +0530
 Subject: [PATCH 04/15] GatedMLP: graphed BC path up to 32 rows
@@ -24,47 +24,29 @@ up to 8 x 16 rows.
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 (cherry picked from commit 6115431e3f7900df05c52da0b222eca443300936)
 ---
- exllamav3/exllamav3_ext/libtorch/mlp.cpp | 22 +++++++++++-------
- exllamav3/exllamav3_ext/libtorch/mlp.h   | 29 ++++++++++++++++--------
- exllamav3/modules/mlp.py                 | 18 +++++++++++----
- 3 files changed, 47 insertions(+), 22 deletions(-)
+ exllamav3/exllamav3_ext/libtorch/mlp.cpp |  8 ++++----
+ exllamav3/exllamav3_ext/libtorch/mlp.h   | 22 +++++++++++++++-------
+ exllamav3/modules/mlp.py                 | 18 +++++++++++++-----
+ 3 files changed, 32 insertions(+), 16 deletions(-)
 
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-index 4e80c153..f38cbe6f 100644
+index 9ec9215a..f64a2f48 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-@@ -19,17 +19,23 @@ void BC_GatedMLP::run_bszN_gr
+@@ -19,9 +19,9 @@ void BC_GatedMLP::run_bszN_gr
      Graph* graph
  )
  {
 -    // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
 -    // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
 -    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
--    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
--    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
 +    // guh/gu hold 2 slots (gate, up); slicing the static (2, MLP_MAX_ROWS, width) buffers along dim 1
 +    // would leave dim 0's stride at MLP_MAX_ROWS*width instead of num_tokens*width, corrupting the
 +    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MLP_MAX_ROWS --
-+    // view the statics' leading 2*num_tokens*width elements as (2, num_tokens, width) instead
-+    // (a/down_xh have no such issue: their slot dim is size 1, so slicing the token dim -- the true
-+    // leading dim there -- stays contiguous)
-+    auto flat_prefix = [num_tokens](const at::Tensor& t)
-+    {
-+        const int64_t w = t.size(2);
-+        return t.view({-1}).narrow(0, 0, 2 * (int64_t) num_tokens * w).view({2, (int64_t) num_tokens, w});
-+    };
-     at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
-     if (!guh_n_ref.defined())
--        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
-+        guh_n_ref = flat_prefix(guh);
-     at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
-     if (!gu_n_ref.defined())
--        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
-+        gu_n_ref = flat_prefix(gu);
-     at::Tensor guh_n     = guh_n_ref;
-     at::Tensor gu_n      = gu_n_ref;
-     at::Tensor a_n       = a.slice(1, 0, num_tokens);
-@@ -97,7 +103,7 @@ void BC_GatedMLP::run_bszN
+     // use exactly-shaped views instead (a/down_xh have no such issue: their slot dim is size 1,
+     // so slicing the token dim -- the true leading dim there -- stays contiguous)
+     at::Tensor guh_n     = slot_pair_view(guh, num_tokens);
+@@ -91,7 +91,7 @@ void BC_GatedMLP::run_bszN
  )
  {
      int num_tokens = (int) x.numel() / (int) x.size(-1);
@@ -74,7 +56,7 @@ index 4e80c153..f38cbe6f 100644
  
      c10::cuda::CUDAGuard device_guard(x.device());
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
-index c0a31e19..b733544d 100644
+index d5022c6b..016c1c6c 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.h
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
 @@ -10,6 +10,11 @@ namespace py = pybind11;
@@ -89,7 +71,7 @@ index c0a31e19..b733544d 100644
  // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
  // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
  // using this class's OWN scratch (down_xh) rather than gate/up/down's BC_LinearEXL3::run_gr,
-@@ -37,16 +42,17 @@ struct BC_GatedMLP
+@@ -37,14 +42,14 @@ struct BC_GatedMLP
      std::shared_ptr<BC_LinearEXL3> down;
      float act_limit;
  
@@ -104,29 +86,22 @@ index c0a31e19..b733544d 100644
      // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
 -    // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
 -    // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
--    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
--    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
 +    // (2, MLP_MAX_ROWS, width) static buffer when num_tokens == MLP_MAX_ROWS (slicing dim 1 leaves
-+    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for
-+    // any other num_tokens). Each entry is instead an exactly (2, num_tokens, width)-shaped view of
-+    // the static's first 2*num_tokens*width elements: contiguous, slot 1 where the kernel expects
-+    // it, and no per-layer allocation (the statics are shared between layers, like a/down_xh)
-     std::vector<at::Tensor> guh_cache;
-     std::vector<at::Tensor> gu_cache;
- 
-@@ -89,8 +95,13 @@ struct BC_GatedMLP
++    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for any
+     // other num_tokens). Reshaping the static's leading 2*num_tokens*width elements instead gives
+     // the exact (2, num_tokens, width) layout without a per-layer allocation (the statics are
+     // shared by every layer on the device, these buffers are only live within one replay)
+@@ -93,8 +98,11 @@ struct BC_GatedMLP
          act_limit           (_act_limit)
      {
          TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
--        guh_cache.resize(MAX_BSZN);
--        gu_cache.resize(MAX_BSZN);
+-        TORCH_CHECK(guh.is_contiguous() && gu.is_contiguous() && guh.size(1) == MAX_BSZN && gu.size(1) == MAX_BSZN,
+-                    "BC_GatedMLP: guh/gu must be contiguous (2, MAX_BSZN, width) statics");
 +        TORCH_CHECK(guh.dim() == 3 && gu.dim() == 3 && guh.size(0) == 2 && gu.size(0) == 2 &&
 +                    guh.size(1) >= MLP_MAX_ROWS && gu.size(1) >= MLP_MAX_ROWS &&
 +                    a.size(1) >= MLP_MAX_ROWS && down_xh.size(1) >= MLP_MAX_ROWS &&
 +                    guh.is_contiguous() && gu.is_contiguous(),
 +                    "BC_GatedMLP: scratch must be contiguous (2, MLP_MAX_ROWS, width) / (1, MLP_MAX_ROWS, width)");
-+        guh_cache.resize(MLP_MAX_ROWS);
-+        gu_cache.resize(MLP_MAX_ROWS);
      }
  
      void run_bszN_gr

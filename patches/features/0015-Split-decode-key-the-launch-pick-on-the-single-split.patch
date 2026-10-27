@@ -1,4 +1,4 @@
-From 5a03aa174758519b5257c77567031456382ab8b7 Mon Sep 17 00:00:00 2001
+From 29d4d234e7c91f2aa4afb5c258f2cea623a3c966 Mon Sep 17 00:00:00 2001
 From: Parth Thakre <144053824+parth-thakre@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 03:13:43 +0530
 Subject: [PATCH 15/15] Split-decode: key the launch pick on the single-split
@@ -17,10 +17,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 18 insertions(+), 8 deletions(-)
 
 diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
-index 103402aa..a926d0fa 100644
+index 614a0136..2851cb84 100644
 --- a/exllamav3/modules/attention_fn/triton_paged.py
 +++ b/exllamav3/modules/attention_fn/triton_paged.py
-@@ -1510,11 +1510,14 @@ def paged_attn_triton_decode(
+@@ -1522,11 +1522,14 @@ def paged_attn_triton_decode(
          _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
      target = decode_split_target(_decode_sm_count[dev], q_len)
  
@@ -38,7 +38,7 @@ index 103402aa..a926d0fa 100644
          split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
          if splits > 1:
              partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-@@ -1535,8 +1538,11 @@ def paged_attn_triton_decode(
+@@ -1547,8 +1550,11 @@ def paged_attn_triton_decode(
  
      split_kernel = decode_split_kernel_for(qck, qcv, head_dim, hd_pad)
      with torch.cuda.device(q.device):

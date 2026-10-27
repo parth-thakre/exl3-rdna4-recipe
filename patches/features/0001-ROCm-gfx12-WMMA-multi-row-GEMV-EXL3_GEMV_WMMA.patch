@@ -1,4 +1,4 @@
-From d277469d7922e25a86ac9f3713bca17d0d11a848 Mon Sep 17 00:00:00 2001
+From 632f70c1954a317a660e78777de328d0fb86c3e4 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:03 +0530
 Subject: [PATCH 01/15] ROCm: gfx12 WMMA multi-row GEMV (EXL3_GEMV_WMMA)
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  2 files changed, 374 insertions(+)
 
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 4b7deafe..ed4de555 100644
+index 28938470..751daa5a 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
-@@ -267,6 +267,20 @@ the path wherever its hard constraints allow (testing).
+@@ -274,6 +274,20 @@ the path wherever its hard constraints allow (testing).
  Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
  forces shuffle extraction, `1` forces shared-memory staging. Testing only.
  

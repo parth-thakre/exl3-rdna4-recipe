@@ -1,4 +1,4 @@
-From 622d488510cc5b4a4abfdff1f4c506cf32089fb0 Mon Sep 17 00:00:00 2001
+From 73da4e2e9a66616704d015f8a36f935b5b400179 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:25:08 +0530
 Subject: [PATCH 08/15] GatedMLP: key BC graphs by output dtype as well as row
@@ -30,10 +30,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  2 files changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-index f38cbe6f..06bb1b07 100644
+index f64a2f48..f5818762 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-@@ -104,12 +104,18 @@ void BC_GatedMLP::run_bszN
+@@ -92,12 +92,18 @@ void BC_GatedMLP::run_bszN
  {
      int num_tokens = (int) x.numel() / (int) x.size(-1);
      TORCH_CHECK(num_tokens >= 1 && num_tokens <= MLP_MAX_ROWS, "run_bszN: bsz out of supported range");
@@ -54,7 +54,7 @@ index f38cbe6f..06bb1b07 100644
      if (g.disabled || (!g.ready && !g.ready_to_record))
      {
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
-index b733544d..99458959 100644
+index 016c1c6c..fe125eab 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.h
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
 @@ -42,9 +42,12 @@ struct BC_GatedMLP

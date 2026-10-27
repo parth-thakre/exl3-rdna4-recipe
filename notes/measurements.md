@@ -124,13 +124,34 @@ All numbers are from the one RX 9070 XT, measured on 5-13 October 2026 with the 
 is turboderp's plain 3.0 bpw quant except in "Current base" and "Self-calibrated 3.0 bpw" below and the rows marked SC H4 (the current
 default, about 3% slower on greedy code; that section). The batching section, the self-calibrated comparison and rows
 marked "new base" are on exllamav3 0662fac + our patches (the previous base) and TabbyAPI 2fd6cc7; "Current base"
-is on 9cc3bd1 (the recipe now builds 0f685aa, with the same kernels); the rest are on the old base (exllamav3 f1cf869 + the single-request
+is on 9cc3bd1 (the recipe now builds v1.6.5, with the same kernels; checks in that section); the rest are on the old base (exllamav3 f1cf869 + the single-request
 patches, TabbyAPI f07131c). Context sizes like "80k" mean the server's `max_seq_len`/`cache_size` (80k = 81,920
 tokens).
 
 ### Current base (since 2026-10-12)
 
-Since 2026-10-13 the recipe builds `dev` 0f685aa. turboderp merged our DeltaNet scan change and the Mamba2 replay fix
+Since 2026-10-27 the recipe builds the v1.6.5 release (cdc785d) with the same 15 commits (one hand edit, see
+`patches/README.md`). Checks of the port against the 0f685aa build (`wt-up1013`, which the numbers in the rest of this
+file were measured on), 2026-10-27, SC H4 model, DFlash2 3.0 bpw draft, 7 draft tokens:
+
+- Kernel tests: attention 382 passed (64 skipped), recurrent 923 passed (22 skipped); `test_gemv32.py` passes (11
+  projections, rows 1-32, fp16/fp32, row-tile invariance, fused gate+up, graphed MLP rows 1-32).
+- Greedy output (`test_greedy_equal.py`, 4 x 400 tokens): with every patch switch at its stock value
+  (`EXL3_GEMV_WMMA=0 EXL3_DEC_GROUP=0 EXL3_DEC_Q4W=0 EXL3_BC_MLP_MAX_ROWS=8`, no `EXL3_DEC_WARPS/STAGES/BLOCK_N`) the
+  port is token-identical to plain v1.6.5, and plain v1.6.5 is identical to itself across runs. With the recipe's
+  settings it differs at near-ties, as the patch always has: port vs plain v1.6.5, 1 of 4 prompts diverged (token 49);
+  0f685aa build vs plain 0f685aa, 2 of 4 (tokens 230 and 398); port vs 0f685aa build, 2 of 4 (tokens 124 and 230).
+- PPL, first 580 chunks: 7.0579 on the port and on plain v1.6.5, against 7.0487 on the 0f685aa build (10.5667 vs
+  10.5374 with the BOS overwrite). The change comes with upstream, not the patch.
+- API A/B, 64k / 1 slot (`ab-upstream/run_ab.sh`, TabbyAPI 2fd6cc7, two rounds alternating), tok/s, 0f685aa build vs
+  port: code 156.2 / 156.0 vs 154.1 / 154.1; prose (sampled) 64.5 / 66.9 vs 56.5 / 60.5; decode at 8k 135.9 / 139.2 vs
+  141.4 / 145.0, at 32k 127.5 / 138.1 vs 132.4 / 139.3, at 56k 122.9 / 118.3 vs 132.0 / 131.4 (the port's second
+  context run was repeated after a restart cut it off); prefill even (1,259-1,270 tok/s at 30k, except the port's first run at 1,095). Peak VRAM 13.89 vs 13.74 GB. Recall correct
+  everywhere, no OOM.
+- TabbyAPI a3fed43 (the recipe's pin) with the port: loads, code 153.4 tok/s, prose 66.3, prefill 1,236 / 1,260 tok/s
+  at 8k / 30k, no server errors.
+
+Since 2026-10-13 the recipe built `dev` 0f685aa. turboderp merged our DeltaNet scan change and the Mamba2 replay fix
 there (#505, #506), with the same kernel code as our `0016` and `0018`, so our patch is down to the other 15 commits;
 the rest of what came in after 9cc3bd1 is the disk cache tier, tensor parallelism, a DSA top-k workspace fix and
 conversion. The compute kernels this setup uses are unchanged and the disk tier and TP paths aren't used, though some

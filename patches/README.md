@@ -1,20 +1,21 @@
 # Patches
 
-All against ExLlamaV3 `dev` at 0f685aa (v1.6.1 plus two days of commits, among them our DeltaNet scan change).
+All against ExLlamaV3 v1.6.5 (cdc785d, released 2026-10-25). Before 2026-10-27 the base was `dev` 0f685aa (v1.6.1 plus
+two days of commits); that patch is in this repository's history.
 TabbyAPI needs no patch: it accepts ROCm GPUs natively since 2fd6cc7 (the recipe uses a3fed43).
 
 | File | Applied by `setup/build_exllamav3.sh` | What |
 |---|---|---|
-| `exllamav3-rdna4.patch` | always | Everything of ours: `git diff 0f685aa live-1013`. |
+| `exllamav3-rdna4.patch` | always | Everything of ours: `git diff v1.6.5 live-165`. |
 | `features/*.patch` | no | The same as its 15 commits, for reading and review. |
 | `previous/exllamav3-rdna4-0662fac.patch` | only if you select the previous base (`setup/versions.sh`) | The patch for the previous base, 0662fac, unchanged. |
 | `previous/pr423-dflash2-rejection-sampling-0662fac.patch` | only with `WITH_PR423=1`, on the previous base | Open upstream PR #423 by Rafa (@rafatxf), with its review fixes. |
 
-`live-1013` is our local work branch; it isn't published, and these patch files are its published form. The combined
+`live-165` is our local work branch; it isn't published, and these patch files are its published form. The combined
 patch is the one that's guaranteed: it's what we compile and validate, and it touches only source, docs and three tests
 (`test_gemv32.py`, `test_greedy_equal.py`, `tests/kernels/attention/test_paged_decode_layout.py`). The files in
-`features/` are the commits of `live-1013` as `git format-patch` output. Applied in order with `git am` on 0f685aa they
-give the same tree as the combined patch (checked 2026-10-13).
+`features/` are the commits of `live-165` as `git format-patch` output. Applied in order with `git am` on v1.6.5 they
+give the same tree as the combined patch (checked 2026-10-27).
 
 1. `0001` to `0003`, `0006`: gfx12 WMMA GEMV for 2-8 rows (draft verification), then 16 and 32 rows (two M tiles), with
    the 32-row accumulator kept in registers (`EXL3_GEMV_WMMA`).
@@ -28,6 +29,12 @@ give the same tree as the combined patch (checked 2026-10-13).
 7. `0014`, `0015`: a multi-stage split-decode tile that doesn't fit in shared memory falls back to one stage (it only
    happened with `EXL3_DEC_STAGES=2` at 16 q heads per kv head, not on Qwen3.8), and the launch pick is keyed on the
    single-split variant.
+
+The port from 0f685aa to v1.6.5 (2026-10-27) needed one hand edit, in `0004`. turboderp's f0dd8f6 replaced the per-row
+gate/up buffers of `BC_GatedMLP` with views of the shared statics (`slot_pair_view`), the same change `0004` makes; we
+kept his version and raised its limit from `MAX_BSZN` (8) to `MLP_MAX_ROWS` (32), with our stricter scratch-size check
+in the constructor. `0004`'s commit message still describes the views as its own change. The other 14 commits applied
+unchanged.
 
 Upstream since 0f685aa: our DeltaNet scan change (each thread keeps its slice of the recurrent state in registers across
 the tokens of a pass, which made the 8-token verify's DeltaNet layers a fifth faster here) and the Mamba2 replay launch

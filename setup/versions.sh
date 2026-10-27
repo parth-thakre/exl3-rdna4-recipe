@@ -3,11 +3,11 @@
 # environment, e.g. EXLLAMAV3_GIT_URL=/path/to/local/mirror setup/build_exllamav3.sh
 # (TABBY_URL, without GIT, is the running server's address in the bench scripts; it isn't used here.)
 
-# ExLlamaV3, dev branch (v1.6.1 and later). Our patch is `git diff <commit> live-1013` (our local work branch); see
+# ExLlamaV3 v1.6.5 (release tag). Our patch is `git diff <commit> live-165` (our local work branch); see
 # patches/README.md for how to regenerate it. The previous base is still available (patches/README.md, "Previous base"):
 #   EXLLAMAV3_COMMIT=0662fac591992c6d5f11d041b1cf2136d62e536d EXLLAMAV3_PATCH=patches/previous/exllamav3-rdna4-0662fac.patch
 EXLLAMAV3_GIT_URL=${EXLLAMAV3_GIT_URL:-https://github.com/turboderp-org/exllamav3}
-EXLLAMAV3_COMMIT=${EXLLAMAV3_COMMIT:-0f685aa9fda3a98a864149b367b7ef570257572e}
+EXLLAMAV3_COMMIT=${EXLLAMAV3_COMMIT:-cdc785db89e263e65e5849cb53e1ada156411414}
 EXLLAMAV3_PATCH=${EXLLAMAV3_PATCH:-patches/exllamav3-rdna4.patch}   # paths are relative to the repo root
 
 # Optional: upstream PR #423 (DFlash2 rejection sampling, by @rafatxf), applied after the main patch. Off by default

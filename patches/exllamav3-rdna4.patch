@@ -1,5 +1,5 @@
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 4b7deafe..4a741674 100644
+index 28938470..e7a5e134 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
 @@ -49,6 +49,34 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)
@@ -51,7 +51,7 @@ index 4b7deafe..4a741674 100644
  ### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
  
  Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges
-@@ -267,6 +302,28 @@ the path wherever its hard constraints allow (testing).
+@@ -274,6 +309,28 @@ the path wherever its hard constraints allow (testing).
  Weight-extraction strategy inside the fp16 GEMV kernel: `-1` picks per bitrate (default), `0`
  forces shuffle extraction, `1` forces shared-memory staging. Testing only.
  
@@ -81,41 +81,23 @@ index 4b7deafe..4a741674 100644
  
  Fused int8-activation GEMV for tensors quantized with the mul1 codebook: one cooperative launch
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.cpp b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-index 4e80c153..06bb1b07 100644
+index 9ec9215a..f5818762 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.cpp
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.cpp
-@@ -19,17 +19,23 @@ void BC_GatedMLP::run_bszN_gr
+@@ -19,9 +19,9 @@ void BC_GatedMLP::run_bszN_gr
      Graph* graph
  )
  {
 -    // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
 -    // would leave dim 0's stride at MAX_BSZN*width instead of num_tokens*width, corrupting the
 -    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MAX_BSZN --
--    // use exactly-shaped, lazily-cached buffers instead (a/down_xh have no such issue: their slot
--    // dim is size 1, so slicing the token dim -- the true leading dim there -- stays contiguous)
 +    // guh/gu hold 2 slots (gate, up); slicing the static (2, MLP_MAX_ROWS, width) buffers along dim 1
 +    // would leave dim 0's stride at MLP_MAX_ROWS*width instead of num_tokens*width, corrupting the
 +    // fused mgemm kernel's raw j*size_m*size_k slot addressing for any num_tokens != MLP_MAX_ROWS --
-+    // view the statics' leading 2*num_tokens*width elements as (2, num_tokens, width) instead
-+    // (a/down_xh have no such issue: their slot dim is size 1, so slicing the token dim -- the true
-+    // leading dim there -- stays contiguous)
-+    auto flat_prefix = [num_tokens](const at::Tensor& t)
-+    {
-+        const int64_t w = t.size(2);
-+        return t.view({-1}).narrow(0, 0, 2 * (int64_t) num_tokens * w).view({2, (int64_t) num_tokens, w});
-+    };
-     at::Tensor& guh_n_ref = guh_cache[num_tokens - 1];
-     if (!guh_n_ref.defined())
--        guh_n_ref = at::empty({2, num_tokens, guh.size(2)}, guh.options());
-+        guh_n_ref = flat_prefix(guh);
-     at::Tensor& gu_n_ref = gu_cache[num_tokens - 1];
-     if (!gu_n_ref.defined())
--        gu_n_ref = at::empty({2, num_tokens, gu.size(2)}, gu.options());
-+        gu_n_ref = flat_prefix(gu);
-     at::Tensor guh_n     = guh_n_ref;
-     at::Tensor gu_n      = gu_n_ref;
-     at::Tensor a_n       = a.slice(1, 0, num_tokens);
-@@ -97,13 +103,19 @@ void BC_GatedMLP::run_bszN
+     // use exactly-shaped views instead (a/down_xh have no such issue: their slot dim is size 1,
+     // so slicing the token dim -- the true leading dim there -- stays contiguous)
+     at::Tensor guh_n     = slot_pair_view(guh, num_tokens);
+@@ -91,13 +91,19 @@ void BC_GatedMLP::run_bszN
  )
  {
      int num_tokens = (int) x.numel() / (int) x.size(-1);
@@ -138,7 +120,7 @@ index 4e80c153..06bb1b07 100644
      if (g.disabled || (!g.ready && !g.ready_to_record))
      {
 diff --git a/exllamav3/exllamav3_ext/libtorch/mlp.h b/exllamav3/exllamav3_ext/libtorch/mlp.h
-index c0a31e19..99458959 100644
+index d5022c6b..fe125eab 100644
 --- a/exllamav3/exllamav3_ext/libtorch/mlp.h
 +++ b/exllamav3/exllamav3_ext/libtorch/mlp.h
 @@ -10,6 +10,11 @@ namespace py = pybind11;
@@ -153,7 +135,7 @@ index c0a31e19..99458959 100644
  // Gate and up projections run as one fused MGEMM when the pointer tables are given, otherwise
  // as two separate GEMV/GEMM calls -- for num_tokens > 1 these go directly through exl3_gemm_gr
  // using this class's OWN scratch (down_xh) rather than gate/up/down's BC_LinearEXL3::run_gr,
-@@ -37,16 +42,20 @@ struct BC_GatedMLP
+@@ -37,14 +42,17 @@ struct BC_GatedMLP
      std::shared_ptr<BC_LinearEXL3> down;
      float act_limit;
  
@@ -171,29 +153,22 @@ index c0a31e19..99458959 100644
      // raw offset j*size_m*size_k from the base pointer, which only lines up with a slice of the
 -    // (2, MAX_BSZN, width) static buffer when num_tokens == MAX_BSZN (slicing dim 1 leaves dim
 -    // 0's stride at MAX_BSZN*width, not num_tokens*width, corrupting the slot-1 address for any
--    // other num_tokens). Lazily-allocated, exactly (2, num_tokens, width)-shaped buffers per
--    // num_tokens sidestep this -- same pattern as BC_BlockSparseMLP's flat_token_cache
 +    // (2, MLP_MAX_ROWS, width) static buffer when num_tokens == MLP_MAX_ROWS (slicing dim 1 leaves
-+    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for
-+    // any other num_tokens). Each entry is instead an exactly (2, num_tokens, width)-shaped view of
-+    // the static's first 2*num_tokens*width elements: contiguous, slot 1 where the kernel expects
-+    // it, and no per-layer allocation (the statics are shared between layers, like a/down_xh)
-     std::vector<at::Tensor> guh_cache;
-     std::vector<at::Tensor> gu_cache;
- 
-@@ -89,8 +98,13 @@ struct BC_GatedMLP
++    // dim 0's stride at MLP_MAX_ROWS*width, not num_tokens*width, corrupting the slot-1 address for any
+     // other num_tokens). Reshaping the static's leading 2*num_tokens*width elements instead gives
+     // the exact (2, num_tokens, width) layout without a per-layer allocation (the statics are
+     // shared by every layer on the device, these buffers are only live within one replay)
+@@ -93,8 +101,11 @@ struct BC_GatedMLP
          act_limit           (_act_limit)
      {
          TORCH_CHECK(gu_ptrs_trellis.has_value() || (gate && up), "BC_GatedMLP: need fused mgemm tensors or gate/up handles");
--        guh_cache.resize(MAX_BSZN);
--        gu_cache.resize(MAX_BSZN);
+-        TORCH_CHECK(guh.is_contiguous() && gu.is_contiguous() && guh.size(1) == MAX_BSZN && gu.size(1) == MAX_BSZN,
+-                    "BC_GatedMLP: guh/gu must be contiguous (2, MAX_BSZN, width) statics");
 +        TORCH_CHECK(guh.dim() == 3 && gu.dim() == 3 && guh.size(0) == 2 && gu.size(0) == 2 &&
 +                    guh.size(1) >= MLP_MAX_ROWS && gu.size(1) >= MLP_MAX_ROWS &&
 +                    a.size(1) >= MLP_MAX_ROWS && down_xh.size(1) >= MLP_MAX_ROWS &&
 +                    guh.is_contiguous() && gu.is_contiguous(),
 +                    "BC_GatedMLP: scratch must be contiguous (2, MLP_MAX_ROWS, width) / (1, MLP_MAX_ROWS, width)");
-+        guh_cache.resize(MLP_MAX_ROWS);
-+        gu_cache.resize(MLP_MAX_ROWS);
      }
  
      void run_bszN_gr
@@ -817,10 +792,10 @@ index f4b3b614..e92133d5 100644
  int exl3_gemv_max_m();
  
 diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
-index e417e209..c3940bb1 100644
+index f38c077d..43dc04d3 100644
 --- a/exllamav3/modules/attention_fn/bc_attn.py
 +++ b/exllamav3/modules/attention_fn/bc_attn.py
-@@ -300,7 +300,9 @@ class BCAttn:
+@@ -307,7 +307,9 @@ class BCAttn:
          from .triton_paged import (
              combine_subtiles,
              decode_row_layout,
@@ -831,7 +806,7 @@ index e417e209..c3940bb1 100644
              _paged_attn_decode_combine_kernel,
              _paged_kv_update_kernel,
              _normalize_window,
-@@ -312,13 +314,19 @@ class BCAttn:
+@@ -319,13 +321,19 @@ class BCAttn:
          qh, kvh = self.num_q_heads, self.num_kv_heads
          group_size = qh // kvh
  
@@ -852,7 +827,7 @@ index e417e209..c3940bb1 100644
          splits_cap = max(1, min(target // programs, 128))
          window_left, window_right = _normalize_window(self.window_size)
  
-@@ -345,8 +353,16 @@ class BCAttn:
+@@ -352,8 +360,16 @@ class BCAttn:
              SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
              BLOCK_ROWS = block_rows, BLOCK_N = block_n,
          )
@@ -872,10 +847,10 @@ index e417e209..c3940bb1 100644
          sig_c = {
              "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
 diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
-index 17e2da1f..a926d0fa 100644
+index 2370bfcd..2851cb84 100644
 --- a/exllamav3/modules/attention_fn/triton_paged.py
 +++ b/exllamav3/modules/attention_fn/triton_paged.py
-@@ -1044,6 +1044,203 @@ def _paged_attn_decode_split_kernel(
+@@ -1056,6 +1056,203 @@ def _paged_attn_decode_split_kernel(
              tl.store(partial_ml + ml_base + rows * 2 + 1, l)
  
  
@@ -1079,7 +1054,7 @@ index 17e2da1f..a926d0fa 100644
  @triton.jit
  def _paged_attn_decode_combine_kernel(
      partial_o,
-@@ -1146,7 +1343,10 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
+@@ -1158,7 +1355,10 @@ def decode_row_layout(q_len: int, group_size: int, hd_pad: int) -> tuple[int, in
      32 rows pays off at every head_dim up to 256 on Ampere, Blackwell and RDNA3 alike, the fp32
      accumulator notwithstanding, since the tile loads dominate; at least 16 rows, the dots' minimum."""
      rows = q_len * group_size
@@ -1091,7 +1066,7 @@ index 17e2da1f..a926d0fa 100644
      return block_rows, triton.cdiv(rows, block_rows)
  
  
-@@ -1164,6 +1364,39 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
+@@ -1176,6 +1376,39 @@ def combine_subtiles(block_rows: int, hd_pad: int) -> tuple[int, int]:
  
  _decode_sm_count = {}
  
@@ -1131,7 +1106,7 @@ index 17e2da1f..a926d0fa 100644
  def paged_attn_triton_decode(
      q: torch.Tensor,
      k: torch.Tensor | None,
-@@ -1184,8 +1417,8 @@ def paged_attn_triton_decode(
+@@ -1196,8 +1429,8 @@ def paged_attn_triton_decode(
      qc: tuple | None = None,            # (k_scales, v_scales, k_bits, v_bits): caches are packed int32
      pre_appended_len: int = 0,          # new tokens already written to the cache; count but don't append
      n_kv_heads_override: int | None = None,
@@ -1142,7 +1117,7 @@ index 17e2da1f..a926d0fa 100644
  ) -> torch.Tensor:
      """Flash-decoding paged attention for short queries: the kv sequence is split across
      programs (sized from the block table, so no host sync on cache_seqlens) and reduced in a
-@@ -1245,14 +1478,20 @@ def paged_attn_triton_decode(
+@@ -1257,14 +1490,20 @@ def paged_attn_triton_decode(
          k_scales, v_scales, qck, qcv = q, q, 0, 0
          h32 = q
  
@@ -1166,7 +1141,7 @@ index 17e2da1f..a926d0fa 100644
  
      group_size = n_q_heads // n_kv_heads
      block_rows, h_blocks = decode_row_layout(q_len, group_size, hd_pad)
-@@ -1269,13 +1508,16 @@ def paged_attn_triton_decode(
+@@ -1281,13 +1520,16 @@ def paged_attn_triton_decode(
      dev = q.device.index
      if dev not in _decode_sm_count:
          _decode_sm_count[dev] = torch.cuda.get_device_properties(q.device).multi_processor_count
@@ -1187,7 +1162,7 @@ index 17e2da1f..a926d0fa 100644
          split_len = triton.cdiv(triton.cdiv(max_k_len, splits), block_n) * block_n
          if splits > 1:
              partial_o = torch.empty(programs * splits * block_rows * hd_pad, dtype = torch.float32, device = q.device)
-@@ -1294,20 +1536,24 @@ def paged_attn_triton_decode(
+@@ -1306,20 +1548,24 @@ def paged_attn_triton_decode(
          )
          return args, splits, partial_o, partial_ml
  

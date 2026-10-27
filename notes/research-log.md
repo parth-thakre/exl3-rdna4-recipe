@@ -6,8 +6,8 @@ point at this repo's layout. Dates are 2026. Numbers are from one RX 9070 XT (16
 superseded TabbyAPI patch); the work was then ported to exllamav3 0662fac (`patches/previous/`: the WMMA GEMV, graph
 re-instantiation, GQA decode attention with Q4W, the review fixes, the DeltaNet replay and the batching series), and
 on 2026-10-12 to 9cc3bd1, where upstream's own replay and graphs-off default replace ours, and on 2026-10-13 to
-0f685aa (`patches/exllamav3-rdna4.patch` and `patches/features/`), which has our DeltaNet scan change; the last three
-sections cover those ports. The 16-row GEMV below later grew into the
+0f685aa, which has our DeltaNet scan change, and on 2026-10-27 to the v1.6.5 release (`patches/exllamav3-rdna4.patch`
+and `patches/features/`); the last four sections cover those ports. The 16-row GEMV below later grew into the
 batching series (16- and 32-row GEMV); see `notes/measurements.md`. The adaptive draft length, tree fallback and Q4P
 experiments are not in this repo. The notes between the 16-row GEMV and the ports skip the batching work, which is
 written up in `notes/measurements.md`.
@@ -225,7 +225,7 @@ The same port moved to `dev` 9cc3bd1 (v1.6.1 plus the next day's commits). Upstr
 - PR #423 isn't ported: upstream rewrote `sample_from_state` for tensor parallelism, and the PR relied on our row
   pruning. It stays available on the previous base.
 
-## Upstream dev of 2026-10-13 (adopted: the current base)
+## Upstream dev of 2026-10-13 (adopted; the base until v1.6.5)
 
 We filed the DeltaNet scan change and the Mamba2 replay launch fix as issues rather than PRs (#505, #506), with the
 measurements and the patch linked. turboderp merged both into `dev` the same day (0f685aa), with the same kernel code;
@@ -291,3 +291,20 @@ config (128k, 3 slots), 2026-10-13, A/B through the API: code 156.1 vs 155.1 tok
 1,263 vs 1,242 / 1,262 tok/s at 7.7k / 29.4k, peak 16.25 vs 16.27 GB under concurrent and image load. The first
 streamed delta of a tool call now carries `role: assistant` (it had none). After concurrent and image requests, the
 registry's six gates pass on a3fed43: context recall at 106,084 tokens, 107.3 tok/s, peak 16,282 MiB, no OOM.
+
+## Upstream v1.6.5 (adopted 2026-10-27: the current base)
+
+v1.6.5 (2026-10-25) is 115 commits past 0f685aa. None of them carry our speed work, but it has a fix for a 1.6.4
+tokenizer regression that sometimes broke prompt caching, less VRAM for prefill with a quantized cache, and lower-latency
+drafting. 14 of our 15 commits cherry-picked cleanly; `0004` needed a hand edit because turboderp had made the same
+buffer change to `BC_GatedMLP` (`patches/README.md`).
+
+- With every patch switch at stock the port's greedy output is token-identical to plain v1.6.5, so the port adds nothing
+  beyond the switchable kernels. With them on it differs from plain v1.6.5 at near-ties (1 of 4 prompts), as the
+  0f685aa build did from plain 0f685aa (2 of 4).
+- PPL moved from 7.0487 to 7.0579, the same on plain v1.6.5, so it comes with upstream.
+- Speed against the 0f685aa build: code about 1% slower (154 vs 156 tok/s), decode at 8-56k equal or faster, prefill
+  even, 0.15 GB less peak VRAM. The earlier A/B of the 0f685aa build against stock v1.6.4 (official ROCm wheel,
+  gfx12-generic) had the patch 7% ahead on code and ~30% past 30k.
+- Not run on this base yet: GPQA through the live server.
+
