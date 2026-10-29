@@ -58,13 +58,19 @@ gpu_state() {
     done
 }
 
-# Kernel command-line GPU options, the amdgpu module parameters that matter for hangs, the firmware package (it carries
-# the GPU's MES and other firmware) and overclocking tools that are running
+# Kernel command-line GPU options, the amdgpu module parameters that matter for hangs, the firmware package and the
+# firmware versions each card loaded, and overclocking tools that are running
 amdgpu_driver() {
     local p v
     echo "kernel command line: $(tr ' ' '\n' </proc/cmdline | grep -E 'amdgpu|radeon|iommu|pci' | paste -sd' ' -)"
-    for p in lockup_timeout gpu_recovery cwsr_enable mes runpm ppfeaturemask; do
+    for p in lockup_timeout gpu_recovery cwsr_enable mes user_queue runpm ppfeaturemask; do
         v=$(cat /sys/module/amdgpu/parameters/$p 2>/dev/null) && echo "amdgpu.$p = $v"
+    done
+    # Loaded GPU firmware (MES schedules the queues; MEC runs compute), per card, readable without root
+    for d in /sys/class/drm/card[0-9]*/device/fw_version; do
+        [ -d "$d" ] || continue
+        echo "firmware loaded on $(basename "$(readlink -f "$d/..")"): $(for f in mes mes_kiq mec rlc smc sos; do
+            printf '%s=%s ' "$f" "$(cat "$d/${f}_fw_version" 2>/dev/null || echo -)"; done)"
     done
     echo "firmware: $( { rpm -q linux-firmware amd-gpu-firmware 2>/dev/null; dpkg-query -W -f '${Package} ${Version}\n' linux-firmware 2>/dev/null; pacman -Q linux-firmware linux-firmware-amdgpu 2>/dev/null; } | grep -v 'not installed' | paste -sd' ' -)"
     for p in lactd corectrl; do pgrep -x "$p" >/dev/null && echo "running: $p (GPU clock / voltage tool)"; done

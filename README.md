@@ -169,9 +169,10 @@ Hangs come and go, so give each test a few tries, and change one thing at a time
    is the kernel that hung. The mask must be decimal. It's slow and the log grows fast, so use it for one reproduction.
 
 For an issue, attach `./triage.sh --print` (it records which GPU runs the display, the clocks and overdrive table, the
-amdgpu settings, recent amdgpu kernel errors and the container's settings), the request that triggered it (prompt
-size, settings, whether it happens again), and, with sudo, `sudo journalctl -k -b -1 | grep -iE 'amdgpu|kfd'` if
-the hang ended in a reboot, and the GPU firmware versions: `sudo sh -c 'grep -H . /sys/kernel/debug/dri/*/amdgpu_firmware_info'`.
+amdgpu settings and loaded firmware versions, recent amdgpu kernel errors and the container's settings) and the
+request that triggered it (prompt size, settings, whether it happens again). If the hang ended in a reboot and
+`triage.sh` couldn't read the previous boot's kernel log, add `sudo journalctl -k -b -1 | grep -iE 'amdgpu|kfd'`:
+the lines before the reset say which queue timed out.
 
 ## Details and measurements
 
