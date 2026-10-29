@@ -10,6 +10,9 @@
 # Environment: CTX (context, default 96k), IMAGE (default below), MODELS (default ~/.cache/exl3-rdna4/models), PORT (default 8096),
 # CT=docker|podman (default: whichever works, Docker first), NO_TRIAGE=1 (don't offer ./triage.sh on failure),
 # EXL3_QC_STAGING=0 (~0.2 GB less VRAM at 128k for 17-28% slower long-prompt prefill; notes/measurements.md).
+# Every other EXL3_* variable (EXL3_TUNING=0 and the rest of setup/env.sh) and the ROCm debug variables AMD_LOG_LEVEL,
+# AMD_LOG_MASK, AMD_SERIALIZE_KERNEL, AMD_SERIALIZE_COPY and HIP_LAUNCH_BLOCKING are passed into the container too
+# (README, "GPU hangs and wrong output").
 set -euo pipefail
 IMAGE=${IMAGE:-ghcr.io/parth-thakre/exl3-rdna4:latest}
 MODELS=${MODELS:-${XDG_CACHE_HOME:-$HOME/.cache}/exl3-rdna4/models}
@@ -107,9 +110,18 @@ if [ ! -f "$MODELS/Qwen3.8-27B-EXL3-SC3.0bpw-H4/.download-complete" ] ||
     "$CT" run --rm "${user_args[@]}" -v "$MODELS:/models" "$IMAGE" download || die "the model download failed (rerun to resume)"
 fi
 
+# Your EXL3_* settings and ROCm debug variables; not EXL3_MODELS (the image's /models) or EXL3_TREE (a host path)
+env_args=() passed=()
+while read -r v; do
+    [[ $v =~ ^(EXL3_.+|AMD_LOG_LEVEL|AMD_LOG_MASK|AMD_SERIALIZE_KERNEL|AMD_SERIALIZE_COPY|HIP_LAUNCH_BLOCKING)$ ]] || continue
+    [[ $v = EXL3_MODELS || $v = EXL3_TREE ]] && continue
+    env_args+=(-e "$v=${!v}") passed+=("$v=${!v}")
+done < <(compgen -e)
+[ ${#passed[@]} -eq 0 ] || echo "passing to the container: ${passed[*]}"
+
 "$CT" rm -f "$NAME" >/dev/null 2>&1 || true
 "$CT" run -d --name "$NAME" "${gpu_args[@]}" "${user_args[@]}" --shm-size 8g \
-    -e CTX="$CTX" ${EXL3_QC_STAGING:+-e EXL3_QC_STAGING="$EXL3_QC_STAGING"} -p "127.0.0.1:$PORT:8096" -v "$MODELS:/models:ro" "$IMAGE" >/dev/null || die "the container didn't start"
+    -e CTX="$CTX" "${env_args[@]}" -p "127.0.0.1:$PORT:8096" -v "$MODELS:/models:ro" "$IMAGE" >/dev/null || die "the container didn't start"
 echo "starting $NAME ($CT, $CTX context); loading the model takes a minute or two"
 for _ in $(seq 1 120); do
     if curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then

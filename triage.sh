@@ -1,6 +1,7 @@
 #!/bin/bash
 # Something didn't work? This collects what an AI coding agent needs to help (distro, kernel, GPU and device access,
-# container runtime, recipe version, the last server and build logs) and opens the first agent CLI you have installed
+# which GPU runs the display, clocks and overdrive, amdgpu driver settings and kernel-log errors, container runtime and
+# settings, recipe version, the last server and build logs) and opens the first agent CLI you have installed
 # (Claude Code, Codex or OpenCode) with it, in this directory. The agent sends it to its model provider, like
 # anything you type into it; tokens and keys are removed first, and in a terminal you're asked before it opens.
 #
@@ -28,6 +29,60 @@ section() { printf '\n### %s\n```\n' "$1"; }
 endsec() { printf '```\n'; }
 run() { "$@" 2>&1 | head -n "${LINES_MAX:-40}"; }
 
+# Each DRM card: PCI address and IDs, whether it's the boot display (boot_vga) and which outputs have a display, VRAM
+# use, clocks, the power cap and the overdrive table (pp_od_clk_voltage: clock and voltage offsets, i.e. an undervolt
+# or overclock; readable when overdrive is enabled)
+gpu_state() {
+    local c d h n s conn
+    for c in /sys/class/drm/card[0-9]*; do
+        [[ $c =~ card[0-9]+$ ]] && [ -e "$c/device/vendor" ] || continue
+        d=$c/device n=$(basename "$c")
+        echo "$n: $(basename "$(readlink -f "$d")") $(cat "$d/vendor"):$(cat "$d/device" 2>/dev/null) boot_vga=$(cat "$d/boot_vga" 2>/dev/null || echo ?)"
+        conn=""
+        for s in /sys/class/drm/"$n"-*/status; do
+            [ "$(cat "$s" 2>/dev/null)" = connected ] && conn="$conn ${s#/sys/class/drm/$n-}"
+        done
+        echo "  displays connected:${conn:- none}" | sed 's|/status||g'
+        [ -r "$d/mem_info_vram_used" ] &&
+            echo "  VRAM used: $(( $(cat "$d/mem_info_vram_used") >> 20 )) / $(( $(cat "$d/mem_info_vram_total") >> 20 )) MiB"
+        [ -r "$d/power_dpm_force_performance_level" ] && echo "  performance level: $(cat "$d/power_dpm_force_performance_level")"
+        [ -r "$d/pp_dpm_sclk" ] && echo "  core clock levels: $(paste -sd' ' "$d/pp_dpm_sclk")"
+        [ -r "$d/pp_dpm_mclk" ] && echo "  memory clock levels: $(paste -sd' ' "$d/pp_dpm_mclk")"
+        for h in "$d"/hwmon/hwmon*; do
+            [ -r "$h/power1_cap" ] && echo "  power cap: $(( $(cat "$h/power1_cap") / 1000000 )) W (default $(( $(cat "$h/power1_cap_default" 2>/dev/null || echo 0) / 1000000 )) W)"
+            for s in "$h"/temp*_input; do
+                [ -r "$s" ] && echo "  $(cat "${s%_input}_label" 2>/dev/null || basename "$s"): $(( $(cat "$s") / 1000 )) C"
+            done
+        done
+        [ -r "$d/pp_od_clk_voltage" ] && { echo "  overdrive (pp_od_clk_voltage):"; head -n 20 "$d/pp_od_clk_voltage" 2>&1 | sed 's/^/    /'; }
+    done
+}
+
+# Kernel command-line GPU options, the amdgpu module parameters that matter for hangs, the firmware package (it carries
+# the GPU's MES and other firmware) and overclocking tools that are running
+amdgpu_driver() {
+    local p v
+    echo "kernel command line: $(tr ' ' '\n' </proc/cmdline | grep -E 'amdgpu|radeon|iommu|pci' | paste -sd' ' -)"
+    for p in lockup_timeout gpu_recovery cwsr_enable mes runpm ppfeaturemask; do
+        v=$(cat /sys/module/amdgpu/parameters/$p 2>/dev/null) && echo "amdgpu.$p = $v"
+    done
+    echo "firmware: $( { rpm -q linux-firmware amd-gpu-firmware 2>/dev/null; dpkg-query -W -f '${Package} ${Version}\n' linux-firmware 2>/dev/null; pacman -Q linux-firmware linux-firmware-amdgpu 2>/dev/null; } | grep -v 'not installed' | paste -sd' ' -)"
+    for p in lactd corectrl; do pgrep -x "$p" >/dev/null && echo "running: $p (GPU clock / voltage tool)"; done
+}
+
+# amdgpu, KFD and DRM errors from the kernel log of one boot (0 = this one, -1 = the previous, for when a hang ended in
+# a reboot). Reading it may need sudo or the systemd-journal group.
+kernel_log() {
+    local out
+    if out=$(journalctl -k -b "$1" --no-pager -q -o short-monotonic 2>/dev/null) && [ -n "$out" ]; then :
+    elif [ "$1" = 0 ] && out=$(dmesg 2>/dev/null) && [ -n "$out" ]; then :
+    else
+        echo "(not readable as you; with sudo: sudo journalctl -k -b $1 | grep -iE 'amdgpu|kfd|drm')"; return
+    fi
+    out=$(grep -iE 'amdgpu|kfd|\[drm' <<<"$out" | grep -iE '\b(error|fail\w*|fault|reset|hang|timeout|timed out|wedged|lost|corrupt\w*)\b' | tail -n 40)
+    echo "${out:-no amdgpu errors}"
+}
+
 collect() {
     section "System"
     . /etc/os-release 2>/dev/null; echo "distro: ${PRETTY_NAME:-unknown}"
@@ -44,12 +99,27 @@ collect() {
     command -v amd-smi >/dev/null && run amd-smi metric --mem-usage 2>/dev/null | grep -E 'GPU|VRAM'
     command -v hipconfig >/dev/null && echo "hipconfig: $(hipconfig --version 2>/dev/null)" || echo "hipconfig: not installed (fine for the container)"
     endsec
+    section "GPUs, display and clocks"
+    gpu_state
+    endsec
+    section "amdgpu driver"
+    amdgpu_driver
+    endsec
+    section "Kernel log: amdgpu errors (this boot, then the previous one)"
+    kernel_log 0
+    echo "--- previous boot"
+    kernel_log -1
+    endsec
     section "Container runtime"
     for ct in docker podman; do
         if command -v $ct >/dev/null; then
             echo "$ct: $($ct --version 2>&1)"
             $ct info >/dev/null 2>&1 && echo "  $ct info: ok" || echo "  $ct info: FAILS ($($ct info 2>&1 | tail -1))"
             $ct ps -a --filter name=exl3-rdna4 --format '  container {{.Names}}: {{.Status}} ({{.Image}})' 2>/dev/null
+            img=$($ct inspect --format '{{.Image}}' exl3-rdna4 2>/dev/null) &&
+                echo "  image: $($ct image inspect --format '{{join .RepoDigests " "}}' "$img" 2>/dev/null) ($img)"
+            $ct inspect --format '{{range .Config.Env}}{{println .}}{{end}}' exl3-rdna4 2>/dev/null |
+                grep -E '^(CTX|EXL3_|AMD_|HIP_|ROCR_)' | sed 's/^/  env: /'
         else
             echo "$ct: not installed"
         fi
@@ -93,6 +163,10 @@ How to help:
   "Limitations" in notes/measurements.md. The setup scripts are in setup/, the container files in container/.
 - Explain what you think is wrong before changing anything, and ask before anything that needs sudo, installs
   packages, or deletes files (never delete downloaded models or the .venv without asking).
+- If the GPU hung or reset (my desktop died, \`GPU Hang\` or \`MODE1 reset\` in the logs) or the output turned to
+  garbage (a run of \`!\`, 0% of the draft accepted), read "GPU hangs and wrong output" in README.md and take me
+  through its tests one at a time. Diagnostics that need sudo (the full kernel log, firmware versions) are fine to
+  suggest: show me the command and what it reads, and I'll run it.
 - Don't post anything online for me. If it looks like a bug in the recipe, write a GitHub issue I can review and file
   myself at https://github.com/parth-thakre/exl3-rdna4-recipe/issues, with the details that matter.
 

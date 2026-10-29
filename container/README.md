@@ -33,7 +33,9 @@ proxy with a key in front before exposing it anywhere else. For a quick chat in 
 is at http://127.0.0.1:8096/ui/.
 
 If something fails, `run.sh` offers to open Claude Code, Codex or OpenCode with the details (`./triage.sh` in the repo
-root, which you can also run yourself).
+root, which you can also run yourself). For a GPU hang or garbled output, see "GPU hangs and wrong output" in the main
+README: `run.sh` passes your `EXL3_*` settings (`EXL3_TUNING=0` among them) and ROCm's debug variables into the
+container.
 
 **Omarchy:** Docker comes installed, so `container/run.sh` is all you need. If Docker says permission denied, add
 yourself to the `docker` group (`sudo usermod -aG docker $USER`) and log in again. Once the image is in the local-ai
@@ -59,7 +61,7 @@ The models it expects in `/models`, and what `entrypoint.sh download` fetches:
 | `Qwen3.8-27B-EXL3-SC3.0bpw-H4` | [turboderp/Qwen3.8-27B-exl3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3), revision `86b9553` (branch `SC_3.00bpw_H4`) |
 | `draft/Qwen3.8-27B-DFlash2-EXL3-3.0bpw` | [parth-thakre/Qwen3.8-27B-DFlash2-EXL3-3.0bpw](https://huggingface.co/parth-thakre/Qwen3.8-27B-DFlash2-EXL3-3.0bpw), revision `3d915b1` (our 3.0 bpw quant of inco.ai's draft) |
 
-Add `-e CTX=128k` for 128k context. Arguments after the image name go to TabbyAPI (`--max-batch-size 2`, `--config
+Add `-e CTX=128k` for 128k context, `-e EXL3_TUNING=0` for the patch's kernels at upstream's defaults. Arguments after the image name go to TabbyAPI (`--max-batch-size 2`, `--config
 /path/in/container.yml`, ...). The built-in config is [`config.yml`](config.yml): the same settings as a host install.
 
 ## Build

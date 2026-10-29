@@ -149,6 +149,30 @@ last server and build logs, with anything that looks like an API key removed) an
 OpenCode, whichever you have, with it. `./triage.sh "what you saw"` adds your own description; `./triage.sh --print`
 just writes the file for you to paste anywhere. `container/run.sh` offers it when it fails.
 
+### GPU hangs and wrong output
+
+A GPU hang resets the card: the server log shows `HW Exception ... GPU Hang`, the kernel log `amdgpu ... reset`, and a
+desktop on the same card restarts. Wrong output usually looks like a run of `!` (what greedy decoding picks when the
+logits are NaN) with none of the draft accepted. Neither has happened on the test machine, whose display runs on the
+CPU's integrated GPU, so its RX 9070 XT runs nothing but this. If either happens to you, these tests narrow it down.
+Hangs come and go, so give each test a few tries, and change one thing at a time:
+
+1. **The patch's kernels at upstream's defaults:** `EXL3_TUNING=0 container/run.sh` (or `EXL3_TUNING=0
+   serve/run_tabby.sh`). Decode is slower, and greedy output is the same as plain upstream's, token for token. If the
+   problem stops, it's in our code.
+2. **Nothing else on the card:** plug the monitor into the motherboard (most Ryzen 7000 and 9000 CPUs have an
+   integrated GPU), or log out of the desktop and send requests over SSH.
+3. **Stock clocks and voltage:** undo any undervolt, overclock or power limit (LACT, CoreCtrl). Long compute work can
+   fail at settings that games pass. `./triage.sh --print` shows the card's overdrive table.
+4. **Which kernel hangs:** `AMD_SERIALIZE_KERNEL=3 AMD_LOG_LEVEL=3 AMD_LOG_MASK=2097152 container/run.sh` runs one GPU
+   kernel at a time and logs each one's name (`ShaderName`), so the last name in `container/run.sh logs` before the hang
+   is the kernel that hung. The mask must be decimal. It's slow and the log grows fast, so use it for one reproduction.
+
+For an issue, attach `./triage.sh --print` (it records which GPU runs the display, the clocks and overdrive table, the
+amdgpu settings, recent amdgpu kernel errors and the container's settings), the request that triggered it (prompt
+size, settings, whether it happens again), and, with sudo, `sudo journalctl -k -b -1 | grep -iE 'amdgpu|kfd'` if
+the hang ended in a reboot, and the GPU firmware versions: `sudo sh -c 'grep -H . /sys/kernel/debug/dri/*/amdgpu_firmware_info'`.
+
 ## Details and measurements
 
 Full benchmark tables and methodology, what each patch does, what didn't work and the known limitations are in

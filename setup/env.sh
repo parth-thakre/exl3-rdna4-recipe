@@ -43,11 +43,18 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Fa
 # doesn't have that, so the setting below only matters on the previous base.
 export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-1000}
 
-# gfx12 WMMA multi-row GEMV for draft verification.
-export EXL3_GEMV_WMMA=1
-
-# Split-decode attention tuned for gfx1201: the whole GQA group per program, 4 warps, 16-token tiles.
-# 60k deep, 8-row verify: 1961 -> ~605 us per layer; 1-row decode 550 -> ~336 us (bench/bench_decode_attn.py).
-export EXL3_DEC_GROUP=1 EXL3_DEC_WARPS=4 EXL3_DEC_BLOCK_N=16
-# Q4W word-sliced kernel for 4-bit caches, 2 stages: 1.2-1.3x the packed kernel at q_len 4-8.
-export EXL3_DEC_Q4W=1 EXL3_DEC_STAGES=2
+# The patch's kernel settings. Each keeps a value you set yourself. EXL3_TUNING=0 puts them all at upstream's defaults
+# instead, which tells a GPU hang or wrong output caused by our kernels from one that isn't (README, "GPU hangs and
+# wrong output"); it costs speed, not quality.
+if [ "${EXL3_TUNING:-1}" = 0 ]; then
+    export EXL3_GEMV_WMMA=0 EXL3_GEMV_MAX_M=8 EXL3_BC_MLP_MAX_ROWS=8 EXL3_DEC_GROUP=0 EXL3_DEC_Q4W=0
+    unset EXL3_DEC_WARPS EXL3_DEC_BLOCK_N EXL3_DEC_STAGES
+else
+    # gfx12 WMMA multi-row GEMV for draft verification.
+    export EXL3_GEMV_WMMA=${EXL3_GEMV_WMMA:-1}
+    # Split-decode attention tuned for gfx1201: the whole GQA group per program, 4 warps, 16-token tiles.
+    # 60k deep, 8-row verify: 1961 -> ~605 us per layer; 1-row decode 550 -> ~336 us (bench/bench_decode_attn.py).
+    export EXL3_DEC_GROUP=${EXL3_DEC_GROUP:-1} EXL3_DEC_WARPS=${EXL3_DEC_WARPS:-4} EXL3_DEC_BLOCK_N=${EXL3_DEC_BLOCK_N:-16}
+    # Q4W word-sliced kernel for 4-bit caches, 2 stages: 1.2-1.3x the packed kernel at q_len 4-8.
+    export EXL3_DEC_Q4W=${EXL3_DEC_Q4W:-1} EXL3_DEC_STAGES=${EXL3_DEC_STAGES:-2}
+fi
