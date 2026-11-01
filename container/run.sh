@@ -53,6 +53,8 @@ command -v curl >/dev/null || die "needs curl (to check when the server is up)"
 [ -e /dev/kfd ] || die "/dev/kfd is missing: the amdgpu driver isn't loaded (is the RX 9070 XT installed and the kernel recent enough?)"
 render=$(ls /dev/dri/renderD* 2>/dev/null | head -1) || true
 [ -n "$render" ] || die "no /dev/dri/renderD* node"
+source "$ROOT/setup/gpu_check.sh"
+gpu_stock_warning run.sh
 
 # need_own_access: rootless runtimes pass your own groups through, so you need access to the devices yourself
 need_own_access() {

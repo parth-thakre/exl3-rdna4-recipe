@@ -13,6 +13,7 @@
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 cd "$ROOT"
+source "$ROOT/setup/gpu_check.sh"
 print_only=false
 [ "${1:-}" = --print ] && { print_only=true; shift; }
 problem=${*:-}
@@ -33,7 +34,7 @@ run() { "$@" 2>&1 | head -n "${LINES_MAX:-40}"; }
 # use, clocks, the power cap and the overdrive table (pp_od_clk_voltage: clock and voltage offsets, i.e. an undervolt
 # or overclock; readable when overdrive is enabled)
 gpu_state() {
-    local c d h n s v conn
+    local c d h n s conn
     for c in /sys/class/drm/card[0-9]*; do
         [[ $c =~ card[0-9]+$ ]] && [ -e "$c/device/vendor" ] || continue
         d=$c/device n=$(basename "$c")
@@ -55,16 +56,8 @@ gpu_state() {
             done
         done
         [ -r "$d/pp_od_clk_voltage" ] && { echo "  overdrive (pp_od_clk_voltage):"; head -n 20 "$d/pp_od_clk_voltage" 2>&1 | sed 's/^/    /'; }
-        # Undervolts and power limits look stable in games and can still hang long prefills (issue #2)
-        for s in OD_VDDGFX_OFFSET OD_SCLK_OFFSET; do
-            v=$(grep -A1 "^$s:" "$d/pp_od_clk_voltage" 2>/dev/null | sed -n 2p | tr -d ' ')
-            [ -n "$v" ] && [[ ! $v =~ ^0[A-Za-z]*$ ]] && echo "  NOT STOCK: ${s#OD_} is $v"
-        done
-        for h in "$d"/hwmon/hwmon*; do
-            [ -r "$h/power1_cap_default" ] && [ "$(cat "$h/power1_cap")" -lt "$(cat "$h/power1_cap_default")" ] &&
-                echo "  NOT STOCK: power cap below default"
-        done
     done
+    gpu_not_stock | sed 's/^/NOT STOCK: /'
 }
 
 # Kernel command-line GPU options, the amdgpu module parameters that matter for hangs, the firmware package and the
