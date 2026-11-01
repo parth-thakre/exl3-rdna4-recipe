@@ -9,6 +9,7 @@
 #
 # Environment: CTX (context, default 96k), IMAGE (default below), MODELS (default ~/.cache/exl3-rdna4/models), PORT (default 8096),
 # CT=docker|podman (default: whichever works, Docker first), NO_TRIAGE=1 (don't offer ./triage.sh on failure),
+# ALLOW_NOT_STOCK=1 (don't ask before serving on an undervolted or power-limited card),
 # EXL3_QC_STAGING=0 (~0.2 GB less VRAM at 128k for 17-28% slower long-prompt prefill; notes/measurements.md).
 # Every other EXL3_* variable (EXL3_TUNING=0 and the rest of setup/env.sh) and the ROCm debug variables AMD_LOG_LEVEL,
 # AMD_LOG_MASK, AMD_SERIALIZE_KERNEL, AMD_SERIALIZE_COPY and HIP_LAUNCH_BLOCKING are passed into the container too
@@ -54,7 +55,7 @@ command -v curl >/dev/null || die "needs curl (to check when the server is up)"
 render=$(ls /dev/dri/renderD* 2>/dev/null | head -1) || true
 [ -n "$render" ] || die "no /dev/dri/renderD* node"
 source "$ROOT/setup/gpu_check.sh"
-gpu_stock_warning run.sh
+gpu_stock_warning run.sh || exit 1
 
 # need_own_access: rootless runtimes pass your own groups through, so you need access to the devices yourself
 need_own_access() {

@@ -27,7 +27,7 @@ PIDFILE=${TABBY_PIDFILE:-$ROOT/logs/tabby.pid}
 
 source "$ROOT/setup/env.sh" || { echo "run_tabby.sh: environment setup failed" >&2; exit 1; }
 source "$ROOT/setup/gpu_check.sh"
-gpu_stock_warning run_tabby.sh
+gpu_stock_warning run_tabby.sh || exit 1
 [ -f "$TABBY_TREE/main.py" ] || { echo "run_tabby.sh: no TabbyAPI in $TABBY_TREE; run setup/install_tabby.sh" >&2; exit 1; }
 [ -f "$TABBY_TREE/config.yml" ] || { echo "run_tabby.sh: no $TABBY_TREE/config.yml; run setup/install_tabby.sh" >&2; exit 1; }
 if compgen -G "$EXL3_TREE/exllamav3_ext*.so" >/dev/null; then

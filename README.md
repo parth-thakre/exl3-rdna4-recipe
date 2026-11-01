@@ -161,8 +161,9 @@ down. Hangs come and go, so give each test a few tries, and change one thing at 
 
 1. **Stock clocks and voltage:** undo any undervolt, overclock or power limit (LACT, CoreCtrl), and check it's still
    undone after a reboot, since a LACT profile applies at boot. A long prefill keeps the card at full load for minutes
-   and can fail at settings games pass. `container/run.sh` and `serve/run_tabby.sh` warn at start when the card has a
-   voltage or clock offset or a lowered power cap, and `./triage.sh --print` shows them.
+   and can fail at settings games pass. When the card has a voltage or clock offset or a lowered power cap,
+   `container/run.sh` and `serve/run_tabby.sh` warn at start and, in a terminal, ask whether to continue
+   (`ALLOW_NOT_STOCK=1` skips the question). `./triage.sh --print` shows them too.
 2. **The patch's kernels at upstream's defaults:** `EXL3_TUNING=0 container/run.sh` (or `EXL3_TUNING=0
    serve/run_tabby.sh`). Decode is slower, and greedy output is the same as plain upstream's, token for token. If the
    problem stops, it's in our code.

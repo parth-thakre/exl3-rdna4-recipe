@@ -22,9 +22,10 @@ gpu_not_stock() {
     return 0
 }
 
-# gpu_stock_warning <script name>: print a warning to stderr if any GPU isn't at stock settings
+# gpu_stock_warning <script name>: warn on stderr if any GPU isn't at stock settings. In a terminal, ask whether to
+# continue and return 1 on no; otherwise (the container, a service) only warn. ALLOW_NOT_STOCK=1 skips the question.
 gpu_stock_warning() {
-    local n; n=$(gpu_not_stock)
+    local n ans; n=$(gpu_not_stock)
     [ -n "$n" ] || return 0
     {
         echo "$1: warning: GPU not at stock settings:"
@@ -32,4 +33,9 @@ gpu_stock_warning() {
         echo "  Undervolts and power limits that games pass can hang long prompts or turn the output into a run of '!'."
         echo "  If that happens, set the card back to stock (LACT, CoreCtrl) first: README, \"GPU hangs and wrong output\"."
     } >&2
+    [ -t 0 ] && [ -t 2 ] && [ -z "${ALLOW_NOT_STOCK:-}" ] || return 0
+    read -r -p "Continue anyway? [y/N] " ans || ans=
+    case $ans in [yY]*) return 0 ;; esac
+    echo "$1: stopped (ALLOW_NOT_STOCK=1 skips this question)" >&2
+    return 1
 }
