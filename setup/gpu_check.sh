@@ -33,7 +33,7 @@ gpu_stock_warning() {
         echo "  Undervolts and power limits that games pass can hang long prompts or turn the output into a run of '!'."
         echo "  If that happens, set the card back to stock (LACT, CoreCtrl) first: README, \"GPU hangs and wrong output\"."
     } >&2
-    [ -t 0 ] && [ -t 2 ] && [ -z "${ALLOW_NOT_STOCK:-}" ] || return 0
+    [ -t 0 ] && [ -t 2 ] && [ "${ALLOW_NOT_STOCK:-}" != 1 ] || return 0
     read -r -p "Continue anyway? [y/N] " ans || ans=
     case $ans in [yY]*) return 0 ;; esac
     echo "$1: stopped (ALLOW_NOT_STOCK=1 skips this question)" >&2

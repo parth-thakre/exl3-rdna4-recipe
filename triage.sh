@@ -21,7 +21,9 @@ problem=${*:-}
 # Tokens and keys: long hex strings, common token prefixes, key/password/secret/token values in key: value,
 # key=value and "key": "value" form, and Bearer headers. Applied to the whole prompt, your own text included.
 redact() {
-    sed -E 's/[0-9a-fA-F]{32,}/<redacted>/g
+    # Image digests are kept, cut to 12 hex digits (as docker and podman show them), so the report names the image
+    sed -E 's/sha256:([0-9a-fA-F]{12})[0-9a-fA-F]{52}/sha256:\1/g
+        s/[0-9a-fA-F]{32,}/<redacted>/g
         s/(hf_|sk-|sk_|ghp_|gho_|ghs_|github_pat_|xox[abp]-|glpat-|AKIA)[A-Za-z0-9_-]{8,}/<redacted>/g
         s/("?[A-Za-z_]*(api[_-]?key|token|secret|password|passwd)[A-Za-z_]*"?[[:space:]]*[:=][[:space:]]*)("[^"]*"|[^[:space:],}]+)/\1<redacted>/Ig
         s/(Bearer)[[:space:]]+[^[:space:]"]+/\1 <redacted>/Ig'
@@ -124,8 +126,8 @@ collect() {
             echo "$ct: $($ct --version 2>&1)"
             $ct info >/dev/null 2>&1 && echo "  $ct info: ok" || echo "  $ct info: FAILS ($($ct info 2>&1 | tail -1))"
             $ct ps -a --filter name=exl3-rdna4 --format '  container {{.Names}}: {{.Status}} ({{.Image}})' 2>/dev/null
-            img=$($ct inspect --format '{{.Image}}' exl3-rdna4 2>/dev/null) &&
-                echo "  image: $($ct image inspect --format '{{join .RepoDigests " "}}' "$img" 2>/dev/null) ($img)"
+            img=$($ct inspect --format '{{.Image}}' exl3-rdna4 2>/dev/null) && id=${img#sha256:} &&
+                echo "  image: $($ct image inspect --format '{{join .RepoDigests " "}}' "$img" 2>/dev/null) (id ${id:0:12})"
             $ct inspect --format '{{range .Config.Env}}{{println .}}{{end}}' exl3-rdna4 2>/dev/null |
                 grep -E '^(CTX|EXL3_|AMD_|HIP_|ROCR_)' | sed 's/^/  env: /'
         else

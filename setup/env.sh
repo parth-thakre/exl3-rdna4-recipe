@@ -48,7 +48,7 @@ export EXL3_GRAPH_REINST=${EXL3_GRAPH_REINST:-1000}
 # wrong output"); it costs speed, not quality.
 if [ "${EXL3_TUNING:-1}" = 0 ]; then
     export EXL3_GEMV_WMMA=0 EXL3_GEMV_MAX_M=8 EXL3_BC_MLP_MAX_ROWS=8 EXL3_DEC_GROUP=0 EXL3_DEC_Q4W=0
-    unset EXL3_DEC_WARPS EXL3_DEC_BLOCK_N EXL3_DEC_STAGES
+    unset EXL3_DEC_WARPS EXL3_DEC_BLOCK_N EXL3_DEC_STAGES EXL3_DEC_SPLIT_MULT
 else
     # gfx12 WMMA multi-row GEMV for draft verification.
     export EXL3_GEMV_WMMA=${EXL3_GEMV_WMMA:-1}
