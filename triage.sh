@@ -33,7 +33,7 @@ run() { "$@" 2>&1 | head -n "${LINES_MAX:-40}"; }
 # use, clocks, the power cap and the overdrive table (pp_od_clk_voltage: clock and voltage offsets, i.e. an undervolt
 # or overclock; readable when overdrive is enabled)
 gpu_state() {
-    local c d h n s conn
+    local c d h n s v conn
     for c in /sys/class/drm/card[0-9]*; do
         [[ $c =~ card[0-9]+$ ]] && [ -e "$c/device/vendor" ] || continue
         d=$c/device n=$(basename "$c")
@@ -55,6 +55,15 @@ gpu_state() {
             done
         done
         [ -r "$d/pp_od_clk_voltage" ] && { echo "  overdrive (pp_od_clk_voltage):"; head -n 20 "$d/pp_od_clk_voltage" 2>&1 | sed 's/^/    /'; }
+        # Undervolts and power limits look stable in games and can still hang long prefills (issue #2)
+        for s in OD_VDDGFX_OFFSET OD_SCLK_OFFSET; do
+            v=$(grep -A1 "^$s:" "$d/pp_od_clk_voltage" 2>/dev/null | sed -n 2p | tr -d ' ')
+            [ -n "$v" ] && [[ ! $v =~ ^0[A-Za-z]*$ ]] && echo "  NOT STOCK: ${s#OD_} is $v"
+        done
+        for h in "$d"/hwmon/hwmon*; do
+            [ -r "$h/power1_cap_default" ] && [ "$(cat "$h/power1_cap")" -lt "$(cat "$h/power1_cap_default")" ] &&
+                echo "  NOT STOCK: power cap below default"
+        done
     done
 }
 
@@ -171,7 +180,7 @@ How to help:
   packages, or deletes files (never delete downloaded models or the .venv without asking).
 - If the GPU hung or reset (my desktop died, \`GPU Hang\` or \`MODE1 reset\` in the logs) or the output turned to
   garbage (a run of \`!\`, 0% of the draft accepted), read "GPU hangs and wrong output" in README.md and take me
-  through its tests one at a time. Diagnostics that need sudo (the full kernel log, firmware versions) are fine to
+  through its tests one at a time, starting with any NOT STOCK line below (an undervolt or power limit). Diagnostics that need sudo (the full kernel log, firmware versions) are fine to
   suggest: show me the command and what it reads, and I'll run it.
 - Don't post anything online for me. If it looks like a bug in the recipe, write a GitHub issue I can review and file
   myself at https://github.com/parth-thakre/exl3-rdna4-recipe/issues, with the details that matter.
