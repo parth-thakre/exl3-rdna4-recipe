@@ -1,4 +1,4 @@
-From f35103628a75080b1fb9fda3e373da2925b7d70f Mon Sep 17 00:00:00 2001
+From 37ca16ee21b2a81b5b42ed3e97c61ac4cb1b3e2b Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:42:26 +0530
 Subject: [PATCH 06/15] ROCm: keep the 32-row WMMA GEMV accumulator out of

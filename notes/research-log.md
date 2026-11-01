@@ -6,11 +6,11 @@ point at this repo's layout. Dates are 2026. Numbers are from one RX 9070 XT (16
 superseded TabbyAPI patch); the work was then ported to exllamav3 0662fac (`patches/previous/`: the WMMA GEMV, graph
 re-instantiation, GQA decode attention with Q4W, the review fixes, the DeltaNet replay and the batching series), and
 on 2026-10-12 to 9cc3bd1, where upstream's own replay and graphs-off default replace ours, and on 2026-10-13 to
-0f685aa, which has our DeltaNet scan change, and on 2026-10-27 to the v1.6.5 release (`patches/exllamav3-rdna4.patch`
-and `patches/features/`); the last four sections cover those ports. The 16-row GEMV below later grew into the
-batching series (16- and 32-row GEMV); see `notes/measurements.md`. The adaptive draft length, tree fallback and Q4P
-experiments are not in this repo. The notes between the 16-row GEMV and the ports skip the batching work, which is
-written up in `notes/measurements.md`.
+0f685aa, which has our DeltaNet scan change, on 2026-10-27 to the v1.6.5 release, and on 2026-11-02 to v1.6.6
+(`patches/exllamav3-rdna4.patch` and `patches/features/`); the last five sections cover those ports. The 16-row GEMV
+below later grew into the batching series (16- and 32-row GEMV); see `notes/measurements.md`. The adaptive draft
+length, tree fallback and Q4P experiments are not in this repo. The notes between the 16-row GEMV and the ports skip
+the batching work, which is written up in `notes/measurements.md`.
 
 Some configuration labels in these notes are loose (for example, the "before/after attention patch" rows mix 64k and
 80k servers, and the MTP row mixes 128k, 144k and 160k servers). The tables in `notes/measurements.md` were rechecked against
@@ -292,7 +292,7 @@ config (128k, 3 slots), 2026-10-13, A/B through the API: code 156.1 vs 155.1 tok
 streamed delta of a tool call now carries `role: assistant` (it had none). After concurrent and image requests, the
 registry's six gates pass on a3fed43: context recall at 106,084 tokens, 107.3 tok/s, peak 16,282 MiB, no OOM.
 
-## Upstream v1.6.5 (adopted 2026-10-27: the current base)
+## Upstream v1.6.5 (adopted 2026-10-27; the base until v1.6.6)
 
 v1.6.5 (2026-10-25) is 115 commits past 0f685aa. None of them carry our speed work, but it has a fix for a 1.6.4
 tokenizer regression that sometimes broke prompt caching, less VRAM for prefill with a quantized cache, and lower-latency
@@ -308,3 +308,18 @@ buffer change to `BC_GatedMLP` (`patches/README.md`).
   gfx12-generic) had the patch 7% ahead on code and ~30% past 30k.
 - Not run on this base yet: GPQA through the live server.
 
+## Upstream v1.6.6 (adopted 2026-11-02: the current base)
+
+v1.6.6 (2026-10-31) is 63 commits past v1.6.5, mostly DeepSeek V4.1, LFM3, CPU MoE and conversion work this setup
+doesn't use. Two generator changes do reach it: the sampler now returns batched results while drafting (16c695e5), and
+loop detection is rewritten (805caee9). TabbyAPI asks for loop detection by default (`loop_detect_window` 800), and
+v1.6.6 now reads that as "use the new detector with its default settings". All 15 of our commits cherry-picked cleanly.
+
+- With every patch switch at stock the port's greedy output is token-identical to plain v1.6.6. With the recipe's
+  settings it is token-identical to the v1.6.5 port: moving to v1.6.6 changes no token on these prompts.
+- PPL 7.0579, the same as v1.6.5.
+- Speed against the v1.6.5 port: code, prose and prefill equal; decode with a long prompt 4-5% lower at 8-32k over
+  four rounds, equal at 56k, within the run-to-run spread of the long-prompt test. The new loop detector isn't the
+  cause (no change with it off).
+- Not run on this base: GPQA, which can't differ when greedy output and PPL are unchanged, and the 96k / 3-slot
+  stress run.

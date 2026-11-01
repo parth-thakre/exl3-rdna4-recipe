@@ -30,7 +30,7 @@ export CPATH="$DEPS_DIR/usr/include:$DEPS_DIR/usr/include/python3.12${CPATH:+:$C
 # can lose writes after a remap at the same address (ROCm/TheRock#8744, pytorch/pytorch#195202): a missing TLB flush
 # in the amdgpu kernel driver with Resizable BAR, fixed by a kernel patch in review (notes/measurements.md). With them
 # on, the recurrent kernel tests failed in 3 of 10 runs and upstream's spec-rewind e2e test in 3 of 45; off, none did.
-# ExLlamaV3 v1.6.5 turns them on by default except on ROCm or when this variable is set; this sets an explicit default,
+# ExLlamaV3 v1.6.6 turns them on by default except on ROCm or when this variable is set; this sets an explicit default,
 # and a value you set yourself is kept.
 # Off, a 106k-token prefill after concurrent and image requests still fits at 3 slots (notes/measurements.md, Batching).
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}

@@ -124,13 +124,34 @@ All numbers are from the one RX 9070 XT, measured on 5-13 October 2026 with the 
 is turboderp's plain 3.0 bpw quant except in "Current base" and "Self-calibrated 3.0 bpw" below and the rows marked SC H4 (the current
 default, about 3% slower on greedy code; that section). The batching section, the self-calibrated comparison and rows
 marked "new base" are on exllamav3 0662fac + our patches (the previous base) and TabbyAPI 2fd6cc7; "Current base"
-is on 9cc3bd1 (the recipe now builds v1.6.5, with the same kernels; checks in that section); the rest are on the old base (exllamav3 f1cf869 + the single-request
+is on 9cc3bd1 (the recipe now builds v1.6.6, with the same kernels; checks in that section); the rest are on the old base (exllamav3 f1cf869 + the single-request
 patches, TabbyAPI f07131c). Context sizes like "80k" mean the server's `max_seq_len`/`cache_size` (80k = 81,920
 tokens).
 
 ### Current base (since 2026-10-12)
 
-Since 2026-10-27 the recipe builds the v1.6.5 release (cdc785d) with the same 15 commits (one hand edit, see
+Since 2026-11-02 the recipe builds the v1.6.6 release (bd1f519) with the same 15 commits, unchanged. Checks of the
+v1.6.6 port (`wt-up166`) against the v1.6.5 port (`wt-up165`), 2026-11-01/02, same model, draft and settings as below
+(`ab-upstream/port166_check.sh`):
+
+- Kernel tests: attention 382 passed (64 skipped), recurrent 923 passed (22 skipped), gemm 228 passed (42 skipped);
+  `test_gemv32.py` passes.
+- Greedy output: with every patch switch at stock the port is token-identical to plain v1.6.6; with the recipe's
+  settings it is token-identical to the v1.6.5 port on all 4 prompts. Plain v1.6.6 is identical to plain v1.6.5.
+- PPL, first 580 chunks: 7.0579, the same as v1.6.5.
+- API A/B, 64k / 1 slot, TabbyAPI 2fd6cc7, four rounds alternating, mean tok/s, v1.6.5 port vs v1.6.6 port: code 151.7
+  vs 151.4, prose (sampled) 60.4 vs 59.5, prefill at 30k 1,286 vs 1,281, decode at 8k 141.8 vs 135.3, at 32k 135.0 vs
+  129.3, at 56k 126.1 vs 127.5. Decode with a long prompt varies a lot between runs, because `context_bench.py` builds
+  a new random document each time: one v1.6.6 server gave 126-142 tok/s at 8k over 8 runs. So the 4-5% at 8-32k may
+  be noise; turning v1.6.6's new loop detector off (TabbyAPI enables it by default) changed nothing (137.9 vs 135.0 at
+  8k, 130.3 vs 131.1 at 32k, 4 runs each). Peak VRAM above idle 13.78 vs 13.80 GB. No OOM.
+- Recall: one 8k run of 28 on v1.6.6 failed, the first failure in 185 recorded runs. Replaying that prompt gives the
+  same answer on both ports: the model writes out the instruction ("the secret vault code from the document, nothing
+  else") instead of the code. It's the prompt, not the version.
+- TabbyAPI a3fed43 (the recipe's pin) with the port: loads, code 151.6 tok/s, prose 59.7, prefill 1,272 / 1,291 tok/s
+  at 8k / 30k, no server errors.
+
+From 2026-10-27 the recipe built the v1.6.5 release (cdc785d) with the same 15 commits (one hand edit, see
 `patches/README.md`). Checks of the port against the 0f685aa build (`wt-up1013`, which the numbers in the rest of this
 file were measured on), 2026-10-27, SC H4 model, DFlash2 3.0 bpw draft, 7 draft tokens:
 

@@ -1,5 +1,5 @@
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 28938470..e7a5e134 100644
+index b0d9e487..ba29f5ef 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
 @@ -49,6 +49,34 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)

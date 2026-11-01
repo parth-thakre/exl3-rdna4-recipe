@@ -1,4 +1,4 @@
-From ad413c7f58edaee3c9ced372545617fb1e7a87fc Mon Sep 17 00:00:00 2001
+From 807d73e4151bcf47e40656b5befb2d5b4439011f Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 14:25:08 +0530
 Subject: [PATCH 09/15] MLP: route adapters and per-projection controls around

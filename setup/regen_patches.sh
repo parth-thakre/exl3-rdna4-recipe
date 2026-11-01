@@ -8,9 +8,9 @@
 #   setup/regen_patches.sh --features DIR [--repo DIR] BASE BRANCH      one numbered file per commit into DIR
 #   BRANCH=WORKTREE diffs BASE against the working tree (plain mode only).
 #
-# What we ran for the current files, with WORK = an exllamav3 checkout that has branch live-165 (our work):
-#   setup/regen_patches.sh --repo "$WORK" cdc785db89e263e65e5849cb53e1ada156411414 live-165
-#   setup/regen_patches.sh --features patches/features --repo "$WORK" cdc785db89e263e65e5849cb53e1ada156411414 live-165
+# What we ran for the current files, with WORK = an exllamav3 checkout that has branch live-166 (our work):
+#   setup/regen_patches.sh --repo "$WORK" bd1f519172406a9560bd5c90e61000691bb69a07 live-166
+#   setup/regen_patches.sh --features patches/features --repo "$WORK" bd1f519172406a9560bd5c90e61000691bb69a07 live-166
 # The files in patches/previous/ came from the previous base (0662fac, branches rdna4-dev-batch-nographs and
 # rdna4-dev-pr423) and are kept as they were.
 set -euo pipefail

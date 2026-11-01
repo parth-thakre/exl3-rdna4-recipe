@@ -1,4 +1,4 @@
-From 45fb813875e4bf147f8cf6d1c77d66ceaaee6962 Mon Sep 17 00:00:00 2001
+From 29219da3bac9324c9b68adbaa08badb27d8e43a2 Mon Sep 17 00:00:00 2001
 From: Parth Thakre <144053824+parth-thakre@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 20:34:11 +0530
 Subject: [PATCH 12/15] Split-decode attention: EXL3_DEC_* tuning and the Q4W
@@ -25,7 +25,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 284 insertions(+), 12 deletions(-)
 
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 9a05f9cc..bedfaf55 100644
+index d959eb0a..002a938a 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
 @@ -49,6 +49,33 @@ span-heads head norms, non-EXL3 projections, compander-enabled quant cache, ...)

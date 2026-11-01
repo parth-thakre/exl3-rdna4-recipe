@@ -1,4 +1,4 @@
-From 77fe8f255995cca3492e910eece3687fab9d5db6 Mon Sep 17 00:00:00 2001
+From 7b507a574030624180145c1002cc85014f92e5b2 Mon Sep 17 00:00:00 2001
 From: Parth Thakre <144053824+parth-thakre@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 02:07:58 +0530
 Subject: [PATCH 14/15] Split-decode: fall back to single-stage when a

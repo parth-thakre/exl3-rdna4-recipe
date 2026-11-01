@@ -1,4 +1,4 @@
-From e5bce78da95a6bd191f40bd8b75eaf4dcc51661f Mon Sep 17 00:00:00 2001
+From da813062de745d68abe8840cc85bac4c74b9e22e Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:16:27 +0530
 Subject: [PATCH 02/15] ROCm: gfx12 WMMA multi-row GEMV up to 16 rows
@@ -33,7 +33,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  4 files changed, 51 insertions(+), 33 deletions(-)
 
 diff --git a/doc/env_vars.md b/doc/env_vars.md
-index 751daa5a..a946d2ca 100644
+index 1d0f4f3f..463fc938 100644
 --- a/doc/env_vars.md
 +++ b/doc/env_vars.md
 @@ -276,14 +276,21 @@ forces shuffle extraction, `1` forces shared-memory staging. Testing only.
