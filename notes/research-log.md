@@ -6,8 +6,8 @@ point at this repo's layout. Dates are 2026. Numbers are from one RX 9070 XT (16
 superseded TabbyAPI patch); the work was then ported to exllamav3 0662fac (`patches/previous/`: the WMMA GEMV, graph
 re-instantiation, GQA decode attention with Q4W, the review fixes, the DeltaNet replay and the batching series), and
 on 2026-10-12 to 9cc3bd1, where upstream's own replay and graphs-off default replace ours, and on 2026-10-13 to
-0f685aa, which has our DeltaNet scan change, on 2026-10-27 to the v1.6.5 release, and on 2026-11-02 to v1.6.6
-(`patches/exllamav3-rdna4.patch` and `patches/features/`); the last five sections cover those ports. The 16-row GEMV
+0f685aa, which has our DeltaNet scan change, on 2026-10-27 to the v1.6.5 release, on 2026-11-02 to v1.6.6
+and on 2026-11-17 to v1.6.7 (`patches/exllamav3-rdna4.patch` and `patches/features/`); the last six sections cover those ports. The 16-row GEMV
 below later grew into the batching series (16- and 32-row GEMV); see `notes/measurements.md`. The adaptive draft
 length, tree fallback and Q4P experiments are not in this repo. The notes between the 16-row GEMV and the ports skip
 the batching work, which is written up in `notes/measurements.md`.
@@ -308,7 +308,7 @@ buffer change to `BC_GatedMLP` (`patches/README.md`).
   gfx12-generic) had the patch 7% ahead on code and ~30% past 30k.
 - Not run on this base yet: GPQA through the live server.
 
-## Upstream v1.6.6 (adopted 2026-11-02: the current base)
+## Upstream v1.6.6 (adopted 2026-11-02; the base until v1.6.7)
 
 v1.6.6 (2026-10-31) is 63 commits past v1.6.5, mostly DeepSeek V4.1, LFM3, CPU MoE and conversion work this setup
 doesn't use. Two generator changes do reach it: the sampler now returns batched results while drafting (16c695e5), and
@@ -323,3 +323,27 @@ v1.6.6 now reads that as "use the new detector with its default settings". All 1
   cause (no change with it off).
 - Not run on this base: GPQA, which can't differ when greedy output and PPL are unchanged, and the 96k / 3-slot
   stress run.
+
+## Upstream v1.6.7 and TabbyAPI main of 2026-11-14 (adopted 2026-11-17: the current base)
+
+v1.6.7 (2026-11-13) is 36 commits past v1.6.6. What reaches this setup: pipelined prefill, rolling checkpoints for
+recurrent models, a fix for a prefill shared-memory overrun on chunked prompts and a tokenizer fix (#599). Its GEMV
+register-bound changes (#590) are CUDA-only. All 15 of our commits cherry-picked cleanly.
+
+- With every patch switch at stock the port's greedy output is token-identical to plain v1.6.7. The first check
+  reported a difference because it left `EXL3_DEC_WARPS/STAGES/BLOCK_N` from `env.sh` set; with those unset as well
+  (what `EXL3_TUNING=0` does) the outputs match.
+- PPL 7.0579, the same as v1.6.6.
+- Against the v1.6.6 port over four rounds: code within 1%, prose about 7% faster, prefill 5-6% faster, decode with a
+  long prompt 6-9% faster at 8-56k.
+- TabbyAPI a3fed43 to 4728158 (68 commits) pins ExLlamaV3 1.6.7 wheels for CUDA and adds no Python dependencies. For this setup:
+  loop detection is configured for the detector v1.6.6 introduced (`loop_detect`, with `loop_detect_window` still
+  accepted), a detected loop ends with `finish_reason: repetition`, qwen3_coder tool calls stream their arguments,
+  `/metrics`, and options this recipe doesn't set (`sparse_draft_head`, `draft_max_rows`, `use_generation_config`).
+  The recipe's two configs validate against its config model unchanged.
+- turboderp's new `SCP_3.00bpw` quant of Qwen3.8-27B (fractional-K + YAQA) runs on the port: about 40% of its tensors
+  are half-rate (2.5 or 3.5 bpw), which the WMMA GEMV skips (they fall back to upstream's kernels). Against the SC H4
+  default over two rounds: code and prose within 2%, decode at 56k about 10% lower (noisy), about 95 MB more peak
+  VRAM. turboderp's published KL divergence for the two is on different evaluation traces, so not comparable. The
+  default stays SC H4.
+- Not run on this base: GPQA (greedy output and PPL unchanged at stock) and the 96k / 3-slot stress run.

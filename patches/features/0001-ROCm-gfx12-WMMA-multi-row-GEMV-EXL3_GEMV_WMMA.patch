@@ -1,4 +1,4 @@
-From c1fefa40460ce998a19af1f80b894779af13bb8f Mon Sep 17 00:00:00 2001
+From de06d3faf3649f9fb21dfa827710538d3146ce4d Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 11:55:03 +0530
 Subject: [PATCH 01/15] ROCm: gfx12 WMMA multi-row GEMV (EXL3_GEMV_WMMA)

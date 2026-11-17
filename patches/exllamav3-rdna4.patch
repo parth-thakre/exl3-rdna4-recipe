@@ -173,7 +173,7 @@ index d5022c6b..fe125eab 100644
  
      void run_bszN_gr
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
-index c909164b..bfcb4094 100644
+index 3f15080d..6f60714b 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 +++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 @@ -200,9 +200,9 @@ int exl3_gemm_gr
@@ -188,7 +188,7 @@ index c909164b..bfcb4094 100644
          && (!half_k || exl3_rocm_half_gemv_enabled()))
      {
          if (exl3_gemv_multirow_try_launch
-@@ -665,9 +665,9 @@ int exl3_mgemm_gr
+@@ -670,9 +670,9 @@ int exl3_mgemm_gr
  
  #if defined(USE_ROCM)
      // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
@@ -792,10 +792,10 @@ index f4b3b614..e92133d5 100644
  int exl3_gemv_max_m();
  
 diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
-index f38c077d..43dc04d3 100644
+index a9049c82..b6e94dc0 100644
 --- a/exllamav3/modules/attention_fn/bc_attn.py
 +++ b/exllamav3/modules/attention_fn/bc_attn.py
-@@ -307,7 +307,9 @@ class BCAttn:
+@@ -308,7 +308,9 @@ class BCAttn:
          from .triton_paged import (
              combine_subtiles,
              decode_row_layout,
@@ -806,7 +806,7 @@ index f38c077d..43dc04d3 100644
              _paged_attn_decode_combine_kernel,
              _paged_kv_update_kernel,
              _normalize_window,
-@@ -319,13 +321,19 @@ class BCAttn:
+@@ -320,13 +322,19 @@ class BCAttn:
          qh, kvh = self.num_q_heads, self.num_kv_heads
          group_size = qh // kvh
  
@@ -827,7 +827,7 @@ index f38c077d..43dc04d3 100644
          splits_cap = max(1, min(target // programs, 128))
          window_left, window_right = _normalize_window(self.window_size)
  
-@@ -352,8 +360,16 @@ class BCAttn:
+@@ -353,8 +361,16 @@ class BCAttn:
              SOFTCAP = float(self.softcap or 0.0), FINAL = False, HAS_SINKS = False,
              BLOCK_ROWS = block_rows, BLOCK_N = block_n,
          )
@@ -847,7 +847,7 @@ index f38c077d..43dc04d3 100644
          sig_c = {
              "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
 diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
-index 2370bfcd..2851cb84 100644
+index 8feb30de..cb5f5452 100644
 --- a/exllamav3/modules/attention_fn/triton_paged.py
 +++ b/exllamav3/modules/attention_fn/triton_paged.py
 @@ -1056,6 +1056,203 @@ def _paged_attn_decode_split_kernel(
