@@ -124,13 +124,39 @@ All numbers are from the one RX 9070 XT, measured on 5-13 October 2026 with the 
 is turboderp's plain 3.0 bpw quant except in "Current base" and "Self-calibrated 3.0 bpw" below and the rows marked SC H4 (the current
 default, about 3% slower on greedy code; that section). The batching section, the self-calibrated comparison and rows
 marked "new base" are on exllamav3 0662fac + our patches (the previous base) and TabbyAPI 2fd6cc7; "Current base"
-is on 9cc3bd1 (the recipe now builds v1.6.6, with the same kernels; checks in that section); the rest are on the old base (exllamav3 f1cf869 + the single-request
+is on 9cc3bd1 (the recipe now builds v1.6.7, with the same kernels; checks in that section); the rest are on the old base (exllamav3 f1cf869 + the single-request
 patches, TabbyAPI f07131c). Context sizes like "80k" mean the server's `max_seq_len`/`cache_size` (80k = 81,920
 tokens).
 
 ### Current base (since 2026-10-12)
 
-Since 2026-11-02 the recipe builds the v1.6.6 release (bd1f519) with the same 15 commits, unchanged. Checks of the
+Since 2026-11-17 the recipe builds the v1.6.7 release (8c593e4) with the same 15 commits, unchanged, and TabbyAPI `main`
+4728158 (was a3fed43). Checks of the v1.6.7 port (`wt-up167`) against the v1.6.6 port (`wt-up166`), 2026-11-17, same
+model, draft and settings (`ab-upstream/port167_check.sh`):
+
+- Kernel tests: attention 382 passed (64 skipped), recurrent 923 passed (22 skipped), gemm 228 passed (44 skipped);
+  `test_gemv32.py` passes.
+- Greedy output: with every patch switch at stock (including no `EXL3_DEC_WARPS/STAGES/BLOCK_N`) the port is
+  token-identical to plain v1.6.7, and each build is identical to itself across runs. With the recipe's settings it
+  differs from the v1.6.6 port at near-ties on 2 of 4 prompts (tokens 91 and 20), as earlier moves did.
+- PPL, first 580 chunks: 7.0579, the same as v1.6.6.
+- API A/B, 64k / 1 slot, TabbyAPI 2fd6cc7, four rounds alternating, mean tok/s, v1.6.6 port vs v1.6.7 port: code 153.1
+  vs 151.6, prose (sampled) 62.2 vs 66.5, prefill 1,246 / 1,271 vs 1,312 / 1,350 at 8k / 30k, decode at 8k 132.3 vs
+  144.1, at 32k 131.8 vs 139.8, at 56k 123.6 vs 131.3. The prefill gain is v1.6.7's pipelined prefill; long-prompt
+  decode is noisy (see the v1.6.6 notes below), but v1.6.7 was ahead in 10 of 12 depth runs. Peak VRAM the same
+  (13,758 vs 13,759 MiB with 94 MiB idle). Recall correct in all 24 runs, no OOM.
+- TabbyAPI a3fed43 and 4728158 with the port: both load; code 150.9 / 150.6 tok/s, prose 64.7 / 66.2, prefill 1,310 /
+  1,341 and 1,300 / 1,346 tok/s at 8k / 30k; one tool call, streamed and not, returns the right call on both, and
+  4728158's first streamed delta carries `role: assistant`. 4728158 also served Claude Code (through LiteLLM) for about
+  3 hours of agent work at 128k / 3 slots with no server errors.
+- The Qwen4 building blocks that v1.6.7 has for Qwen3.8-Flash-Next (hyper-connections, PLE, n-gram embedding, DSA)
+  pass their kernel tests except the 10 `test_ple_forward_streams` cases with conv kernel size 2, dilation 1. Those
+  fail on plain v1.6.7 too: PyTorch's fp16 depthwise `conv1d` through MIOpen returns wrong values and NaN at that
+  shape on gfx1201 with the ROCm 7.2 wheels, and is correct with the ROCm 10.0 wheels or with MIOpen off
+  (`scripts/depthwise_conv1d_repro.py` in the work tree). Flash-Next uses kernel size 4, dilation 3, so it isn't
+  affected.
+
+From 2026-11-02 the recipe built the v1.6.6 release (bd1f519) with the same 15 commits, unchanged. Checks of the
 v1.6.6 port (`wt-up166`) against the v1.6.5 port (`wt-up165`), 2026-11-01/02, same model, draft and settings as below
 (`ab-upstream/port166_check.sh`):
 

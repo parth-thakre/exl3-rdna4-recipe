@@ -1,4 +1,4 @@
-From 7b507a574030624180145c1002cc85014f92e5b2 Mon Sep 17 00:00:00 2001
+From 873bbdbf793a2b4b26d9cb9b970054aa40bb7507 Mon Sep 17 00:00:00 2001
 From: Parth Thakre <144053824+parth-thakre@users.noreply.github.com>
 Date: Mon, 12 Oct 2026 02:07:58 +0530
 Subject: [PATCH 14/15] Split-decode: fall back to single-stage when a
@@ -18,10 +18,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/exllamav3/modules/attention_fn/bc_attn.py b/exllamav3/modules/attention_fn/bc_attn.py
-index 3bd5477d..43dc04d3 100644
+index 1c2b027f..b6e94dc0 100644
 --- a/exllamav3/modules/attention_fn/bc_attn.py
 +++ b/exllamav3/modules/attention_fn/bc_attn.py
-@@ -361,8 +361,15 @@ class BCAttn:
+@@ -362,8 +362,15 @@ class BCAttn:
              BLOCK_ROWS = block_rows, BLOCK_N = block_n,
          )
          split_fn = decode_split_kernel_for(self.k_bits if self.quant else 0, self.v_bits if self.quant else 0, hd, hd_pad)
@@ -40,7 +40,7 @@ index 3bd5477d..43dc04d3 100644
          sig_c = {
              "partial_o": "*fp32:16", "partial_ml": "*fp32:16", "out": "*fp16:16", "h32": "*fp16:16",
 diff --git a/exllamav3/modules/attention_fn/triton_paged.py b/exllamav3/modules/attention_fn/triton_paged.py
-index 54691722..614a0136 100644
+index 262e2480..59e8377f 100644
 --- a/exllamav3/modules/attention_fn/triton_paged.py
 +++ b/exllamav3/modules/attention_fn/triton_paged.py
 @@ -1498,8 +1498,12 @@ def paged_attn_triton_decode(

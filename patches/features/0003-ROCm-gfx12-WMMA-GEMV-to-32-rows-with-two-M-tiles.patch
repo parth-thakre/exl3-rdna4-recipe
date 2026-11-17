@@ -1,4 +1,4 @@
-From b425fb7eff12ecf979dab2e2e2198002b58eee80 Mon Sep 17 00:00:00 2001
+From ab36aab3b1c30bbcdabb6a5b9c37eea57483774a Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:18:11 +0530
 Subject: [PATCH 03/15] ROCm: gfx12 WMMA GEMV to 32 rows with two M tiles
@@ -62,7 +62,7 @@ index 463fc938..44e30dc2 100644
  ### `EXL3_GEMV_WMMA_U` (default: `4`)
  
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
-index 1fab225e..bfcb4094 100644
+index 24b79fa3..6f60714b 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 +++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 @@ -200,7 +200,7 @@ int exl3_gemm_gr
@@ -74,7 +74,7 @@ index 1fab225e..bfcb4094 100644
      // capture, ahead of every other path. Half-integer rates go as the pseudo width EXL3_HALF_BITS(K)
      if (force_shape_idx <= 0 && force_num_sms <= 0 && size_m >= 1 && size_m <= exl3_gemv_max_m()
          && (!half_k || exl3_rocm_half_gemv_enabled()))
-@@ -665,7 +665,7 @@ int exl3_mgemm_gr
+@@ -670,7 +670,7 @@ int exl3_mgemm_gr
  
  #if defined(USE_ROCM)
      // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)

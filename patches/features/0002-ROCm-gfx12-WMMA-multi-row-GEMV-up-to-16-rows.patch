@@ -1,4 +1,4 @@
-From da813062de745d68abe8840cc85bac4c74b9e22e Mon Sep 17 00:00:00 2001
+From 3cacdbf3aa506dbc2140472163e3a274a6cc83d5 Mon Sep 17 00:00:00 2001
 From: local <local@localhost>
 Date: Tue, 6 Oct 2026 13:16:27 +0530
 Subject: [PATCH 02/15] ROCm: gfx12 WMMA multi-row GEMV up to 16 rows
@@ -63,7 +63,7 @@ index 1d0f4f3f..463fc938 100644
  
  k-tiles decoded per WMMA batch in the `EXL3_GEMV_WMMA` kernel: `1`, `2` or `4`.
 diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
-index c909164b..1fab225e 100644
+index 3f15080d..24b79fa3 100644
 --- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 +++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
 @@ -200,9 +200,9 @@ int exl3_gemm_gr
@@ -78,7 +78,7 @@ index c909164b..1fab225e 100644
          && (!half_k || exl3_rocm_half_gemv_enabled()))
      {
          if (exl3_gemv_multirow_try_launch
-@@ -665,9 +665,9 @@ int exl3_mgemm_gr
+@@ -670,9 +670,9 @@ int exl3_mgemm_gr
  
  #if defined(USE_ROCM)
      // RDNA: the plain-launch multi-matrix GEMVs (rocm/quant/exl3_mgemv_rdna.cu, exl3_gemv_multirow_rdna.cu)
